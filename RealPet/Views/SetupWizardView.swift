@@ -9,7 +9,9 @@ import AppKit
 /// (one copy-paste command, no sudo on Apple Silicon) and then automatically
 /// create the venv, install pip dependencies, install SAM2, and write a marker
 /// file so subsequent launches skip this step.
-final class SetupWizard: NSObject, ObservableObject {
+// Background setup only performs process and file work; every UI mutation is
+// dispatched to the main queue by the helpers below.
+final class SetupWizard: NSObject, ObservableObject, @unchecked Sendable {
     enum Outcome {
         case ready
         case aborted(String)

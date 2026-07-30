@@ -38,3 +38,7 @@ venv/
 
 # Pets runtime data
 pets/
+# User-supplied Live2D SDK and generated Web runtime
+web/cubism-runtime/node_modules/
+web/cubism-runtime/dist/
+vendor/CubismWeb/

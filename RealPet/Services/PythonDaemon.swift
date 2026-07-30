@@ -19,6 +19,7 @@ final class PythonDaemon: ObservableObject {
     private var pending: [Int: ([String: Any]) -> Void] = [:]
     private var nextId: Int = 1
     private var stdoutBuffer = ""
+    private var intentionallyStoppedPIDs: Set<Int32> = []
 
     /// Callback invoked when the daemon dies unexpectedly.
     var onCrash: (() -> Void)?
@@ -68,19 +69,26 @@ final class PythonDaemon: ObservableObject {
         proc.terminationHandler = { [weak self] p in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                let intentional = self.intentionallyStoppedPIDs.remove(
+                    p.processIdentifier) != nil
                 PythonBridge.log("PythonDaemon exited with code \(p.terminationStatus)")
-                self.process = nil
-                self.isRunning = false
-                self.isReady = false
-                self.stdinPipe = nil
-                self.stdoutPipe = nil
-                self.stderrPipe = nil
-                // Fail all pending requests
-                for (_, cb) in self.pending {
-                    cb(["type": "error", "message": "daemon exited unexpectedly"])
+                // An intentionally-stopped old process may finish after a new
+                // daemon was started. Never let its callback clear the new one.
+                if self.process === p {
+                    self.process = nil
+                    self.isRunning = false
+                    self.isReady = false
+                    self.stdinPipe = nil
+                    self.stdoutPipe = nil
+                    self.stderrPipe = nil
+                    for (_, cb) in self.pending {
+                        cb(["type": "error", "message": "daemon exited unexpectedly"])
+                    }
+                    self.pending.removeAll()
                 }
-                self.pending.removeAll()
-                self.onCrash?()
+                if !intentional {
+                    self.onCrash?()
+                }
             }
         }
 
@@ -102,6 +110,7 @@ final class PythonDaemon: ObservableObject {
     /// Terminate the daemon cleanly.
     func terminate() {
         guard let proc = process else { return }
+        intentionallyStoppedPIDs.insert(proc.processIdentifier)
         // Close stdin → daemon's for-loop exits → clean sys.exit(0)
         stdinPipe?.fileHandleForWriting.closeFile()
         // Give it a moment, then hard-kill if stuck.

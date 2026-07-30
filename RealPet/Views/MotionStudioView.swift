@@ -1,0 +1,319 @@
+import AppKit
+import SwiftUI
+
+struct MotionStudioView: View {
+    @EnvironmentObject private var vm: PetListViewModel
+
+    let pet: Pet
+    let onDismiss: () -> Void
+
+    @State private var selectedKind: PetActionManifest.Action.Kind = .idle
+    @State private var naturalPrompt = ""
+    @State private var optimizedPrompt = ""
+    @State private var petDescription = ""
+    @State private var warnings: [String] = []
+    @State private var showServiceConfiguration = false
+    @State private var baseURL = ""
+    @State private var promptModel = ""
+    @State private var agnesBaseURL = ""
+    @State private var imageModel = ""
+    @State private var videoModel = ""
+    @State private var seconds = 4
+    @State private var size = "1280x720"
+    @State private var promptAPIKey = ""
+    @State private var agnesAPIKey = ""
+    @State private var configurationMessage: String?
+
+    private var references: [URL] {
+        vm.motionReferenceImages(for: pet)
+    }
+
+    private var actionKinds: [PetActionManifest.Action.Kind] {
+        if pet.framesDir == nil { return [.idle] }
+        return [.idle] + PetActionManifest.Action.Kind.importable
+    }
+
+    private var isBusy: Bool { vm.motionWorkflowState.isBusy }
+
+    private var hasBothCredentials: Bool {
+        vm.hasPromptMotionServiceCredential && vm.hasAgnesMotionServiceCredential
+    }
+
+    private var credentialStatus: String {
+        switch (vm.hasPromptMotionServiceCredential, vm.hasAgnesMotionServiceCredential) {
+        case (true, true): return "两组 Key 已配置"
+        case (true, false): return "待配置 Agnes Key"
+        case (false, true): return "待配置 Prompt Key"
+        case (false, false): return "未配置服务 Key"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("动作工作台")
+                        .font(.title3.weight(.semibold))
+                    Text(pet.name)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    showServiceConfiguration.toggle()
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .buttonStyle(.borderless)
+                .help("动作服务配置")
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .disabled(isBusy)
+                .help("关闭")
+            }
+
+            MotionReferenceStrip(urls: references)
+
+            HStack(spacing: 10) {
+                Label("动作", systemImage: selectedKind.symbolName)
+                    .font(.subheadline.weight(.medium))
+                Picker("动作", selection: $selectedKind) {
+                    ForEach(actionKinds, id: \.self) { kind in
+                        Text(kind.displayName).tag(kind)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 165)
+                Spacer()
+                Text(credentialStatus)
+                    .font(.caption)
+                    .foregroundStyle(hasBothCredentials ? .green : .orange)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("自然语言描述")
+                    .font(.subheadline.weight(.medium))
+                TextEditor(text: $naturalPrompt)
+                    .font(.body)
+                    .scrollContentBackground(.hidden)
+                    .padding(7)
+                    .frame(height: 78)
+                    .background(Color.black.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                    .disabled(isBusy)
+            }
+
+            HStack {
+                Button {
+                    Task {
+                        guard let result = await vm.optimizeMotionPrompt(
+                            for: pet, kind: selectedKind,
+                            naturalLanguage: naturalPrompt) else { return }
+                        optimizedPrompt = result.optimizedPrompt
+                        petDescription = result.petDescription
+                        warnings = result.warnings
+                    }
+                } label: {
+                    Label("优化 Prompt", systemImage: "wand.and.stars")
+                }
+                .disabled(isBusy || naturalPrompt.trimmingCharacters(
+                    in: .whitespacesAndNewlines).isEmpty)
+
+                Spacer()
+
+                Button {
+                    vm.generateMotion(
+                        for: pet, kind: selectedKind,
+                        optimizedPrompt: optimizedPrompt)
+                } label: {
+                    Label("生成动作", systemImage: "video.badge.plus")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isBusy || optimizedPrompt.trimmingCharacters(
+                    in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            if !optimizedPrompt.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("优化后的 Prompt")
+                        .font(.subheadline.weight(.medium))
+                    TextEditor(text: $optimizedPrompt)
+                        .font(.body)
+                        .scrollContentBackground(.hidden)
+                        .padding(7)
+                        .frame(height: 90)
+                        .background(Color.black.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                        .disabled(isBusy)
+                    if !petDescription.isEmpty {
+                        Text(petDescription)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    ForEach(warnings, id: \.self) { warning in
+                        Label(warning, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+
+            if let status = vm.motionWorkflowState.displayName {
+                HStack(spacing: 8) {
+                    if isBusy { ProgressView().controlSize(.small) }
+                    Text(status)
+                        .font(.footnote)
+                        .foregroundStyle(statusColor)
+                    Spacer()
+                    if isBusy {
+                        Button("停止", role: .destructive) {
+                            vm.cancelMotionGeneration()
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.footnote)
+                    }
+                }
+            }
+
+            if showServiceConfiguration {
+                Divider()
+                serviceConfiguration
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
+        .onAppear(perform: loadConfiguration)
+    }
+
+    private var statusColor: Color {
+        if case .failed = vm.motionWorkflowState { return .red }
+        if isBusy { return .secondary }
+        return .green
+    }
+
+    private var serviceConfiguration: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Prompt 中转站")
+                .font(.subheadline.weight(.semibold))
+            TextField("Prompt API Base URL", text: $baseURL)
+                .textFieldStyle(.roundedBorder)
+            TextField("提示词模型", text: $promptModel)
+                .textFieldStyle(.roundedBorder)
+            SecureField(
+                vm.hasPromptMotionServiceCredential
+                    ? "新的 Prompt API Key（留空则不修改）" : "Prompt API Key",
+                text: $promptAPIKey)
+                .textFieldStyle(.roundedBorder)
+            Divider()
+            Text("Agnes 官方直连")
+                .font(.subheadline.weight(.semibold))
+            TextField("Agnes API Base URL", text: $agnesBaseURL)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                TextField("参考图模型", text: $imageModel)
+                TextField("视频模型", text: $videoModel)
+            }
+            HStack {
+                Picker("时长", selection: $seconds) {
+                    Text("4 秒").tag(4)
+                    Text("8 秒").tag(8)
+                    Text("12 秒").tag(12)
+                }
+                Picker("尺寸", selection: $size) {
+                    Text("标准 1152x768").tag("1152x768")
+                    Text("横屏 1280x720").tag("1280x720")
+                    Text("竖屏 720x1280").tag("720x1280")
+                }
+            }
+            SecureField(
+                vm.hasAgnesMotionServiceCredential
+                    ? "新的 Agnes API Key（留空则不修改）" : "Agnes API Key",
+                text: $agnesAPIKey)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                if let configurationMessage {
+                    Text(configurationMessage)
+                        .font(.caption)
+                        .foregroundStyle(configurationMessage == "已保存" ? .green : .red)
+                }
+                Spacer()
+                Button("保存") {
+                    do {
+                        try vm.saveMotionServiceConfiguration(
+                            baseURLString: baseURL,
+                            promptModel: promptModel,
+                            agnesBaseURLString: agnesBaseURL,
+                            imageModel: imageModel,
+                            videoModel: videoModel,
+                            seconds: seconds,
+                            size: size,
+                            promptAPIKey: promptAPIKey,
+                            agnesAPIKey: agnesAPIKey)
+                        promptAPIKey = ""
+                        agnesAPIKey = ""
+                        configurationMessage = "已保存"
+                    } catch {
+                        configurationMessage = error.localizedDescription
+                    }
+                }
+                .disabled(isBusy)
+            }
+        }
+    }
+
+    private func loadConfiguration() {
+        let configuration = vm.motionServiceConfiguration
+        baseURL = configuration.baseURLString
+        promptModel = configuration.promptModel
+        agnesBaseURL = configuration.resolvedAgnesBaseURLString
+        imageModel = configuration.imageModel ?? ""
+        videoModel = configuration.videoModel
+        seconds = configuration.seconds
+        size = configuration.size
+        if naturalPrompt.isEmpty {
+            naturalPrompt = pet.framesDir == nil
+                ? "让它在原地自然待机，轻微眨眼和呼吸。"
+                : "让它\(selectedKind.displayName)，动作自然且完整。"
+        }
+    }
+}
+
+private struct MotionReferenceStrip: View {
+    let urls: [URL]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Array(urls.enumerated()), id: \.offset) { index, url in
+                    ZStack(alignment: .topLeading) {
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(Color.black.opacity(0.08))
+                        if let image = NSImage(contentsOf: url) {
+                            Image(nsImage: image)
+                                .resizable()
+                                .interpolation(.high)
+                                .scaledToFill()
+                                .clipped()
+                        } else {
+                            Image(systemName: "photo")
+                                .foregroundStyle(.secondary)
+                        }
+                        if index == 0 {
+                            Text("主")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 2)
+                                .background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 3))
+                                .foregroundStyle(.white)
+                                .padding(4)
+                        }
+                    }
+                    .frame(width: 64, height: 64)
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                }
+            }
+        }
+        .frame(height: 64)
+    }
+}

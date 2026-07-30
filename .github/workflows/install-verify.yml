@@ -53,6 +53,7 @@ jobs:
           path: |
             ~/.cache/huggingface
             weights/hf
+            weights/birefnet-fp16
             weights/torch
           key: weights-${{ runner.os }}-birefnet-rcnn-v2
           restore-keys: |
@@ -144,12 +145,11 @@ jobs:
           missing=0
           for p in \
             "$RES/requirements.txt" \
-            "$RES/pipeline/segment.py" \
             "$RES/scripts/track_then_matte.py" \
             "$RES/scripts/daemon.py" \
             "$RES/bin/ffmpeg" \
             "$RES/weights/sam2" \
-            "$RES/weights/hf" \
+            "$RES/weights/birefnet-fp16" \
             "$RES/weights/torch" \
             "dist/RealPet.app/Contents/MacOS/RealPet" \
             "dist/RealPet.app/Contents/Info.plist"; do
@@ -161,6 +161,15 @@ jobs:
             fi
           done
           [ -x "$RES/bin/ffmpeg" ] || { echo "::error::bin/ffmpeg is not executable"; missing=1; }
+          CAMERA_REASON=$(plutil -extract NSCameraUsageDescription raw -o - \
+            "dist/RealPet.app/Contents/Info.plist" 2>/dev/null || true)
+          [ -n "$CAMERA_REASON" ] || { echo "::error::Missing NSCameraUsageDescription"; missing=1; }
+          MICROPHONE_REASON=$(plutil -extract NSMicrophoneUsageDescription raw -o - \
+            "dist/RealPet.app/Contents/Info.plist" 2>/dev/null || true)
+          [ -n "$MICROPHONE_REASON" ] || { echo "::error::Missing NSMicrophoneUsageDescription"; missing=1; }
+          SPEECH_REASON=$(plutil -extract NSSpeechRecognitionUsageDescription raw -o - \
+            "dist/RealPet.app/Contents/Info.plist" 2>/dev/null || true)
+          [ -n "$SPEECH_REASON" ] || { echo "::error::Missing NSSpeechRecognitionUsageDescription"; missing=1; }
           exit "$missing"
 
       - name: track_then_matte.py --help (must work without weights)

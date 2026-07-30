@@ -3,7 +3,8 @@
 
 Layout (under --out):
   weights/sam2/sam2.1_hiera_tiny.pt
-  weights/hf/hub/models--ZhengPeng7-BiRefNet-matting/snapshots/<sha>/
+  weights/hf/models--ZhengPeng7--BiRefNet-matting/snapshots/<sha>/
+  weights/birefnet-fp16/  (MPS-equivalent release checkpoint)
   weights/torch/hub/checkpoints/fasterrcnn_resnet50_fpn_v2_coco32689bffd.pth
 
 Idempotent + --verify-only + honors HF_ENDPOINT (auto via huggingface_hub).
@@ -18,6 +19,7 @@ DEFAULT_OUT = os.environ.get(
     "REALPET_WEIGHTS_DIR", os.path.join(PROJECT_ROOT, "weights"))
 
 BIREFNET_REPO = "ZhengPeng7/BiRefNet-matting"
+BIREFNET_FP16_EXPECTED_SIZE = 420_000_000
 RCNN_URL = ("https://download.pytorch.org/models/"
             "fasterrcnn_resnet50_fpn_v2_coco-dd69338a.pth")
 RCNN_EXPECTED_SIZE = 167_000_000
@@ -31,17 +33,28 @@ def _ensure_env(out_dir):
 def download_birefnet(out_dir, force=False):
     from huggingface_hub import snapshot_download
     dest = os.path.join(out_dir, "hf")
-    hub_dir = os.path.join(dest, "hub")
-    if not force and os.path.isdir(hub_dir):
+    repo_dir = os.path.join(
+        dest, "models--ZhengPeng7--BiRefNet-matting")
+    if not force and os.path.isdir(repo_dir):
         print("BiRefNet already present")
         return
     print(f"Downloading BiRefNet-matting to {dest} ...")
     snapshot_download(
         repo_id=BIREFNET_REPO,
         cache_dir=dest,
-        allow_patterns=["*.json", "*.py", "*.safetensors", "*.bin",
-                        "*.txt", "*.md"],
+        # Runtime-only snapshot. Prefer safetensors so a future duplicate .bin
+        # checkpoint cannot silently double the app size.
+        allow_patterns=["*.json", "*.py", "*.safetensors", "*.txt"],
     )
+
+
+def prepare_birefnet_fp16(out_dir, force=False):
+    """Materialize the exact half-precision checkpoint used on MPS."""
+    from prepare_birefnet_fp16 import convert_snapshot, find_snapshot
+
+    source = find_snapshot(out_dir)
+    output = os.path.join(out_dir, "birefnet-fp16")
+    convert_snapshot(source, output, force=force)
 
 
 def download_faster_rcnn(out_dir, force=False):
@@ -96,7 +109,8 @@ def verify(out_dir):
     sam2_path = os.path.join(out_dir, "sam2", "sam2.1_hiera_tiny.pt")
     checks = [
         ("SAM2", sam2_path, SAM2_EXPECTED_SIZE, "file"),
-        ("BiRefNet", os.path.join(out_dir, "hf"), 100_000_000, "dir"),
+        ("BiRefNet FP16", os.path.join(out_dir, "birefnet-fp16"),
+         BIREFNET_FP16_EXPECTED_SIZE, "dir"),
         ("Faster R-CNN", os.path.join(out_dir, "torch", "hub", "checkpoints",
                                       os.path.basename(RCNN_URL)),
          RCNN_EXPECTED_SIZE, "file"),
@@ -110,10 +124,13 @@ def verify(out_dir):
         if kind == "file":
             size = os.path.getsize(path)
         else:
+            # Hugging Face snapshots symlink into blobs. Do not follow those
+            # links or the report double-counts the same 885 MB checkpoint.
             size = sum(
-                os.path.getsize(os.path.join(root, f))
+                os.path.getsize(file_path)
                 for root, _, files in os.walk(path)
                 for f in files
+                if not os.path.islink(file_path := os.path.join(root, f))
             )
         marker = "ok" if size >= floor * 0.9 else "!!"
         if marker == "!!":
@@ -149,6 +166,7 @@ def main():
     print()
     print("Bundling BiRefNet...")
     download_birefnet(args.out, force=args.force)
+    prepare_birefnet_fp16(args.out, force=args.force)
     print()
     print("Bundling Faster R-CNN...")
     download_faster_rcnn(args.out, force=args.force)

@@ -10,6 +10,8 @@ class PythonBridge: ObservableObject {
 
     private var process: Process?
     private var buffer = ""
+    private var isShuttingDown = false
+    private var isCancelling = false
 
     /// Resident daemon for QC / detect.  Set by AppDelegate after
     /// creating both objects.  When nil or not ready, callers fall back to
@@ -121,6 +123,11 @@ class PythonBridge: ObservableObject {
     static func subprocessEnvironment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
 
+        // A signed app bundle must remain immutable at runtime. Without this,
+        // Python writes __pycache__ files into Contents/Resources and invalidates
+        // the code signature after the first launch.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+
         // (a) Resources/bin first: bundled static ffmpeg lives here.
         let resourcesBin = Bundle.main.resourceURL?
             .appendingPathComponent("bin").path
@@ -134,11 +141,11 @@ class PythonBridge: ObservableObject {
         for p in toolPaths + existing where !merged.contains(p) { merged.append(p) }
         env["PATH"] = merged.joined(separator: ":")
 
-        // (b) HF_HUB_CACHE / HF_HOME / TORCH_HOME default to bundled weights.
+        // (b) HF_HUB_CACHE / HF_HOME / TORCH_HOME default to available weights.
         //
         // huggingface_hub stores the actual repo cache under HF_HUB_CACHE.
-        // We bundle the cache directly at Resources/weights/hf/
-        // (models--<org>--<repo>/snapshots/...), so HF_HUB_CACHE must point there.
+        // Release builds use Resources/weights/birefnet-fp16 directly. The HF
+        // cache variables remain useful for development trees with full weights.
         let bundledHF = Bundle.main.resourceURL?
             .appendingPathComponent("weights/hf").path
         if let bundledHF, env["HF_HUB_CACHE"] == nil,
@@ -162,16 +169,6 @@ class PythonBridge: ObservableObject {
         return env
     }
 
-    /// Find a system Python 3 (for scripts that need PyObjC, not the SAM2 venv).
-    static func findSystemPython() -> URL? {
-        for path in ["/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"] {
-            if FileManager.default.isExecutableFile(atPath: path) {
-                return URL(fileURLWithPath: path)
-            }
-        }
-        return nil
-    }
-
     /// Find Python for the Track-then-Matte pipeline (SAM2 venv with Python 3.10+)
     static func findTrackMattePython() -> URL? {
         let venvPython = venvDir + "/bin/python"
@@ -181,22 +178,48 @@ class PythonBridge: ObservableObject {
         return nil
     }
 
-    static func checkDeps(completion: @escaping (Bool, [String], Bool) -> Void) {
-        if findTrackMattePython() != nil {
-            completion(true, [], true)
-        } else {
-            completion(false, ["python3 (with sam2 venv)"], false)
-        }
-    }
-
-    func startProcessing(videoPath: String, outputDir: String, useCoreML: Bool = true) {
-        guard !isProcessing else { return }
-
+    private func runJSONScript(
+        _ scriptName: String,
+        arguments: [String],
+        responseType: String,
+        completion: @escaping ([String: Any]?) -> Void
+    ) {
         guard let python = Self.findTrackMattePython() else {
-            error = "Python not found. Run ./install.sh first."
+            completion(nil)
             return
         }
-        startTrackMatte(python: python, videoPath: videoPath, outputDir: outputDir)
+        let script = Self.projectRoot.appendingPathComponent("scripts/\(scriptName)")
+        let process = Process()
+        process.executableURL = python
+        process.arguments = [script.path] + arguments
+        process.environment = Self.subprocessEnvironment()
+        process.currentDirectoryURL = Self.projectRoot
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            var result: [String: Any]?
+            do {
+                try process.run()
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                let text = String(data: data, encoding: .utf8) ?? ""
+                for line in text.split(separator: "\n").reversed() {
+                    guard let lineData = line.data(using: .utf8),
+                          let json = try? JSONSerialization.jsonObject(
+                            with: lineData) as? [String: Any],
+                          json["type"] as? String == responseType else {
+                        continue
+                    }
+                    result = json
+                    break
+                }
+            } catch {
+                result = nil
+            }
+            DispatchQueue.main.async { completion(result) }
+        }
     }
 
     /// Analyze a video for clip-selection candidates (long videos). Returns the
@@ -204,40 +227,75 @@ class PythonBridge: ObservableObject {
     func analyzeClips(videoPath: String, outputDir: String,
                       maxSeconds: Double = 15,
                       completion: @escaping ([String: Any]?) -> Void) {
-        guard let python = Self.findTrackMattePython() else {
-            completion(nil); return
-        }
-        let script = Self.projectRoot.appendingPathComponent("scripts/analyze_clips.py")
-        let proc = Process()
-        proc.executableURL = python
-        proc.arguments = [script.path, "--video", videoPath,
-                          "--output-dir", outputDir,
-                          "--max-seconds", "\(maxSeconds)"]
-        proc.environment = Self.subprocessEnvironment()
-        proc.currentDirectoryURL = Self.projectRoot
+        runJSONScript(
+            "analyze_clips.py",
+            arguments: ["--video", videoPath, "--output-dir", outputDir,
+                        "--max-seconds", "\(maxSeconds)"],
+            responseType: "clips",
+            completion: completion)
+    }
 
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
+    /// Validate action semantics before the sequence can unlock movement or
+    /// reaction capabilities in the desktop runtime.
+    func validateAction(
+        framesDirectory: String,
+        kind: String,
+        referenceFramesDirectory: String,
+        completion: @escaping ([String: Any]?) -> Void
+    ) {
+        runJSONScript(
+            "validate_action.py",
+            arguments: [
+            "--frames-dir", framesDirectory,
+            "--reference-frames-dir", referenceFramesDirectory,
+            "--kind", kind,
+            ],
+            responseType: "action_validation",
+            completion: completion)
+    }
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            var result: [String: Any]? = nil
-            do {
-                try proc.run()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                proc.waitUntilExit()
-                // Parse the last JSON line whose type == "clips".
-                let text = String(data: data, encoding: .utf8) ?? ""
-                for line in text.split(separator: "\n").reversed() {
-                    if let d = line.data(using: .utf8),
-                       let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                       j["type"] as? String == "clips" {
-                        result = j; break
-                    }
-                }
-            } catch { result = nil }
-            DispatchQueue.main.async { completion(result) }
+    /// Extract a short motion-focused sequence for a one-shot reaction before
+    /// semantic validation and atomic installation.
+    func prepareAction(
+        framesDirectory: String,
+        outputDirectory: String,
+        kind: String,
+        fps: Int,
+        completion: @escaping ([String: Any]?) -> Void
+    ) {
+        runJSONScript(
+            "prepare_action.py",
+            arguments: [
+            "--frames-dir", framesDirectory,
+            "--output-dir", outputDirectory,
+            "--kind", kind,
+            "--fps", "\(fps)",
+            ],
+            responseType: "action_prepared",
+            completion: completion)
+    }
+
+    func prepareRigAtlas(
+        atlasPath: String,
+        outputDirectory: String,
+        profile: PetTemplateProfile,
+        completion: @escaping ([String: Any]?) -> Void
+    ) {
+        guard let template = CubismTemplateResources.discover(
+            profile: profile, projectRoot: Self.projectRoot) else {
+            completion([
+                "type": "rig_assets_prepared",
+                "prepared": false,
+                "message": "应用缺少内置\(profile.displayName) Live2D 模板",
+            ])
+            return
         }
+        runJSONScript(
+            "prepare_rig_atlas.py",
+            arguments: ["--atlas", atlasPath, "--output-dir", outputDirectory,
+                        "--template-dir", template.root.path],
+            responseType: "rig_assets_prepared",
+            completion: completion)
     }
 
     /// Run quality gate (resolution / brightness / blur / pet detection).
@@ -418,7 +476,9 @@ class PythonBridge: ObservableObject {
         }
     }
 
+    @MainActor
     func startWithClick(videoPath: String, outputDir: String, clickX: Int, clickY: Int,
+                        bbox: [Double]? = nil,
                         startTime: Double = -1, duration: Double = -1) {
         guard !isProcessing, let python = Self.findTrackMattePython() else { return }
 
@@ -434,6 +494,9 @@ class PythonBridge: ObservableObject {
             "--max-seconds", "15",
             "--click", "\(clickX),\(clickY)"
         ]
+        if let bbox, bbox.count == 4 {
+            procArgs += ["--bbox", bbox.map { String($0) }.joined(separator: ",")]
+        }
         // User picked a specific segment → process from there (skip auto-select).
         if startTime >= 0 {
             procArgs += ["--start", "\(startTime)"]
@@ -445,6 +508,7 @@ class PythonBridge: ObservableObject {
         startProcess(proc)
     }
 
+    @MainActor
     private func startTrackMatte(python: URL, videoPath: String, outputDir: String) {
         let script = Self.projectRoot.appendingPathComponent("scripts/track_then_matte.py")
         fputs("DEBUG: track-matte python=\(python.path) script=\(script.path)\n", stderr)
@@ -464,6 +528,7 @@ class PythonBridge: ObservableObject {
         startProcess(proc)
     }
 
+    @MainActor
     private func startProcess(_ proc: Process) {
         // Run from the project root so the scripts' relative pipeline imports
         // resolve correctly. When launched from a .app the default
@@ -476,7 +541,14 @@ class PythonBridge: ObservableObject {
         proc.standardOutput = pipe
         proc.standardError = errPipe
 
+        // The eager Faster R-CNN daemon retains about 1 GB after detection but
+        // is idle during SAM2/BiRefNet. Release it before the heavy model process;
+        // `models_released` starts it again before the user can import another pet.
+        daemon?.terminate()
+
         buffer = ""
+        isShuttingDown = false
+        isCancelling = false
         isProcessing = true
         progress = 0
         error = nil
@@ -497,18 +569,59 @@ class PythonBridge: ObservableObject {
 
         proc.terminationHandler = { [weak self] p in
             DispatchQueue.main.async {
-                self?.isProcessing = false
-                if p.terminationStatus != 0 && self?.error == nil {
-                    self?.error = "Process exited with code \(p.terminationStatus)"
+                guard let self else { return }
+                let wasCurrentProcess = self.process === p
+                let wasCancelled = self.isCancelling
+                if self.process === p {
+                    self.process = nil
+                }
+                self.isProcessing = false
+                self.isCancelling = false
+                if p.terminationStatus != 0 && self.error == nil && !wasCancelled {
+                    self.error = "Process exited with code \(p.terminationStatus)"
+                }
+                if wasCurrentProcess && !self.isShuttingDown
+                    && (wasCancelled || p.terminationStatus != 0) {
+                    NotificationCenter.default.post(
+                        name: .processingFailed,
+                        object: nil,
+                        userInfo: ["cancelled": wasCancelled]
+                    )
+                }
+                if !self.isShuttingDown {
+                    self.daemon?.start()
                 }
             }
         }
 
         self.process = proc
-        try? proc.run()
+        do {
+            try proc.run()
+        } catch {
+            self.process = nil
+            isProcessing = false
+            self.error = "Failed to start processing: \(error.localizedDescription)"
+            NotificationCenter.default.post(
+                name: .processingFailed,
+                object: nil,
+                userInfo: ["cancelled": false]
+            )
+            if !isShuttingDown {
+                daemon?.start()
+            }
+        }
+    }
+
+    @MainActor
+    func shutdown() {
+        isShuttingDown = true
+        process?.terminate()
+        process = nil
+        daemon?.terminate()
     }
 
     func cancelProcessing() {
+        isCancelling = true
         process?.interrupt()
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
             if self?.process?.isRunning == true {
@@ -581,13 +694,12 @@ class PythonBridge: ObservableObject {
                     userInfo: msg
                 )
 
-            case "preview_ready":
-                self.statusText = "Preview ready, refining..."
-                NotificationCenter.default.post(
-                    name: .previewReady,
-                    object: nil,
-                    userInfo: msg
-                )
+            case "models_released":
+                // Heavy model allocations are gone. Re-warm the eager detector
+                // while lightweight quality/encoding work finishes.
+                if !self.isShuttingDown {
+                    self.daemon?.start()
+                }
 
             case "error":
                 if let message = msg["message"] as? String {
@@ -595,6 +707,11 @@ class PythonBridge: ObservableObject {
                     self.statusText = "Error: \(message)"
                 }
                 self.isProcessing = false
+                NotificationCenter.default.post(
+                    name: .processingFailed,
+                    object: nil,
+                    userInfo: ["cancelled": false]
+                )
 
             default:
                 break
@@ -608,9 +725,7 @@ class PythonBridge: ObservableObject {
         case "quality_check": return "Checking quality"
         case "detect": return "Detecting pet"
         case "sam2_track": return "Tracking pet"
-        case "preview_video": return "Generating preview"
         case "birefnet_refine": return "Refining edges"
-        case "final_video": return "Generating video"
         case "segment": return "Segmenting"
         case "normalize": return "Normalizing"
         default: return name
@@ -620,6 +735,6 @@ class PythonBridge: ObservableObject {
 
 extension Notification.Name {
     static let processingComplete = Notification.Name("processingComplete")
-    static let previewReady = Notification.Name("previewReady")
     static let segmentationPoor = Notification.Name("segmentationPoor")
+    static let processingFailed = Notification.Name("processingFailed")
 }

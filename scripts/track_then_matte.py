@@ -13,6 +13,7 @@ Usage:
 Requires Python 3.10+ venv (set REALPET_VENV or default to .venv in project root).
 """
 import argparse
+import gc
 import glob
 import json
 import os
@@ -29,6 +30,8 @@ import numpy as np
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
+
+from pipeline.model_paths import birefnet_checkpoint  # noqa: E402
 
 
 def _weights_dir():
@@ -264,7 +267,10 @@ def measure_grade_stats(frame_paths, logits=None, sample=8):
         return None
     idx = (list(range(n)) if n <= sample
            else [int(round(i * (n - 1) / (sample - 1))) for i in range(sample)])
-    Ys, Ss, neutral, sharps, white_refs = [], [], [], [], []
+    y_samples = None
+    s_samples = None
+    valid_samples = 0
+    neutral, sharps, white_refs = [], [], []
     for i in idx:
         bgr = cv2.imread(frame_paths[i])
         if bgr is None:
@@ -272,10 +278,16 @@ def measure_grade_stats(frame_paths, logits=None, sample=8):
         b = bgr.astype(np.float32)
         h, w = b.shape[:2]
         Y = _luma_bgr(b)
-        Ys.append(Y.ravel())
         mx = b.max(2); mn = b.min(2)  # noqa: E702  # chroma components for HSV-style saturation
         S = np.where(mx > 1, (mx - mn) / np.maximum(mx, 1), 0)
-        Ss.append((S * 255).ravel())
+        if y_samples is None:
+            # Preallocate once instead of retaining per-frame arrays and then
+            # concatenating a second full copy at peak memory.
+            y_samples = np.empty((len(idx), Y.size), dtype=np.float32)
+            s_samples = np.empty((len(idx), S.size), dtype=np.float32)
+        y_samples[valid_samples] = Y.ravel()
+        s_samples[valid_samples] = (S * 255).ravel()
+        valid_samples += 1
         sharps.append(float(cv2.Laplacian(Y, cv2.CV_32F).var()))
         # Gray-world fallback reference: near-neutral mid-tones.
         m = (S < 0.18) & (Y > 30) & (Y < 220)
@@ -286,15 +298,18 @@ def measure_grade_stats(frame_paths, logits=None, sample=8):
         if lg is not None:
             if lg.shape != (h, w):
                 lg = cv2.resize(lg, (w, h), interpolation=cv2.INTER_LINEAR)
-            pet = (1.0 / (1.0 + np.exp(-lg * 2.0))) > 0.5
+            # sigmoid(2*x) > 0.5 is exactly x > 0 and also works for the
+            # compact uint8 tracking masks without unsigned-negation overflow.
+            pet = lg > 0
             if pet.sum() > 500:
                 thr = np.percentile(Y[pet], 85)
                 wm = pet & (Y >= thr) & (S < 0.22)
                 if wm.sum() > 300:
                     white_refs.append(b[wm].reshape(-1, 3).mean(0))
-    if not Ys:
+    if valid_samples == 0:
         return None
-    Y = np.concatenate(Ys); S = np.concatenate(Ss)  # noqa: E702  # single-line concat for readability
+    Y = y_samples[:valid_samples].reshape(-1)
+    S = s_samples[:valid_samples].reshape(-1)
     return {"p1": float(np.percentile(Y, 1)), "p50": float(np.percentile(Y, 50)),
             "p99": float(np.percentile(Y, 99)), "sat": float(S.mean()),
             "sharp": float(np.mean(sharps)) if sharps else 100.0,
@@ -370,7 +385,7 @@ def load_sam2(device="mps"):
     return build_sam2_video_predictor(cfg, checkpoint, device=device)
 
 
-BIREFNET_CHECKPOINT = "ZhengPeng7/BiRefNet-matting"  # was "ZhengPeng7/BiRefNet"
+BIREFNET_CHECKPOINT = birefnet_checkpoint()
 # Edge refine spike (2026-06-19, tech/BIREFNET_EDGE_REFINE_SPIKE.md §4) proved:
 #   no-sigmoid = hard clip(logits, 0, 1) → "scissor-cut" fur, loses wisps
 #   sigmoid alone = green halo on chroma key (soft band 5-7× wider)
@@ -402,10 +417,16 @@ def load_birefnet(device="mps", resolution=1024):
     from torchvision import transforms
     from transformers import AutoModelForImageSegmentation
 
+    device_name = str(device)
+    use_half = device_name.startswith("mps") or device_name.startswith("cuda")
+    inference_dtype = torch.float16 if use_half else torch.float32
+    # The prior MPS path loaded an 885 MB FP32 state dict and then converted the
+    # entire model to FP16. Loading directly into the same final dtype avoids the
+    # transient duplicate without changing any inference parameter bits.
     model = AutoModelForImageSegmentation.from_pretrained(
-        BIREFNET_CHECKPOINT, trust_remote_code=True, dtype=torch.float32
+        BIREFNET_CHECKPOINT, trust_remote_code=True, dtype=inference_dtype
     )
-    model = model.half().to(device).eval()
+    model = model.to(device=device, dtype=inference_dtype).eval()
 
     transform = transforms.Compose([
         transforms.Resize((resolution, resolution)),
@@ -414,8 +435,10 @@ def load_birefnet(device="mps", resolution=1024):
     ])
 
     # Warm up
-    with torch.no_grad():
-        _ = model(torch.randn(1, 3, resolution, resolution).to(device).half())
+    with torch.inference_mode():
+        _ = model(torch.randn(
+            1, 3, resolution, resolution,
+            device=device, dtype=inference_dtype))
 
     return model, transform
 
@@ -718,7 +741,16 @@ def stabilize_frames(frame_paths, smooth_radius=STABILIZE_SMOOTH_RADIUS,
     return list(frame_paths), True, report
 
 
-def pass1_sam2(frames, click_point, progress_callback=None, device=None):
+class TrackingMasks(dict):
+    """Per-frame SAM2 binary masks plus exact scalar confidence metrics."""
+
+    def __init__(self):
+        super().__init__()
+        self.object_scores = {}
+
+
+def pass1_sam2(frames, click_point, progress_callback=None, device=None,
+               prompt_bbox=None):
     """Pass 1: SAM2 tracking → logit collection.
 
     Runs SAM2 once on ALL frames and returns the per-frame tracking logits.
@@ -731,9 +763,12 @@ def pass1_sam2(frames, click_point, progress_callback=None, device=None):
         click_point: (x, y) tuple for the pet location
         progress_callback: optional callback(phase, current, total, detail)
         device: torch device for SAM2; defaults to mps if available else cpu
+        prompt_bbox: detector bbox already produced by the confirmation step.
+            Supplying it avoids loading Faster R-CNN again in this process.
 
     Returns:
-        dict mapping frame_idx → raw logit (float32)
+        TrackingMasks mapping frame_idx → uint8 binary mask, with the exact
+        resized-logit mean-absolute confidence stored in `object_scores`.
     """
     import torch
 
@@ -747,18 +782,26 @@ def pass1_sam2(frames, click_point, progress_callback=None, device=None):
     # Prepare frames for SAM2 (needs numbered files)
     sam2_dir = tempfile.mkdtemp(prefix="sam2_")
     for i, f in enumerate(frames):
-        shutil.copy(f, f"{sam2_dir}/{i:05d}.jpg")
+        destination = f"{sam2_dir}/{i:05d}.jpg"
+        try:
+            os.symlink(os.path.abspath(f), destination)
+        except OSError:
+            # Unusual filesystems may reject symlinks; retain the copy fallback.
+            shutil.copy2(f, destination)
 
     # Initialize and add prompt (bbox if available, else point)
     inference_state = sam2.init_state(video_path=sam2_dir)
     cx, cy = click_point
 
-    # Try to get pet bbox for better SAM2 tracking
-    try:
-        from pipeline.pet_detector import detect_pet_bbox
-        pet_bbox = detect_pet_bbox(frames[0])
-    except Exception:
-        pet_bbox = None
+    # Reuse the bbox from the user-confirmed detector result. Direct CLI callers
+    # without a bbox retain the original automatic detection fallback.
+    pet_bbox = prompt_bbox
+    if pet_bbox is None:
+        try:
+            from pipeline.pet_detector import detect_pet_bbox
+            pet_bbox = detect_pet_bbox(frames[0])
+        except Exception:
+            pet_bbox = None
 
     if pet_bbox:
         # Use bbox prompt (much better tracking)
@@ -777,14 +820,19 @@ def pass1_sam2(frames, click_point, progress_callback=None, device=None):
         emit({"type": "progress", "phase": "sam2_track",
               "detail": f"point prompt: ({cx}, {cy})"})
 
-    # Propagate once on all frames, collecting logits
-    logits = {}
+    # Propagate once on all frames. Every downstream visual operation thresholds
+    # the resized logits at zero, so retain that exact binary result plus the one
+    # scalar quality metric instead of four bytes of logits per pixel.
+    frame_h, frame_w = cv2.imread(frames[0]).shape[:2]
+    masks = TrackingMasks()
 
     t0 = time.time()
     for frame_idx, obj_ids, mask_logits in sam2.propagate_in_video(inference_state):
-        # Always store logit
-        logit = mask_logits[0].cpu().numpy().squeeze()
-        logits[frame_idx] = logit
+        logit = mask_logits[0].detach().cpu().numpy().squeeze()
+        if logit.shape != (frame_h, frame_w):
+            logit = cv2.resize(logit, (frame_w, frame_h), interpolation=cv2.INTER_LINEAR)
+        masks.object_scores[frame_idx] = float(np.mean(np.abs(logit)))
+        masks[frame_idx] = (logit > 0).astype(np.uint8)
 
         if progress_callback:
             progress_callback("sam2_track", frame_idx + 1, len(frames),
@@ -796,14 +844,15 @@ def pass1_sam2(frames, click_point, progress_callback=None, device=None):
           "detail": f"done ({elapsed:.1f}s)"})
 
     # Free SAM2 model from GPU memory
-    del sam2
+    del inference_state, sam2
+    gc.collect()
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
     # Cleanup
     shutil.rmtree(sam2_dir, ignore_errors=True)
 
-    return logits
+    return masks
 
 
 def get_roi_from_logit(logit, h, w, margin=0.10):
@@ -818,8 +867,8 @@ def get_roi_from_logit(logit, h, w, margin=0.10):
         (x1, y1, x2, y2) or None if no foreground
     """
     # Convert logit to binary mask
-    soft = 1.0 / (1.0 + np.exp(-logit * 2.0))
-    binary = (soft > 0.5).astype(np.uint8)
+    # sigmoid(2*x) > 0.5 is exactly x > 0. Avoid two full-size temporaries.
+    binary = (logit > 0).astype(np.uint8)
 
     # Find contours
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -893,7 +942,7 @@ def _birefnet_alpha(model, norm_transform, img_bgr, resolution, device=None):
     dev_str = str(device)
     if dev_str.startswith("mps") or dev_str.startswith("cuda"):
         inp = inp.half()
-    with torch.no_grad():
+    with torch.inference_mode():
         pred = model(inp)
         if isinstance(pred, (list, tuple)):
             pred = pred[-1]
@@ -936,7 +985,6 @@ def fb_blur_fusion_fg(image, alpha, r=35):
 
 
 def pass2_birefnet(frames, sam2_logits, output_dir, progress_callback=None,
-                   preview_limit=None, on_preview_ready=None,
                    device=None):
     """Pass 2: BiRefNet refinement with ROI cropping → final alpha.
 
@@ -949,9 +997,6 @@ def pass2_birefnet(frames, sam2_logits, output_dir, progress_callback=None,
         sam2_logits: dict from pass1_sam2 (frame_idx → raw logit)
         output_dir: directory to save final RGBA PNGs
         progress_callback: optional callback(phase, current, total, detail)
-        preview_limit: if set with on_preview_ready, fire the callback once the
-            first N frames are matted (these ARE final frames — preview == final)
-        on_preview_ready: callback(n) invoked after the first N frames are saved
         device: torch device for BiRefNet; defaults to mps if available else cpu
     """
     import torch
@@ -998,169 +1043,157 @@ def pass2_birefnet(frames, sam2_logits, output_dir, progress_callback=None,
 
     t0 = time.time()
     total_pixels_saved = 0
+    # Alpha and SAM2 masks are needed across the temporal window, but RGB is not.
+    # Keep those two byte planes in file-backed arrays and re-read RGB only once
+    # when writing output. This replaces the previous 5 bytes/pixel/frame of
+    # resident lists (RGB + alpha + mask) with bounded working memory.
+    with tempfile.TemporaryDirectory(prefix="realpet_matte_") as scratch_dir:
+        shape = (len(frames), h, w)
+        alpha_store = np.memmap(os.path.join(scratch_dir, "alpha.u8"),
+                                mode="w+", dtype=np.uint8, shape=shape)
+        mask_store = np.memmap(os.path.join(scratch_dir, "sam2.u8"),
+                               mode="w+", dtype=np.uint8, shape=shape)
 
-    # PARTC §2.3: collect per-frame alpha + sam2_binary for temporal smoothing
-    # after the BiRefNet loop. FB fusion + PNG write happen on the SMOOTHED
-    # alpha (replaces per-frame loop body in the integration below).
-    alpha_final_list = []
-    sam2_binary_list = []
-    img_list = []  # noqa: F841  # colour-graded RGB for FB fusion after smoothing
-    bgr_pre_fb_list = []  # raw RGB (pre-FB) for FB fusion input
-
-    for i, fp in enumerate(frames):
-        img = cv2.imread(fp)
-        # Missing logit: no SAM2 data → use full gate (BiRefNet alpha unchanged)
-        logit = sam2_logits.get(i, None)
-
-        # Resize logit if needed (guard against missing/None logit — a dropped
-        # SAM2 frame must NOT crash the whole pass)
-        if logit is not None and logit.shape != (h, w):
-            logit = cv2.resize(logit, (w, h), interpolation=cv2.INTER_LINEAR)
-
-        # Get ROI from SAM2 mask (None logit → no ROI, falls back to full image)
-        roi = get_roi_from_logit(logit, h, w, margin=0.10) if logit is not None else None
-
-        if roi is not None:
-            x1, y1, x2, y2 = roi
-            roi_w = x2 - x1
-            roi_h = y2 - y1
-
-            # Aspect-preserving BiRefNet on the pet crop
-            alpha_crop = _birefnet_alpha(model, norm_transform,
-                                         img[y1:y2, x1:x2], roi_resolution,
-                                         device=device)
-            birefnet_alpha = np.zeros((h, w), dtype=np.uint8)
-            birefnet_alpha[y1:y2, x1:x2] = alpha_crop
-
-            total_pixels_saved += h * w - roi_h * roi_w
-        else:
-            # No ROI found → aspect-preserving full-frame inference
-            birefnet_alpha = _birefnet_alpha(model, norm_transform, img,
-                                              roi_resolution, device=device)
-
-        # SAM2 gate: binary → dilate → blur (original design, verified 06/07)
-        # Gate = 1.0 inside pet + margin, 0.0 outside, blurred at edge
-        # Preserves BiRefNet's soft alpha inside the pet (gate=1.0 is no-op)
-        if logit is not None:
-            sam2_soft = 1.0 / (1.0 + np.exp(-logit * 2.0))
-            sam2_binary = (sam2_soft > 0.5).astype(np.uint8)
-            sam2_dilated = cv2.dilate(sam2_binary, kernel, iterations=1)
-            sam2_gate = np.clip(
-                cv2.GaussianBlur(sam2_dilated.astype(np.float32), (0, 0), 3.0), 0, 1
-            )
-        else:
-            # No SAM2 data → full gate (BiRefNet alpha unchanged)
-            sam2_gate = np.ones((h, w), dtype=np.float32)
-            sam2_binary = np.ones((h, w), dtype=np.uint8)  # always "in" → smooth allowed everywhere
-
-        # Combine
-        alpha_final = (birefnet_alpha.astype(float) * sam2_gate).astype(np.uint8)
-        alpha_final = cv2.GaussianBlur(alpha_final, (0, 0), 0.5)
-
-        # PARTC §2.3: collect for temporal smoothing; FB fusion + write happens
-        # AFTER the loop using the smoothed alpha.
-        alpha_final_list.append(alpha_final)
-        sam2_binary_list.append(sam2_binary)
-
-        bgr_out = apply_grade(img, grade) if grade is not None else img
-        bgr_pre_fb_list.append(bgr_out)
-
-        if progress_callback:
-            progress_callback("birefnet_refine", i + 1, len(frames),
-                              f"frame_{i:04d}")
-
-        # PARTC §2.3 preview bookkeeping — the old design fired
-        # on_preview_ready per-frame, but FB fusion + PNG write now happen
-        # AFTER the BiRefNet loop (so alpha is post-temporal-smooth when
-        # written). We remember the FIRST preview_limit indices instead and
-        # trigger on_preview_ready at the end (see below).
-        if (on_preview_ready is not None and preview_limit
-                and i + 1 == min(preview_limit, len(frames))):
-            # Defer — see bottom of pass2
-            pass
-
-    elapsed = time.time() - t0
-    roi_pct = total_pixels_saved / (h * w * len(frames)) * 100 if frames else 0
-    emit({"type": "progress", "phase": "birefnet_refine",
-          "current": len(frames), "total": len(frames),
-          "detail": f"done ({elapsed:.1f}s, ROI saved {roi_pct:.0f}% pixels)"})
-
-    # PARTC §2.3: motion-gated temporal smoothing across all frames, then
-    # FB fusion + PNG write. Smoothing before FB fusion matters: FB reads
-    # alpha to decide which pixels to unmix, and we want that alpha to be
-    # the SHIMMER-REMOVED version, not the per-frame raw.
-    if TEMPORAL_ALPHA_SMOOTH and len(alpha_final_list) >= 3:
-        emit({"type": "phase", "name": "temporal_smooth",
-              "detail": f"motion-gated median, window ±{TEMPORAL_WINDOW} frames, "
-                        f"soft band only, wrap at loop seam"})
         try:
-            def _ts_prog(phase, current, total, detail):
-                emit({"type": "progress", "phase": phase,
-                      "current": current, "total": total, "detail": detail})
-            t1 = time.time()
-            smoothed = motion_gated_temporal_smooth(
-                alpha_final_list, sam2_binary_list,
-                window=TEMPORAL_WINDOW,
-                progress_callback=_ts_prog,
-            )
-            # shimmer before/after measurement
-            def _shimmer(alphas):
-                K = np.ones((3, 3), np.uint8)
-                disps = []
-                for j in range(1, len(alphas)):
-                    m0 = (alphas[j - 1] > 128).astype(np.uint8)
-                    m1 = (alphas[j] > 128).astype(np.uint8)
-                    e0 = cv2.dilate(m0, K) - m0
-                    inv = 1 - m1
-                    dt = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
-                    if np.any(e0 > 0):
-                        disps.append(float(dt[e0 > 0].mean()))
-                    else:
-                        disps.append(0.0)
-                d = np.array(disps)
-                return float(d.mean()), float(np.percentile(d, 95)), float(d.max())
-            sm_before_mean, sm_before_p95, _ = _shimmer(alpha_final_list)
-            sm_after_mean, sm_after_p95, _ = _shimmer(smoothed)
-            emit({"type": "progress", "phase": "temporal_smooth",
-                  "detail": f"edge shimmer mean {sm_before_mean:.2f}→{sm_after_mean:.2f}px "
-                            f"p95 {sm_before_p95:.2f}→{sm_after_p95:.2f}px "
-                            f"in {time.time()-t1:.2f}s"})
-            alpha_final_list = smoothed
-            emit({"type": "temporal_smooth_done",
-                  "before_mean": sm_before_mean, "after_mean": sm_after_mean,
-                  "before_p95": sm_before_p95, "after_p95": sm_after_p95,
-                  "window": int(TEMPORAL_WINDOW)})
-        except Exception as e:
-            emit({"type": "progress", "phase": "temporal_smooth",
-                  "detail": f"failed ({type(e).__name__}: {e}), keeping raw alpha"})
-            # alpha_final_list unchanged → fall through with raw
+            for i, fp in enumerate(frames):
+                img = cv2.imread(fp)
+                raw_logit = sam2_logits.get(i, None)
+                logit = (np.asarray(raw_logit)
+                         if raw_logit is not None else None)
 
-    # FB fusion + write PNG — using the (possibly smoothed) alpha_final.
-    for i, (alpha_final, bgr_out) in enumerate(zip(alpha_final_list, bgr_pre_fb_list)):
-        # Optional edge refine: remove the background color leaked into soft
-        # edge pixels (BiRefNet's bundled handler.py does this, we didn't).
-        # Runs on the *graded* RGB so the unmixing matches what the user sees.
-        # r scales with the PET bbox width (subject-relative, not canvas-relative).
-        # Cost: two cv2.blur per frame, ~ms. See tech/BIREFNET_EDGE_REFINE_SPIKE.md §3.
-        if FG_ESTIMATE and alpha_final.max() > 0:
-            ys_fg, xs_fg = np.where(alpha_final > 0)
-            pet_w = int(xs_fg.max() - xs_fg.min()) if xs_fg.size else w
-            fg_r = max(FG_RADIUS_MIN, int(pet_w * FG_RADIUS_RATIO))
-            rgb = cv2.cvtColor(bgr_out, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            a = alpha_final.astype(np.float32) / 255.0
-            F = fb_blur_fusion_fg(rgb, a, r=fg_r)
-            bgr_out = cv2.cvtColor(
-                (np.clip(F, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR
-            )
+                if logit is not None and logit.shape != (h, w):
+                    logit = cv2.resize(logit, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        bgra = cv2.cvtColor(bgr_out, cv2.COLOR_BGR2BGRA)
-        bgra[:, :, 3] = alpha_final
-        cv2.imwrite(f"{output_dir}/frame_{i:04d}.png", bgra)
+                roi = (get_roi_from_logit(logit, h, w, margin=0.10)
+                       if logit is not None else None)
 
-        # Preview: first N frames — fire callback when Nth is written
-        if (on_preview_ready is not None and preview_limit
-                and i + 1 == min(preview_limit, len(frames))):
-            on_preview_ready(i + 1)
+                if roi is not None:
+                    x1, y1, x2, y2 = roi
+                    roi_w = x2 - x1
+                    roi_h = y2 - y1
+                    alpha_crop = _birefnet_alpha(
+                        model, norm_transform, img[y1:y2, x1:x2],
+                        roi_resolution, device=device)
+                    birefnet_alpha = np.zeros((h, w), dtype=np.uint8)
+                    birefnet_alpha[y1:y2, x1:x2] = alpha_crop
+                    total_pixels_saved += h * w - roi_h * roi_w
+                else:
+                    birefnet_alpha = _birefnet_alpha(
+                        model, norm_transform, img, roi_resolution, device=device)
+
+                if logit is not None:
+                    # sigmoid(2*x) > 0.5 is exactly x > 0.
+                    sam2_binary = (logit > 0).astype(np.uint8)
+                    sam2_dilated = cv2.dilate(sam2_binary, kernel, iterations=1)
+                    sam2_gate = np.clip(cv2.GaussianBlur(
+                        sam2_dilated.astype(np.float32), (0, 0), 3.0), 0, 1)
+                else:
+                    sam2_gate = np.ones((h, w), dtype=np.float32)
+                    sam2_binary = np.ones((h, w), dtype=np.uint8)
+
+                alpha_final = (birefnet_alpha.astype(float)
+                               * sam2_gate).astype(np.uint8)
+                alpha_store[i] = cv2.GaussianBlur(alpha_final, (0, 0), 0.5)
+                mask_store[i] = sam2_binary
+
+                if progress_callback:
+                    progress_callback("birefnet_refine", i + 1, len(frames),
+                                      f"frame_{i:04d}")
+                del img, raw_logit, logit, birefnet_alpha, sam2_binary
+                del sam2_gate, alpha_final
+        finally:
+            # BiRefNet is no longer needed by temporal smoothing or PNG output.
+            # Release it before those CPU-heavy phases so its weights do not
+            # overlap with their working set.
+            del model
+            gc.collect()
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+
+        alpha_store.flush()
+        mask_store.flush()
+
+        elapsed = time.time() - t0
+        roi_pct = total_pixels_saved / (h * w * len(frames)) * 100 if frames else 0
+        emit({"type": "progress", "phase": "birefnet_refine",
+              "current": len(frames), "total": len(frames),
+              "detail": f"done ({elapsed:.1f}s, ROI saved {roi_pct:.0f}% pixels)"})
+
+        effective_alphas = alpha_store
+        smoothed_store = None
+        if TEMPORAL_ALPHA_SMOOTH and len(frames) >= 3:
+            emit({"type": "phase", "name": "temporal_smooth",
+                  "detail": f"motion-gated median, window ±{TEMPORAL_WINDOW} frames, "
+                            f"soft band only, wrap at loop seam"})
+            try:
+                def _ts_prog(phase, current, total, detail):
+                    emit({"type": "progress", "phase": phase,
+                          "current": current, "total": total, "detail": detail})
+
+                t1 = time.time()
+                smoothed_store = np.memmap(
+                    os.path.join(scratch_dir, "alpha-smoothed.u8"),
+                    mode="w+", dtype=np.uint8, shape=shape)
+                motion_gated_temporal_smooth(
+                    alpha_store, mask_store, window=TEMPORAL_WINDOW,
+                    progress_callback=_ts_prog, output=smoothed_store)
+                smoothed_store.flush()
+
+                def _shimmer(alphas):
+                    K = np.ones((3, 3), np.uint8)
+                    disps = []
+                    for j in range(1, len(alphas)):
+                        m0 = (alphas[j - 1] > 128).astype(np.uint8)
+                        m1 = (alphas[j] > 128).astype(np.uint8)
+                        e0 = cv2.dilate(m0, K) - m0
+                        dt = cv2.distanceTransform(1 - m1, cv2.DIST_L2, 3)
+                        disps.append(float(dt[e0 > 0].mean())
+                                     if np.any(e0 > 0) else 0.0)
+                    d = np.array(disps)
+                    return float(d.mean()), float(np.percentile(d, 95)), float(d.max())
+
+                sm_before_mean, sm_before_p95, _ = _shimmer(alpha_store)
+                sm_after_mean, sm_after_p95, _ = _shimmer(smoothed_store)
+                emit({"type": "progress", "phase": "temporal_smooth",
+                      "detail": f"edge shimmer mean {sm_before_mean:.2f}→{sm_after_mean:.2f}px "
+                                f"p95 {sm_before_p95:.2f}→{sm_after_p95:.2f}px "
+                                f"in {time.time()-t1:.2f}s"})
+                effective_alphas = smoothed_store
+                emit({"type": "temporal_smooth_done",
+                      "before_mean": sm_before_mean, "after_mean": sm_after_mean,
+                      "before_p95": sm_before_p95, "after_p95": sm_after_p95,
+                      "window": int(TEMPORAL_WINDOW)})
+            except Exception as e:
+                emit({"type": "progress", "phase": "temporal_smooth",
+                      "detail": f"failed ({type(e).__name__}: {e}), keeping raw alpha"})
+                effective_alphas = alpha_store
+
+        # FB fusion + PNG write. RGB is decoded and graded here, so it never
+        # remains resident for the full clip.
+        for i, fp in enumerate(frames):
+            alpha_final = np.asarray(effective_alphas[i])
+            img = cv2.imread(fp)
+            bgr_out = apply_grade(img, grade) if grade is not None else img
+
+            if FG_ESTIMATE and alpha_final.max() > 0:
+                ys_fg, xs_fg = np.where(alpha_final > 0)
+                pet_w = int(xs_fg.max() - xs_fg.min()) if xs_fg.size else w
+                fg_r = max(FG_RADIUS_MIN, int(pet_w * FG_RADIUS_RATIO))
+                rgb = cv2.cvtColor(bgr_out, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                a = alpha_final.astype(np.float32) / 255.0
+                F = fb_blur_fusion_fg(rgb, a, r=fg_r)
+                bgr_out = cv2.cvtColor(
+                    (np.clip(F, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+            bgra = cv2.cvtColor(bgr_out, cv2.COLOR_BGR2BGRA)
+            bgra[:, :, 3] = alpha_final
+            cv2.imwrite(f"{output_dir}/frame_{i:04d}.png", bgra)
+
+        # Drop mappings before TemporaryDirectory unlinks their backing files.
+        del effective_alphas
+        if smoothed_store is not None:
+            del smoothed_store
+        del mask_store, alpha_store
 
     elapsed = time.time() - t0
     roi_pct = total_pixels_saved / (h * w * len(frames)) * 100 if frames else 0
@@ -1171,7 +1204,8 @@ def pass2_birefnet(frames, sam2_logits, output_dir, progress_callback=None,
 
 # === Quality Feedback Loop ===
 
-def compute_frame_metrics(sam2_logit, birefnet_alpha, yolo_bbox, prev_mask, h, w):
+def compute_frame_metrics(sam2_logit, birefnet_alpha, yolo_bbox, prev_mask, h, w,
+                          object_score_override=None):
     """Compute 6 quality metrics for a single frame.
 
     All metrics are derived from data already computed — no extra model calls.
@@ -1188,8 +1222,10 @@ def compute_frame_metrics(sam2_logit, birefnet_alpha, yolo_bbox, prev_mask, h, w
     """
     # 1. Mask coverage (use BiRefNet alpha if SAM2 logit missing)
     if sam2_logit is not None:
-        sam2_mask = (1.0 / (1.0 + np.exp(-sam2_logit * 2.0)) > 0.5).astype(np.uint8)
-        object_score = float(np.mean(np.abs(sam2_logit)))
+        sam2_mask = (sam2_logit > 0).astype(np.uint8)
+        object_score = (float(object_score_override)
+                        if object_score_override is not None
+                        else float(np.mean(np.abs(sam2_logit))))
     else:
         sam2_mask = (birefnet_alpha > 128).astype(np.uint8)
         object_score = 0.0
@@ -1309,7 +1345,10 @@ def run_quality_feedback(alphas, logits, yolo_bbox, h, w, frame_paths=None, emit
         sam2_logit = logits.get(i, None)
         # Only check anchor IoU on first frame (after that, cat has moved)
         anchor_bbox = yolo_bbox if i == 0 else None
-        m = compute_frame_metrics(sam2_logit, alphas[i], anchor_bbox, prev_mask, h, w)
+        object_score = getattr(logits, "object_scores", {}).get(i)
+        m = compute_frame_metrics(
+            sam2_logit, alphas[i], anchor_bbox, prev_mask, h, w,
+            object_score_override=object_score)
         metrics.append(m)
         prev_mask = (alphas[i] > 128).astype(np.uint8)
 
@@ -1329,6 +1368,102 @@ def run_quality_feedback(alphas, logits, yolo_bbox, h, w, frame_paths=None, emit
     red_frames = [i for i in range(total) if metrics[i]["status"] == "red"]
 
     return alphas, metrics, len(red_frames)
+
+
+def _read_output_alpha(final_dir, index, h, w):
+    """Read one output alpha plane, returning transparent alpha on corruption."""
+    path = os.path.join(final_dir, f"frame_{index:04d}.png")
+    bgra = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if bgra is None or bgra.ndim != 3 or bgra.shape[2] != 4:
+        return np.zeros((h, w), dtype=np.uint8)
+    return bgra[:, :, 3]
+
+
+def run_quality_feedback_from_files(final_dir, n, logits, yolo_bbox, h, w):
+    """Streaming equivalent of `run_quality_feedback` for saved RGBA frames.
+
+    Only the current alpha and previous binary mask are resident. Coverage is
+    returned for the deflicker pass so the PNG sequence is decoded just once.
+    """
+    metrics = []
+    coverage = np.zeros(n, dtype=np.float64)
+    prev_mask = None
+    hw = float(h * w)
+
+    for i in range(n):
+        alpha = _read_output_alpha(final_dir, i, h, w)
+        coverage[i] = (alpha > 128).sum() / hw
+        raw_logit = logits.get(i, None)
+        sam2_logit = (np.asarray(raw_logit)
+                      if raw_logit is not None else None)
+        if sam2_logit is not None and sam2_logit.shape != (h, w):
+            sam2_logit = cv2.resize(sam2_logit, (w, h), interpolation=cv2.INTER_LINEAR)
+        anchor_bbox = yolo_bbox if i == 0 else None
+        object_score = getattr(logits, "object_scores", {}).get(i)
+        metrics.append(compute_frame_metrics(
+            sam2_logit, alpha, anchor_bbox, prev_mask, h, w,
+            object_score_override=object_score))
+        prev_mask = (alpha > 128).astype(np.uint8)
+
+    red_count = sum(1 for metric in metrics if metric["status"] == "red")
+    return metrics, red_count, coverage
+
+
+def _find_alpha_flash_frames(coverage, spike_thresh=0.40, neighbor_agree=0.15):
+    """Return anomalous indices from normalized per-frame alpha coverage."""
+    n = len(coverage)
+    flagged = []
+    for i in range(n):
+        if i == 0:
+            na, nb = 1, 2
+        elif i == n - 1:
+            na, nb = n - 2, n - 3
+        else:
+            na, nb = i - 1, i + 1
+        base = (coverage[na] + coverage[nb]) / 2.0
+        neighbors_agree = abs(coverage[na] - coverage[nb]) <= (
+            neighbor_agree * max(coverage[na], coverage[nb], 1e-6))
+        dev = abs(coverage[i] - base) / max(base, 1e-6)
+        if neighbors_agree and dev >= spike_thresh:
+            flagged.append(i)
+    return flagged
+
+
+def stabilize_alpha_temporal_files(final_dir, n, h, w, coverage=None,
+                                   spike_thresh=0.40, neighbor_agree=0.15):
+    """Repair alpha flashes in RGBA files without retaining the clip in RAM."""
+    if n < 3:
+        return []
+    if coverage is None:
+        hw = float(h * w)
+        coverage = np.array([
+            (_read_output_alpha(final_dir, i, h, w) > 128).sum() / hw
+            for i in range(n)
+        ], dtype=np.float64)
+
+    flagged = _find_alpha_flash_frames(coverage, spike_thresh, neighbor_agree)
+    repairs = {}
+    for i in flagged:
+        if i == 0:
+            na, nb = 1, 2
+        elif i == n - 1:
+            na, nb = n - 2, n - 3
+        else:
+            na, nb = i - 1, i + 1
+        stack = np.stack([
+            _read_output_alpha(final_dir, i, h, w),
+            _read_output_alpha(final_dir, na, h, w),
+            _read_output_alpha(final_dir, nb, h, w),
+        ], axis=0)
+        repairs[i] = np.median(stack, axis=0).astype(np.uint8)
+
+    for i, repaired_alpha in repairs.items():
+        path = os.path.join(final_dir, f"frame_{i:04d}.png")
+        bgra = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if bgra is not None and bgra.ndim == 3 and bgra.shape[2] == 4:
+            bgra[:, :, 3] = repaired_alpha
+            cv2.imwrite(path, bgra)
+    return flagged
 
 
 def stabilize_alpha_temporal(alphas, spike_thresh=0.40, neighbor_agree=0.15):
@@ -1369,23 +1504,16 @@ def stabilize_alpha_temporal(alphas, spike_thresh=0.40, neighbor_agree=0.15):
     cov = np.array([(a > 128).sum() / hw for a in alphas], dtype=np.float64)
 
     out = list(alphas)
-    flagged = []
-    for i in range(n):
+    flagged = _find_alpha_flash_frames(cov, spike_thresh, neighbor_agree)
+    for i in flagged:
         if i == 0:
             na, nb = 1, 2
         elif i == n - 1:
             na, nb = n - 2, n - 3
         else:
             na, nb = i - 1, i + 1
-
-        base = (cov[na] + cov[nb]) / 2.0
-        neighbors_agree = abs(cov[na] - cov[nb]) <= neighbor_agree * max(cov[na], cov[nb], 1e-6)
-        dev = abs(cov[i] - base) / max(base, 1e-6)
-
-        if neighbors_agree and dev >= spike_thresh:
-            flagged.append(i)
-            stack = np.stack([alphas[i], alphas[na], alphas[nb]], axis=0)
-            out[i] = np.median(stack, axis=0).astype(np.uint8)
+        stack = np.stack([alphas[i], alphas[na], alphas[nb]], axis=0)
+        out[i] = np.median(stack, axis=0).astype(np.uint8)
 
     return out, flagged
 
@@ -1447,17 +1575,6 @@ def repair_opacity_flashes(final_dir, n, emit_fn=None, ratio=0.88, solid=205):
     return flagged
 
 
-def make_background(h, w, color=(30, 30, 30)):
-    """Generate solid dark background for video preview.
-
-    Uses solid color instead of checkerboard to avoid visual artifacts
-    in semi-transparent edge regions.
-    """
-    bg = np.zeros((h, w, 3), dtype=np.uint8)
-    bg[:, :] = color
-    return bg
-
-
 # === Motion-gated temporal alpha smoothing (Part C #2b — tech/PET_STABILIZATION_PARTC.md) ===
 # Why: BiRefNet predicts each frame independently, so the soft alpha band on
 # edges shimmers frame-to-frame (~3.3 / 8 mean/p95 px on IMG_0847). The cat's
@@ -1485,7 +1602,8 @@ TEMPORAL_WINDOW = 2     # ±2 frames = 5-frame window (1+2*2); swept 1/2/3 in §
 def motion_gated_temporal_smooth(alphas, sam2_binaries,
                                  window=TEMPORAL_WINDOW,
                                  soft_lo=1, soft_hi=255,
-                                 progress_callback=None):
+                                 progress_callback=None, output=None,
+                                 chunk_rows=64):
     """Per-pixel motion-gated temporal median of soft-edge alpha.
 
     Args:
@@ -1495,14 +1613,16 @@ def motion_gated_temporal_smooth(alphas, sam2_binaries,
         soft_lo, soft_hi: alpha band eligible for smoothing. Defaults 1..254
             (anything strictly between full-transparent and full-opaque).
         progress_callback(phase, current, total, detail) optional.
+        output: optional preallocated uint8 (N,H,W) array or memmap. Supplying
+            a memmap bounds resident memory for full-resolution clips.
+        chunk_rows: number of image rows processed per working chunk.
 
     Returns:
-        list of N uint8 H×W smoothed alphas. Frames where motion was detected
-        in the local window at that pixel are passed through unchanged.
+        uint8 (N,H,W) output (or the supplied `output`). Frames where motion was
+        detected in the local window at that pixel are passed through unchanged.
 
-    Implementation note: vectorised via numpy stride tricks for speed.
-    The wrap trick is `np.roll(stack, k, axis=0)` to address out-of-bounds
-    frames cheaply (no copies needed for reads).
+    The implementation streams frame/row chunks. Peak working memory is
+    O((2*window+1)*chunk_rows*W), independent of clip length and height.
     """
     n = len(alphas)
     if n < 3 or window < 1:
@@ -1512,54 +1632,49 @@ def motion_gated_temporal_smooth(alphas, sam2_binaries,
     if any(a.shape != (H, W) for a in alphas) or any(s.shape != (H, W) for s in sam2_binaries):
         return alphas  # shape mismatch → no-op (don't crash the pipeline)
 
-    # Stack into 3D arrays for vectorised indexing. (n, H, W)
-    a_stack = np.stack(alphas, axis=0).astype(np.uint8)
-    s_stack = np.stack(sam2_binaries, axis=0).astype(np.uint8)
+    if output is None:
+        out = np.empty((n, H, W), dtype=np.uint8)
+    else:
+        if output.shape != (n, H, W) or output.dtype != np.uint8:
+            raise ValueError("output must be a uint8 array with shape (N,H,W)")
+        out = output
 
-    # 1) motion mask: per-pixel "did sam2_binary flip anywhere in the local window"
-    # s_stack is {0,1}; rolling-window max == 1 if any sample is 1, min == 0 if any is 0.
-    # Flipped iff max != min.
-    flipped = np.zeros((n, H, W), dtype=bool)
-    for k in range(-window, window + 1):
-        if k == 0:
-            continue
-        rolled = np.roll(s_stack, k, axis=0)
-        flipped |= (rolled != s_stack)
-
-    # 2) soft-band mask: 0 < alpha < 255 (per-pixel, per-frame)
-    soft = (a_stack > soft_lo) & (a_stack < soft_hi)
-
-    # 3) eligible-for-smooth mask: soft AND not-flipped
-    eligible = soft & ~flipped
-
-    # 4) per-pixel median across the window. Build a (n, W*H, k_len) tensor and
-    #    take median along last axis. Memory: n*W*H*k_len uint8. For 72 frames
-    #    at 1920×1080 with window=2: 72*2M*5 ≈ 720MB uint8 ≈ 720MB. Too big.
-    #    Chunk along the H axis instead.
-    out = a_stack.copy()  # default: unchanged
-    chunk_rows = 64
+    chunk_rows = max(1, int(chunk_rows))
     n_chunks = (H + chunk_rows - 1) // chunk_rows
-    for ci in range(n_chunks):
-        y0 = ci * chunk_rows
-        y1 = min(y0 + chunk_rows, H)
-        # slice on this chunk
-        a_chunk = a_stack[:, y0:y1, :].astype(np.float32)   # (n, h, W)
-        e_chunk = eligible[:, y0:y1, :]                     # (n, h, W)
-        # build window stack (k_len, n, h, W) → reshape to (n*h*W, k_len) for median
-        k_len = 2 * window + 1
-        win_stack = np.empty((k_len, n, y1 - y0, W), dtype=np.float32)
-        for ki, k in enumerate(range(-window, window + 1)):
-            win_stack[ki] = np.roll(a_chunk, k, axis=0)
-        # median across k_len axis
-        med = np.median(win_stack, axis=0)  # (n, h, W)
-        # write back ONLY at eligible pixels (others keep original)
-        result_chunk = np.where(e_chunk, med, a_chunk).astype(np.uint8)
-        out[:, y0:y1, :] = result_chunk
-        if progress_callback and (ci % 8 == 0 or ci == n_chunks - 1):
-            progress_callback("temporal_smooth", ci + 1, n_chunks,
-                              f"chunk {ci+1}/{n_chunks}")
+    k_len = 2 * window + 1
+    total_chunks = n * n_chunks
+    completed = 0
 
-    return [out[i] for i in range(n)]
+    for i in range(n):
+        for ci in range(n_chunks):
+            y0 = ci * chunk_rows
+            y1 = min(y0 + chunk_rows, H)
+            center = np.asarray(alphas[i][y0:y1, :], dtype=np.uint8)
+            center_mask = np.asarray(sam2_binaries[i][y0:y1, :], dtype=np.uint8)
+            flipped = np.zeros(center.shape, dtype=bool)
+            win_stack = np.empty((k_len, y1 - y0, W), dtype=np.uint8)
+
+            for ki, k in enumerate(range(-window, window + 1)):
+                j = (i + k) % n
+                win_stack[ki] = alphas[j][y0:y1, :]
+                if k != 0:
+                    flipped |= (sam2_binaries[j][y0:y1, :] != center_mask)
+
+            eligible = ((center > soft_lo) & (center < soft_hi) & ~flipped)
+            # k_len is odd, so the middle order statistic is exactly np.median
+            # while retaining uint8 and avoiding a float64 median allocation.
+            win_stack.partition(window, axis=0)
+            median = win_stack[window]
+            out[i, y0:y1, :] = np.where(eligible, median, center)
+
+            completed += 1
+            if progress_callback and (completed % 8 == 0 or completed == total_chunks):
+                progress_callback("temporal_smooth", completed, total_chunks,
+                                  f"chunk {completed}/{total_chunks}")
+
+    if isinstance(out, np.memmap):
+        out.flush()
+    return out
 
 
 # === Output position stabilization (Part B #1 — tech/PET_STABILIZATION_PARTB.md) ===
@@ -1771,47 +1886,6 @@ def stabilize_output_position(final_dir, n, smooth_radius=STABILIZE_OUTPUT_RADIU
     return True, report
 
 
-def make_video(frame_dir, output_path, fps=10):
-    """Generate MP4 video from BGRA PNGs on solid dark background."""
-    frames = sorted(glob.glob(os.path.join(frame_dir, "frame_*.png")))
-    if not frames:
-        return
-
-    h, w = cv2.imread(frames[0], cv2.IMREAD_UNCHANGED).shape[:2]
-    bg = make_background(h, w)
-
-    # Per-output intermediate dir (preview vs final must not overwrite each
-    # other) using a lossless PNG intermediate — JPEG q92 double-compression
-    # was a needless source of the "PNG clean but MP4 dirty" artifacts.
-    rgb_dir = os.path.join(os.path.dirname(frame_dir),
-                           "rgb_" + os.path.splitext(os.path.basename(output_path))[0])
-    os.makedirs(rgb_dir, exist_ok=True)
-    for old in glob.glob(os.path.join(rgb_dir, "*.png")):
-        os.remove(old)
-
-    for f in frames:
-        bgra = cv2.imread(f, cv2.IMREAD_UNCHANGED)
-        bgr = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
-        a = bgra[:, :, 3].astype(float) / 255
-        disp = (bg * (1 - a[:, :, None]) + bgr * a[:, :, None]).astype(np.uint8)
-        base = os.path.basename(f)  # keep .png (lossless)
-        cv2.imwrite(f"{rgb_dir}/{base}", disp)
-
-    # scenecut=0 + fixed keyint stops x264 from inserting mid-clip keyframes
-    # at motion bursts (the 7s "flash"); -bf 0 removes B-frame quality
-    # oscillation. These keep brightness/quality constant across the clip.
-    cmd = [
-        "ffmpeg", "-y", "-f", "image2", "-framerate", str(fps),
-        "-i", f"{rgb_dir}/frame_%04d.png",
-        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
-        "-x264-params", "scenecut=0:keyint=600:min-keyint=600",
-        "-bf", "0",
-        output_path,
-    ]
-    subprocess.run(cmd, capture_output=True)
-
-
 def find_pet_center(frames):
     """Auto-detect pet center using torchvision Faster R-CNN.
 
@@ -1869,6 +1943,8 @@ def main():
     parser.add_argument("--fps", type=int, default=10, help="Frame extraction FPS")
     parser.add_argument("--click", type=str, default=None,
                         help="Pet click point as 'x,y' (auto-detect if not set)")
+    parser.add_argument("--bbox", type=str, default=None,
+                        help="Confirmed detector bbox as 'x1,y1,x2,y2'")
     parser.add_argument("--skip-extract", action="store_true",
                         help="Skip frame extraction (reuse existing)")
     parser.add_argument("--skip-qa", action="store_true",
@@ -1885,6 +1961,15 @@ def main():
                         help="Only run SAM2 pass (preview)")
     args = parser.parse_args()
 
+    prompt_bbox = None
+    if args.bbox:
+        try:
+            prompt_bbox = [float(value) for value in args.bbox.split(",")]
+            if len(prompt_bbox) != 4:
+                raise ValueError("expected four coordinates")
+        except ValueError as exc:
+            parser.error(f"invalid --bbox: {exc}")
+
     # Pre-flight dependency check (after parse_args so --help works without deps)
     missing = check_dependencies()
     if missing:
@@ -1893,7 +1978,6 @@ def main():
 
     output_dir = args.output_dir
     extract_dir = os.path.join(output_dir, "extracted")
-    preview_dir = os.path.join(output_dir, "preview")
     final_dir = os.path.join(output_dir, "segmented")
 
     # Step 1: Check duration and decide processing range
@@ -2007,26 +2091,11 @@ def main():
               "current": current, "total": total, "detail": detail})
 
     all_logits = pass1_sam2(frames, click_point,
-                            progress_callback=sam2_progress)
+                            progress_callback=sam2_progress,
+                            prompt_bbox=prompt_bbox)
 
-    # Step 5: Pass 2 - BiRefNet refinement (final). The first N matted frames
-    # double as the preview: same model as the final output, so what the user
-    # sees early is byte-identical to what lands later (no model mismatch).
-    preview_video = os.path.join(output_dir, "preview.mp4")
-
-    def on_preview_ready(n):
-        # Snapshot the first n final frames into preview_dir so the preview is
-        # stable while pass 2 keeps writing the rest into final_dir.
-        os.makedirs(preview_dir, exist_ok=True)
-        for i in range(n):
-            shutil.copy2(os.path.join(final_dir, f"frame_{i:04d}.png"),
-                         os.path.join(preview_dir, f"frame_{i:04d}.png"))
-        make_video(preview_dir, preview_video, fps=args.fps)
-        emit({"type": "preview_ready",
-              "preview_dir": os.path.abspath(preview_dir),
-              "preview_video": os.path.abspath(preview_video),
-              "frames": n})
-
+    # Step 5: BiRefNet produces source frames for Live2D asset generation.
+    # No preview or final MP4 is encoded because video is not a runtime surface.
     def birefnet_progress(phase, current, total, detail):
         emit({"type": "progress", "phase": phase,
               "current": current, "total": total, "detail": detail})
@@ -2034,67 +2103,54 @@ def main():
     if args.preview_only:
         # Only matte the first N frames, emit preview, stop before final.
         pass2_birefnet(frames[:preview_limit], all_logits, final_dir,
-                       birefnet_progress, preview_limit=preview_limit,
-                       on_preview_ready=on_preview_ready)
-        emit({"type": "complete", "preview": preview_video,
-              "frames": min(preview_limit, len(frames))})
+                       birefnet_progress)
+        processed = min(preview_limit, len(frames))
+        emit({"type": "complete",
+              "frames": processed,
+              "frames_dir": os.path.abspath(final_dir),
+              "segmented_dir": os.path.abspath(final_dir),
+              "frame_count": processed})
         return
 
-    pass2_birefnet(frames, all_logits, final_dir, birefnet_progress,
-                   preview_limit=preview_limit,
-                   on_preview_ready=on_preview_ready)
+    pass2_birefnet(frames, all_logits, final_dir, birefnet_progress)
+
+    # Swift can now restart its eager detector daemon without overlapping the
+    # SAM2/BiRefNet model allocations. This keeps the next import warm.
+    emit({"type": "models_released"})
 
     # Step 6: Quality feedback loop
     emit({"type": "phase", "name": "quality_feedback", "detail": "checking output quality"})
     h, w = cv2.imread(frames[0]).shape[:2]
 
-    # Load alphas from segmented output
-    alphas = []
-    for i in range(len(frames)):
-        seg_path = os.path.join(final_dir, f"frame_{i:04d}.png")
-        bgra = cv2.imread(seg_path, cv2.IMREAD_UNCHANGED)
-        if bgra is not None and len(bgra.shape) == 3 and bgra.shape[2] == 4:
-            alphas.append(bgra[:, :, 3])
-        else:
-            alphas.append(np.zeros((h, w), dtype=np.uint8))
-
-    # Get pet bbox for anchor validation
-    yolo_bbox_for_qa = None
-    try:
-        from pipeline.pet_detector import detect_pet_bbox
-        yolo_bbox_for_qa = detect_pet_bbox(frames[0])
-    except Exception:
-        pass
+    # Reuse the confirmed bbox. Direct CLI callers retain automatic detection.
+    yolo_bbox_for_qa = prompt_bbox
+    if yolo_bbox_for_qa is None:
+        try:
+            from pipeline.pet_detector import detect_pet_bbox
+            yolo_bbox_for_qa = detect_pet_bbox(frames[0])
+        except Exception:
+            pass
 
     # Run quality feedback
-    alphas, metrics, red_count = run_quality_feedback(
-        alphas, all_logits, yolo_bbox_for_qa, h, w,
-        frame_paths=frames, emit_fn=emit
-    )
+    metrics, red_count, alpha_coverage = run_quality_feedback_from_files(
+        final_dir, len(frames), all_logits, yolo_bbox_for_qa, h, w)
 
     # Final temporal deflicker: surgically remove single-frame alpha
     # flashes / empty frames that survive (or are introduced by) the
     # steps above. Only true one-frame anomalies are touched; motion is
     # left intact. This is what the desktop pet actually renders, so it
     # is the layer that matters for the user-visible flicker.
-    alphas, flash_frames = stabilize_alpha_temporal(alphas)
+    flash_frames = stabilize_alpha_temporal_files(
+        final_dir, len(frames), h, w, coverage=alpha_coverage)
     if flash_frames:
         emit({"type": "progress", "phase": "deflicker",
               "detail": f"stabilized {len(flash_frames)} flash frame(s): {flash_frames}"})
-
-    # Re-save repaired alphas
-    for i in range(len(alphas)):
-        seg_path = os.path.join(final_dir, f"frame_{i:04d}.png")
-        bgra = cv2.imread(seg_path, cv2.IMREAD_UNCHANGED)
-        if bgra is not None and len(bgra.shape) == 3 and bgra.shape[2] == 4:
-            bgra[:, :, 3] = alphas[i]
-            cv2.imwrite(seg_path, bgra)
 
     # Repair per-frame opacity flashes (body renders translucent for one
     # frame — different failure from coverage spikes, so the deflicker above
     # is blind to it). Operates on the saved RGBA files: holds the nearest
     # good neighbour over each flagged frame.
-    opacity_flashes = repair_opacity_flashes(final_dir, len(alphas), emit_fn=emit)  # noqa: F841  # report count (see emit log)
+    opacity_flashes = repair_opacity_flashes(final_dir, len(frames), emit_fn=emit)  # noqa: F841  # report count (see emit log)
 
     # Part B #1 (tech/PET_STABILIZATION_PARTB.md §2): rigid-translate each RGBA
     # cutout so the alpha centroid tracks a smoothed trajectory. Kills the
@@ -2111,7 +2167,7 @@ def main():
                       "current": current, "total": total, "detail": detail})
             # stabilize_output_position returns (did: bool, report: dict) — 2-tuple.
             did_out, out_report = stabilize_output_position(
-                final_dir, len(alphas),
+                final_dir, len(frames),
                 smooth_radius=STABILIZE_OUTPUT_RADIUS,
                 progress_callback=_stab_out_prog,
             )
@@ -2124,11 +2180,8 @@ def main():
             emit({"type": "progress", "phase": "stabilize_output",
                   "detail": f"failed ({type(e).__name__}: {e}), continuing"})
 
-    # Re-collect alphas if #1 moved the cutouts (centroid shifted) — downstream
-    # quality_summary / make_video read from final_dir/frame_*.png so they're
-    # already seeing the moved frames; only metrics that use the in-memory
-    # `alphas` list would be stale (we don't re-use `alphas` past this point,
-    # so no-op).
+    # Downstream quality_summary and make_video read metrics/files, so an
+    # optional position-stabilization pass needs no in-memory alpha refresh.
 
     # Emit quality summary
     green = sum(1 for m in metrics if m["status"] == "green")
@@ -2156,21 +2209,10 @@ def main():
                   "red_count": red, "total": total_frames,
                   "message": f"分割质量不达标（{red}/{total_frames} 帧异常），"
                              f"素材边缘可能过于复杂或主体不清晰，建议换一段画面更干净的素材"})
-            # Hard gate: do NOT generate the final video or emit "complete".
-            # Emitting complete here would overwrite the failure on the Swift
-            # side and drop a bad pet onto the desktop (self-contradictory).
+            # Hard gate: do not emit "complete" for invalid source material.
             return
 
-    # Generate final video
-    emit({"type": "phase", "name": "final_video", "detail": "generating final"})
-    final_video = os.path.join(output_dir, "final.mp4")
-    make_video(final_dir, final_video, fps=args.fps)
-    emit({"type": "progress", "phase": "final_video",
-          "detail": f"saved to {final_video}"})
-
     emit({"type": "complete",
-          "preview": preview_video,
-          "final": final_video,
           "frames": len(frames),
           "frames_dir": os.path.abspath(final_dir),
           "segmented_dir": os.path.abspath(final_dir),

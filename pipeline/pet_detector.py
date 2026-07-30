@@ -88,7 +88,8 @@ def _run_detection(bgr: np.ndarray, min_size: Optional[int] = None) -> List[dict
 
     # BGR → RGB → CHW tensor [0,1]
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+    tensor = torch.from_numpy(rgb).permute(2, 0, 1).to(dtype=torch.float32)
+    tensor.div_(255.0)
     tensor = tensor.to(device)
 
     _saved = None
@@ -99,7 +100,7 @@ def _run_detection(bgr: np.ndarray, min_size: Optional[int] = None) -> List[dict
         model.transform.max_size = int(round(min_size * 1000.0 / 600.0))
 
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             preds = model([tensor])
     finally:
         if _saved is not None:

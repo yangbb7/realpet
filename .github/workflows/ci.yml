@@ -16,6 +16,93 @@ jobs:
         run: cd RealPet && swift build -c release
       - name: Test build
         run: cd RealPet && swift build
+      - name: Test application edit menu
+        run: |
+          cd RealPet
+          swiftc Services/ApplicationMenu.swift Tests/ApplicationMenuCheck.swift \
+            -o /tmp/realpet-application-menu-check
+          /tmp/realpet-application-menu-check
+      - name: Test persisted-state recovery
+        run: |
+          cd RealPet
+          swiftc Models/PetPersonality.swift Models/PetTemplateProfile.swift \
+            Models/PetRendererKind.swift Models/Pet.swift \
+            Models/MainWindowLayout.swift \
+            Tests/PetRecoveryCheck.swift \
+            -o /tmp/realpet-pet-recovery-check
+          /tmp/realpet-pet-recovery-check
+      - name: Test interaction architecture
+        run: |
+          cd RealPet
+          swiftc Models/PetPersonality.swift Models/PetActionManifest.swift \
+            Models/InteractionModels.swift Models/InteractivePetModel.swift \
+            Models/PetRendererKind.swift \
+            Models/MultimodalInteractionModels.swift \
+            Models/CameraInteractionModels.swift Models/SpeechInteractionModels.swift \
+            Models/PetBehaviorMemory.swift Models/BehaviorPlanningModels.swift \
+            Models/PetBehaviorPolicy.swift \
+            Services/InteractionHub.swift \
+            Services/InteractionAdapter.swift Services/PetRuntimeController.swift \
+            Services/EphemeralEvidenceBuffer.swift \
+            Services/VLMInteractionAdapter.swift Services/BehaviorPlanningCoordinator.swift \
+            Services/PetBehaviorDirector.swift Services/OllamaVLMModel.swift \
+            Services/LocalVLMConfiguration.swift \
+            Services/LocalBehaviorPlannerConfiguration.swift \
+            Services/PetActionLibrary.swift \
+            Tests/InteractionArchitectureCheck.swift \
+            -o /tmp/realpet-interaction-check
+          /tmp/realpet-interaction-check
+      - name: Test source-frame runtime contracts
+        run: |
+          cd RealPet
+          swiftc Models/PetActionManifest.swift Models/PetFeatureManifest.swift \
+            Models/InteractionModels.swift Models/PetRendererKind.swift \
+            Services/InteractionHub.swift Services/InteractionAdapter.swift \
+            Services/PetRuntimeController.swift Services/FrameSequencePetRuntime.swift \
+            Tests/FrameSequenceRuntimeCheck.swift \
+            -o /tmp/realpet-frame-runtime-check
+          /tmp/realpet-frame-runtime-check
+      - name: Test rig asset generation
+        run: |
+          cd RealPet
+          swiftc Models/PetActionManifest.swift Models/PetTemplateProfile.swift \
+            Models/InteractivePetModel.swift \
+            Services/OpenAIImageAPIConfiguration.swift \
+            Services/OpenAIAPIKeyStore.swift \
+            Services/GPTImage2RigAssetGenerator.swift \
+            Services/OriginalRigAtlasExporter.swift \
+            Tests/RigAssetGenerationCheck.swift \
+            -o /tmp/realpet-rig-asset-check
+          /tmp/realpet-rig-asset-check
+      - name: Test motion generation contracts
+        run: |
+          cd RealPet
+          swiftc Models/PetActionManifest.swift \
+            Models/MotionGenerationModels.swift \
+            Services/OpenAIImageAPIConfiguration.swift \
+            Services/PetReferenceImageData.swift \
+            Services/AgnesImageReferenceGenerator.swift \
+            Services/PetActionLibrary.swift \
+            Services/OpenAIPetPromptOptimizer.swift \
+            Services/OpenAIVideoGenerationClient.swift \
+            Tests/MotionGenerationContractCheck.swift \
+            -o /tmp/realpet-motion-generation-check
+          /tmp/realpet-motion-generation-check
+      - name: Test Cubism runtime contracts
+        run: |
+          cd RealPet
+          swiftc Models/PetActionManifest.swift Models/PetTemplateProfile.swift \
+            Models/InteractionModels.swift \
+            Models/InteractivePetModel.swift Models/PetRendererKind.swift \
+            Models/CubismParameterMapper.swift Models/CubismProceduralMotion.swift \
+            Services/CubismWebRuntimeResources.swift \
+            Services/CubismTemplateResources.swift \
+            Services/PetRuntimeController.swift Services/InteractionHub.swift \
+            Services/InteractionAdapter.swift \
+            Services/CubismWebPetRuntime.swift \
+            Tests/CubismRuntimeContractCheck.swift \
+            -o /tmp/realpet-cubism-runtime-check
+          /tmp/realpet-cubism-runtime-check
 
   python:
     name: Python Tests
@@ -34,6 +121,12 @@ jobs:
       - name: Lint
         run: ruff check scripts/ pipeline/ tests/ --select E,F,W --ignore E501
       - name: Run tests (unit only)
-        run: pytest tests/test_quality_check.py tests/test_pet_detector.py -v --timeout=60
+        run: >-
+          pytest tests/test_quality_check.py tests/test_pet_detector.py
+          tests/test_memory_optimization.py
+          tests/test_model_packaging.py tests/test_action_quality.py
+          tests/test_rig_assets.py
+          tests/test_cubism_model.py tests/test_cubism_template.py
+          -v --timeout=60
         env:
           REALPET_WEIGHTS_DIR: /tmp/weights

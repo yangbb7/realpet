@@ -1,8 +1,12 @@
 # RealPet / 真实桌宠
 
-Turn a video of your real pet into a transparent animated desktop companion on macOS.
+Turn photos of your real pet into a realistic desktop companion on macOS.
 
-RealPet uses SAM2 video tracking + BiRefNet matting to extract your pet from any video, then displays it as a borderless, always-on-top, draggable window on your desktop.
+RealPet identifies the owner's pet across several photos, turns a natural-language
+motion request into an image-grounded video prompt, and installs the generated
+motion only after the same local quality and identity checks used for imported
+footage. The source-frame renderer replays alpha-matted frames in a borderless,
+always-on-top native window.
 
 > **v0.2.0 — Double-click to use**
 > - All model weights and ffmpeg are bundled inside the .app. **No first-launch downloads.**
@@ -11,20 +15,56 @@ RealPet uses SAM2 video tracking + BiRefNet matting to extract your pet from any
 
 ## Features
 
-- **Video → Desktop Pet**: Import any video of your pet, get a transparent animated companion
+- **Photos → Generated Pet Motion**: Import 1–6 owner photos; Agnes Image 2.0
+  first creates a unified identity anchor, `gpt-5.6-sol` on the configured
+  compatible relay creates a constrained Chinese video prompt, and Agnes Video
+  V2.0 generates the motion
+- **Prompt Review Before Generation**: The optimized prompt remains editable;
+  generation is an explicit second action rather than an automatic upload
+- **Generated Action Installation**: Video jobs are created, polled, downloaded,
+  segmented, identity-validated, previewed, and only then added to the pet's
+  action library as `AI 生成`
+- **Video → Source-Faithful Pet**: Owners may still import original footage;
+  clip selection, pet classification, tracking, alpha matting, landmark
+  extraction, and display run automatically
 - **AI-Powered Extraction**: SAM2 tracking + BiRefNet matting for high-quality alpha extraction
 - **Smart Clip Selection**: Long videos are automatically analyzed for the best pet segments
 - **Transparent Window**: Borderless, always-on-top, click-through window with real transparency
 - **Drag & Drop**: Move your pet anywhere on the desktop
-- **Persistent Pets**: Pets are saved and relaunched on app restart
+- **Persistent Pets**: Pet source, personality, feature anchors, and action metadata are saved between launches
 - **Resident Daemon**: Python daemon keeps models loaded for fast processing
+- **Personality & Interaction Core**: Versioned multimodal events, personality
+  presets plus a six-axis custom editor, click and back-and-forth petting
+  gestures, immediate affection feedback, decaying short-term mood memory,
+  multi-action playback, and capability-gated behavior
+- **Source-Frame Runtime**: A bounded native frame cache renders processed
+  RGB/alpha pairs directly; no template, breed model, or cloud generation is
+  needed to display a pet
+- **Action Workbench**: Generate idle, gaze, lie-down, paw, and eat actions from
+  the pet's photo identity. Original owner footage can still replace any action
+  when recorded fidelity is preferred
+- **Unified Multimodal Input**: Pointer, camera, local VLM, and speech sources
+  share one expiring observation pipeline with bounded evidence and backpressure
+- **Local Visual Interaction**: Optional Apple Vision processing detects when
+  you appear, approach, or wave; camera frames remain in bounded memory
+- **Local Voice Interaction**: Optional on-device speech recognition maps a
+  small command vocabulary into the same personality and capability gates;
+  microphone audio and transcripts are not persisted
+- **Local VLM Interaction (experimental)**: Discover an installed Ollama vision
+  model and let it recognize allow-listed interactions from ephemeral camera
+  keyframes; models can be installed from the settings sheet with streamed
+  progress and cancellation, while remote endpoints and arbitrary commands are rejected
+- **Local Behavior Planning (experimental)**: An independently selected Ollama
+  model may choose `react`, `wander`, or no action from personality, mood, and
+  recent semantic memory; capability gates and offline rules remain authoritative
 
 ## Requirements
 
 - macOS 14.0+ (Sonoma), Apple Silicon recommended
 - ~3 GB free disk space (bundled model weights + extracted frames)
 - **Python 3.10 or newer** — used to run the AI pipeline
-- Internet connection **on first launch only** — to install Python packages from PyPI (model weights and ffmpeg are already bundled, so no model downloads)
+- Internet connection on first launch for Python packages and when you choose
+  to use the optional prompt/video generation service
 
 ### What you need to install first
 
@@ -89,7 +129,28 @@ RealPet runs real-time AI models (SAM2 tracking + BiRefNet matting + Faster R-CN
 2. Double-click the DMG and drag `RealPet.app` to `/Applications`.
 3. Launch from `/Applications` (right-click → Open the first time — the app is ad-hoc signed). First run sets up Python (~2 minutes, one-time).
 
-Import a video of your pet through the app's Import button, and RealPet will extract, segment, and display it as a desktop companion.
+Click **导入宠物照片** and select 1–6 clear photos of the same pet. In the
+**动作工作台**, write what the pet should do in natural language, such as
+“让它慢慢转一圈”. Open the gear button once to configure two independent
+services. `gpt-5.6-sol` retains its existing OpenAI-compatible relay Base URL
+and relay key for Prompt optimization. Agnes uses the direct official endpoint
+`https://apihub.agnes-ai.com/v1`, `agnes-image-2.0-flash`, and
+`agnes-video-v2.0` with a separate Agnes key. Both keys are stored separately
+in the macOS Keychain.
+
+Click **优化 Prompt**. The selected owner photos are sent only to the configured
+`gpt-5.6-sol` relay, which identifies the pet and produces an editable prompt
+constrained to a pure white background, fixed camera, photographic realism, and
+the same pet. After reviewing or editing it, click **生成动作**. Only then does
+RealPet call Agnes Image 2.0 to make one public identity anchor, followed by
+Agnes Video V2.0 with that anchor and the approved prompt. RealPet polls the
+task by its `video_id`, downloads the result, runs the local quality and
+identity checks, and asks for installation.
+
+The initial generated action must be **待机**. Once it has been installed, use
+the same workbench to generate mouse gaze, lying down, pawing, and eating
+actions. **导入实拍视频** remains available for a full source-frame pet or to
+replace any generated action with owner-recorded footage.
 
 For developers who prefer to build from source, see `docs/RELEASE.md`.
 
@@ -99,12 +160,11 @@ For developers who prefer to build from source, see `docs/RELEASE.md`.
 ┌─────────────────────────────────────────────┐
 │  macOS App (Swift/SwiftUI)                  │
 │  ┌─────────────┐  ┌──────────────────────┐  │
-│  │ ControlPanel │  │ TransparentPetWindow │  │
+│  │ ControlPanel │  │ FrameSequence NSPanel │ │
 │  └──────┬──────┘  └──────────┬───────────┘  │
 │         │                    │              │
 │  ┌──────┴────────────────────┴───────────┐  │
-│  │ PythonBridge / PythonDaemon           │  │
-│  │ (stdin/stdout NDJSON to Python)       │  │
+│  │ InteractionHub / Native Frame Runtime │  │
 │  └──────┬────────────────────────────────┘  │
 └─────────┼───────────────────────────────────┘
           │
@@ -118,7 +178,14 @@ For developers who prefer to build from source, see `docs/RELEASE.md`.
 └─────────────────────────────────────────────┘
 ```
 
-**Pipeline**: `detect_pet` → `analyze_clips` → `track_then_matte` (SAM2 + BiRefNet) → transparent display
+**Pipeline**: `analyze_clips` → `detect_pet` → `track_then_matte` (SAM2 +
+BiRefNet) → RGB/alpha frame pairs + `pet-features.json` + `actions.json` →
+native source-frame runtime. Cubism is optional legacy compatibility only.
+
+Runtime interaction uses versioned semantic observations rather than binding
+behavior directly to mouse events. The same contract is designed for future
+camera, speech, and VLM adapters. See
+[`docs/INTERACTION_ARCHITECTURE.md`](docs/INTERACTION_ARCHITECTURE.md).
 
 ## Project Structure
 
@@ -133,9 +200,7 @@ realpet/
 │   └── Package.swift
 ├── pipeline/             # Python AI pipeline
 │   ├── pet_detector.py   # Faster R-CNN pet detection
-│   ├── segment.py        # BiRefNet segmentation
-│   ├── display.py        # Transparent window rendering
-│   ├── cli.py            # AI-animate pipeline entry
+│   ├── action_quality.py # Captured-response validation
 │   └── smart_clip.py     # Long-video clip selection
 ├── scripts/              # CLI tools
 │   ├── track_then_matte.py  # Main pipeline (SAM2 + BiRefNet)
@@ -172,6 +237,18 @@ If you are building from source, `scripts/bundle_weights.py` downloads all three
 | `REALPET_WEIGHTS_DIR` | `weights/` | Directory for model weights |
 | `REALPET_VENV` | `.venv` (project root) | Python virtual environment path |
 | `REALPET_PROJECT_ROOT` | auto-detected | Project root directory override |
+
+The visual interaction settings accept only a local Ollama loopback address.
+When enabled, the app discovers installed models with the `vision` capability;
+camera evidence remains in bounded memory and is never written to disk by this
+workflow.
+
+The motion service is configured in the in-app action workbench, not through an
+environment variable. Its two Base URLs must be HTTPS unless they are loopback
+addresses. `gpt-5.6-sol` remains on its configured compatible relay for Prompt
+optimization. Agnes is direct-only for the canonical reference
+(`agnes-image-2.0-flash`) and video (`agnes-video-v2.0`), using a separate
+credential.
 
 ## Building the App
 

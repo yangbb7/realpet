@@ -8,7 +8,7 @@ let package = Package(
         .executableTarget(
             name: "RealPet",
             path: ".",
-            exclude: ["Package.swift"]
+            exclude: ["Package.swift", "Tests"]
         )
     ]
 )

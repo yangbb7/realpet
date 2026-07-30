@@ -27,7 +27,7 @@ def _device():
     # smoke test about "do the imports + forward path work?" rather than
     # "can MPS fit this model in the runner's shared memory?". On a real
     # user machine the pipeline uses mps when available and falls back to
-    # cpu automatically (see pipeline/segment.py + scripts/track_then_matte.py).
+    # cpu automatically (see scripts/track_then_matte.py).
     return torch.device("cpu")
 
 
