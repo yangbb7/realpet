@@ -66,6 +66,34 @@ struct SourceFrameSequence: Equatable {
     }
 }
 
+/// Maps a pointer angle to a stable frame inside a generated 360-degree orbit.
+/// The opening and closing holds are excluded so both resolve to the same
+/// front-facing frame instead of being mistaken for intermediate viewpoints.
+enum OrbitFrameSelector {
+    static func index(
+        frameCount: Int,
+        horizontalOffset: Double,
+        verticalOffset: Double,
+        deadZone: Double = 0.16,
+        edgeHoldFraction: Double = 0.12
+    ) -> Int? {
+        guard frameCount > 0,
+              hypot(horizontalOffset, verticalOffset) >= deadZone else { return nil }
+        let fullTurn = 2 * Double.pi
+        let angle = atan2(horizontalOffset, verticalOffset)
+        let progress = angle >= 0 ? angle / fullTurn : (angle + fullTurn) / fullTurn
+        let maxIndex = frameCount - 1
+        let firstOrbitIndex = min(
+            maxIndex,
+            max(0, Int((Double(maxIndex) * edgeHoldFraction).rounded())))
+        let lastOrbitIndex = max(
+            firstOrbitIndex,
+            min(maxIndex, maxIndex - firstOrbitIndex))
+        return Int((Double(firstOrbitIndex)
+            + Double(lastOrbitIndex - firstOrbitIndex) * progress).rounded())
+    }
+}
+
 enum SourceFrameActionResolver {
     static func sequence(
         for cue: PetAnimationCue?,
@@ -305,6 +333,7 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
     private var terminated = false
     private var actionEndsAt: TimeInterval?
     private var activeGazeAction: PetActionManifest.Action.Kind?
+    private var heldFrameIndex: Int?
     private var features: PetFeatureManifest?
     private var pointerWasNear = false
     private var lastNearEmission = 0.0
@@ -423,6 +452,7 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         petView = nil
         activeSequence = nil
         baseSequence = nil
+        heldFrameIndex = nil
         onTermination?()
     }
 
@@ -455,6 +485,7 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
 
     private func activate(sequence: SourceFrameSequence) {
         activeSequence = sequence
+        heldFrameIndex = nil
         frameIndex = 0
         startFrameTimer(fps: sequence.fps)
     }
@@ -471,6 +502,12 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
                 activate(sequence: baseSequence)
             }
             advanceFrame()
+            return
+        }
+        if let heldFrameIndex {
+            let displayIndex = min(max(0, heldFrameIndex), sequence.frames.count - 1)
+            view.image = cache.image(for: sequence.frames[displayIndex])
+            view.needsDisplay = true
             return
         }
         let displayIndex = sequence.loop
@@ -551,6 +588,31 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         verticalOffset: CGFloat
     ) {
         guard actionEndsAt == nil else { return }
+        if let orbitSequence = SourceFrameActionResolver.sequence(
+            for: .gazeOrbit, framesDirectory: framesDirectory, fallbackFPS: fallbackFPS) {
+            guard let selectedFrameIndex = OrbitFrameSelector.index(
+                frameCount: orbitSequence.frames.count,
+                horizontalOffset: Double(horizontalOffset),
+                verticalOffset: Double(verticalOffset)) else {
+                guard activeGazeAction != nil else { return }
+                activeGazeAction = nil
+                heldFrameIndex = nil
+                if let baseSequence {
+                    activate(sequence: baseSequence)
+                }
+                return
+            }
+            if activeSequence?.root != orbitSequence.root {
+                activate(sequence: orbitSequence)
+            }
+            activeGazeAction = .gazeOrbit
+            heldFrameIndex = selectedFrameIndex
+            if let view = petView {
+                view.image = cache.image(for: orbitSequence.frames[selectedFrameIndex])
+                view.needsDisplay = true
+            }
+            return
+        }
         let requested = PetActionManifest.Action.Kind.gazeAction(
             horizontalOffset: Double(horizontalOffset),
             verticalOffset: Double(verticalOffset))

@@ -42,6 +42,13 @@ struct FrameSequenceRuntimeCheck {
         let playRoot = root.appendingPathComponent("actions/play", isDirectory: true)
         try FileManager.default.createDirectory(at: playRoot, withIntermediateDirectories: true)
         try Data("frame".utf8).write(to: playRoot.appendingPathComponent("frame_0000.png"))
+        let orbitRoot = root.appendingPathComponent("actions/gaze_orbit", isDirectory: true)
+        try FileManager.default.createDirectory(at: orbitRoot, withIntermediateDirectories: true)
+        for index in 0..<10 {
+            try Data("frame".utf8).write(
+                to: orbitRoot.appendingPathComponent(
+                    String(format: "frame_%04d.png", index)))
+        }
         let gazeKinds: [PetActionManifest.Action.Kind] = [
             .gazeLeft, .gazeRight, .gazeUp, .gazeDown,
         ]
@@ -104,6 +111,10 @@ struct FrameSequenceRuntimeCheck {
         let generated = PetActionManifest.Action(
             id: "generated_play", kind: .play, framesDirectory: "actions/play",
             fps: 10, loop: false, translatesWindow: false, origin: .generated)
+        let generatedOrbit = PetActionManifest.Action(
+            id: "generated_gaze_orbit", kind: .gazeOrbit,
+            framesDirectory: "actions/gaze_orbit", fps: 10,
+            loop: false, translatesWindow: false, origin: .generated)
         precondition(generated.effectiveOrigin == .generated)
         let generatedOnly = PetActionManifest(
             version: 1, defaultAction: "idle",
@@ -111,12 +122,29 @@ struct FrameSequenceRuntimeCheck {
                 .init(id: "idle", kind: .idle, framesDirectory: ".", fps: 10,
                       loop: true, translatesWindow: false),
                 generated,
+                generatedOrbit,
             ])
         try generatedOnly.save(framesDirectory: root.path)
         let generatedSequence = SourceFrameActionResolver.sequence(
             for: .play, framesDirectory: root, fallbackFPS: 10)
         precondition(generatedSequence?.frames.count == 1)
         precondition(generatedSequence?.loop == false)
+        let orbitSequence = SourceFrameActionResolver.sequence(
+            for: .gazeOrbit, framesDirectory: root, fallbackFPS: 10)
+        precondition(orbitSequence?.frames.count == 10)
+        precondition(orbitSequence?.loop == false)
+        precondition(SourceFrameActionResolver.capabilities(
+            framesDirectory: root).orientation)
+        let right = OrbitFrameSelector.index(
+            frameCount: 100, horizontalOffset: 1, verticalOffset: 0)
+        let back = OrbitFrameSelector.index(
+            frameCount: 100, horizontalOffset: 0, verticalOffset: -1)
+        let left = OrbitFrameSelector.index(
+            frameCount: 100, horizontalOffset: -1, verticalOffset: 0)
+        precondition(right != nil && back != nil && left != nil)
+        precondition(right! < back! && back! < left!)
+        precondition(OrbitFrameSelector.index(
+            frameCount: 100, horizontalOffset: 0.01, verticalOffset: 0) == nil)
         let legacy = PetActionManifest.Action(
             id: "legacy_paw", kind: .paw, framesDirectory: "actions/paw",
             fps: 10, loop: false, translatesWindow: false)

@@ -351,7 +351,9 @@ class PetListViewModel: ObservableObject {
                             firstFrameURL: referenceImageURL,
                             apiKey: miniMaxAPIKey,
                             configuration: miniMaxAPIConfiguration,
-                            seconds: configuration.seconds)
+                            seconds: max(
+                                configuration.seconds,
+                                scenario.minimumVideoSeconds))
                         while !Task.isCancelled {
                             switch job.status {
                             case .completed:

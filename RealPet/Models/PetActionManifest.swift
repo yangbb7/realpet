@@ -50,6 +50,7 @@ struct PetActionManifest: Codable, Equatable, Sendable {
             case gazeRight = "gaze_right"
             case gazeUp = "gaze_up"
             case gazeDown = "gaze_down"
+            case gazeOrbit = "gaze_orbit"
 
             var displayName: String {
                 switch self {
@@ -68,6 +69,7 @@ struct PetActionManifest: Codable, Equatable, Sendable {
                 case .gazeRight: return "注视右侧"
                 case .gazeUp: return "注视上方"
                 case .gazeDown: return "注视下方"
+                case .gazeOrbit: return "360° 注视帧库"
                 }
             }
 
@@ -86,6 +88,7 @@ struct PetActionManifest: Codable, Equatable, Sendable {
                 case .gazeRight: return "arrow.right"
                 case .gazeUp: return "arrow.up"
                 case .gazeDown: return "arrow.down"
+                case .gazeOrbit: return "rotate.3d"
                 }
             }
 
@@ -101,7 +104,9 @@ struct PetActionManifest: Codable, Equatable, Sendable {
                 .lieDown, .paw, .eat,
             ]
 
-            static let defaultMouseInteraction: [Kind] = gazeCapture + [.play]
+            /// New pets generate this single multi-angle action once. The four
+            /// directional kinds above remain readable for existing pets.
+            static let defaultMouseInteraction: [Kind] = [.gazeOrbit, .play]
 
             static func gazeAction(
                 horizontalOffset: Double,
@@ -177,7 +182,8 @@ struct PetActionManifest: Codable, Equatable, Sendable {
                 ($0.kind == .react || $0.kind == .shakeHead || $0.kind == .play
                     || $0.kind == .lieDown || $0.kind == .paw || $0.kind == .eat)
             },
-            orientation: Action.Kind.gazeCapture.allSatisfy(installedKinds.contains))
+            orientation: installedKinds.contains(.gazeOrbit)
+                || Action.Kind.gazeCapture.allSatisfy(installedKinds.contains))
     }
 
     var missingFidelityResponseKinds: [Action.Kind] {
@@ -239,7 +245,7 @@ struct PetActionManifest: Codable, Equatable, Sendable {
             kind: kind,
             framesDirectory: relativeFramesDirectory,
             fps: fps,
-            loop: !([.react, .shakeHead, .play, .lieDown, .paw, .eat]
+            loop: !([.react, .shakeHead, .play, .lieDown, .paw, .eat, .gazeOrbit]
                 + Action.Kind.gazeCapture).contains(kind),
             translatesWindow: kind.translatesWindow,
             origin: origin)

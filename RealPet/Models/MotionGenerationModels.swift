@@ -28,14 +28,19 @@ enum DefaultMouseInteractionScenario: String, CaseIterable, Identifiable, Sendab
         }
     }
 
+    /// A full visual orbit needs enough time for usable intermediate frames.
+    var minimumVideoSeconds: Int {
+        switch self {
+        case .pointerTracking: return 12
+        case .clickBounce: return 4
+        }
+    }
+
     var actionPlans: [DefaultMotionActionPlan] {
         switch self {
         case .pointerTracking:
             return [
-                .init(kind: .gazeLeft, prompt: Self.gazePrompt(direction: "画面左侧", motion: "向左轻转")),
-                .init(kind: .gazeRight, prompt: Self.gazePrompt(direction: "画面右侧", motion: "向右轻转")),
-                .init(kind: .gazeUp, prompt: Self.gazePrompt(direction: "画面上方", motion: "轻轻抬起")),
-                .init(kind: .gazeDown, prompt: Self.gazePrompt(direction: "画面下方", motion: "轻轻低下")),
+                .init(kind: .gazeOrbit, prompt: Self.gazeOrbitPrompt),
             ]
         case .clickBounce:
             return [
@@ -52,11 +57,9 @@ enum DefaultMouseInteractionScenario: String, CaseIterable, Identifiable, Sendab
         }.joined(separator: "\n\n")
     }
 
-    private static func gazePrompt(direction: String, motion: String) -> String {
-        """
-        首帧中的同一只宠物位于纯白无缝背景的平视全身中景中。先以自然站姿稳定看向前方，随后仅头部和双眼\(motion)并注视\(direction)，躯干和四肢保持稳定，最后保持该方向的自然注视姿态。镜头固定稳定，无推拉摇移、缩放或剪辑。真实摄影质感，自然动物解剖和细微毛发运动，柔和均匀的棚拍光线，轮廓干净，画面安静自然。
-        """.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
+    private static let gazeOrbitPrompt = """
+    首帧中的同一只宠物位于纯白无缝背景的平视全身中景中，身体完整可见。先以面向镜头的自然站姿稳定停留，随后四爪始终保持在原地，以匀速、连续、自然的方式顺时针完整旋转 360 度，依次清晰经过正面、左前 45 度、左侧、左后 45 度、背面、右后 45 度、右侧、右前 45 度；每个方位短暂停留，耳朵、尾巴和毛发产生符合惯性的细微运动。最后回到面向镜头的初始方向，恢复与首帧一致的自然站姿并稳定停留。全程无跳帧、无姿态突变、无遮挡，所有方位身体完整且清晰可见。镜头固定稳定，无推拉、摇移、缩放、剪辑或视角变化。真实摄影质感，自然动物解剖，柔和均匀的棚拍光线，轮廓干净，画面安静自然。
+    """.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 enum MotionWorkflowState: Equatable {

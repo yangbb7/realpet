@@ -20,10 +20,10 @@ native window.
 - **Video → Source-Faithful Pet**: Import original pet footage; clip selection,
   pet classification, tracking, alpha matting, landmark extraction, and display
   run automatically
-- **Default Mouse Actions**: Built-in MiniMax H3 prompts generate four fixed
-  head-and-eye tracking directions for pointer tracking and one stationary
-  two-hop bounce for primary-click feedback. Prompts are read-only and visible
-  in the app for debugging
+- **Default Mouse Actions**: One MiniMax H3 request creates a 360-degree,
+  return-to-start viewpoint frame library for pointer tracking; a separate
+  request creates a stationary two-hop bounce for primary-click feedback.
+  Prompts are read-only and visible in the app for debugging
 - **Generated Action Installation**: Video jobs are created, polled, downloaded,
   segmented, identity-validated, previewed, and only then added to the pet's
   action library as `AI 生成`
@@ -146,8 +146,9 @@ the video. The two keys are stored separately in the macOS Keychain.
 
 For a selected scenario, RealPet first calls Agnes Image 2.0 to make one public
 identity anchor, then submits its built-in H3 prompt and that anchor as the
-first frame. Pointer tracking creates four directional clips (left, right, up,
-and down); click bounce creates one clip. RealPet submits
+first frame. Pointer tracking creates one 360-degree multi-view clip and maps
+pointer direction to its viewpoint frames; click bounce creates one clip.
+RealPet submits
 `POST /v2/video_generation`, polls the returned `task_id`, downloads the result,
 runs local quality and identity checks, and asks for installation before each
 clip becomes available to the desktop runtime.

@@ -108,27 +108,41 @@ struct MotionGenerationContractCheck {
             precondition(generatedGaze?.loop == false)
         }
         precondition(gazeManifest.capabilities.orientation)
+
+        let orbitSource = root.appendingPathComponent("source-gaze-orbit")
+        try fm.createDirectory(at: orbitSource, withIntermediateDirectories: true)
+        try Data("frame".utf8).write(
+            to: orbitSource.appendingPathComponent("frame_0000.png"))
+        let orbitManifest = try PetActionLibrary.install(
+            kind: .gazeOrbit,
+            processedFramesDirectory: orbitSource,
+            rootFramesDirectory: root,
+            fps: 10,
+            origin: .generated)
+        let generatedOrbit = orbitManifest.actions.first(where: { $0.kind == .gazeOrbit })
+        precondition(generatedOrbit?.effectiveOrigin == .generated)
+        precondition(generatedOrbit?.loop == false)
+        precondition(orbitManifest.capabilities.orientation)
     }
 
     private static func testDefaultMouseInteractionPrompts() throws {
         let tracking = DefaultMouseInteractionScenario.pointerTracking
-        precondition(tracking.actionPlans.map(\.kind) == [
-            .gazeLeft, .gazeRight, .gazeUp, .gazeDown,
-        ])
-        precondition(tracking.actionPlans.allSatisfy { plan in
-            plan.prompt.contains("首帧中的同一只宠物")
-                && plan.prompt.contains("先")
-                && plan.prompt.contains("随后")
-                && plan.prompt.contains("最后")
-                && plan.prompt.contains("镜头固定稳定")
-                && plan.prompt.contains("真实摄影质感")
-        })
+        precondition(tracking.actionPlans.map(\.kind) == [.gazeOrbit])
+        precondition(tracking.minimumVideoSeconds == 12)
+        let orbitPrompt = tracking.actionPlans[0].prompt
+        precondition(orbitPrompt.contains("首帧中的同一只宠物"))
+        precondition(orbitPrompt.contains("完整旋转 360 度"))
+        precondition(orbitPrompt.contains("每个方位短暂停留"))
+        precondition(orbitPrompt.contains("最后回到面向镜头的初始方向"))
+        precondition(orbitPrompt.contains("镜头固定稳定"))
+        precondition(orbitPrompt.contains("真实摄影质感"))
         let bounce = DefaultMouseInteractionScenario.clickBounce
         precondition(bounce.actionPlans.map(\.kind) == [.play])
+        precondition(bounce.minimumVideoSeconds == 4)
         precondition(bounce.debugPrompt.contains("原地轻快蹦跳两次"))
         precondition(bounce.debugPrompt.contains("首帧中的同一只宠物"))
         precondition(PetActionManifest.Action.Kind.defaultMouseInteraction == [
-            .gazeLeft, .gazeRight, .gazeUp, .gazeDown, .play,
+            .gazeOrbit, .play,
         ])
     }
 
