@@ -147,7 +147,7 @@ struct MotionStudioView: View {
 
             if !optimizedPrompt.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("优化后的 Prompt")
+                    Text("适配 MiniMax H3 的 Prompt")
                         .font(.subheadline.weight(.medium))
                     TextEditor(text: $optimizedPrompt)
                         .font(.body)

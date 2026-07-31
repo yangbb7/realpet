@@ -177,6 +177,10 @@ struct MotionGenerationContractCheck {
         let body = try JSONSerialization.jsonObject(
             with: request.httpBody ?? Data()) as? [String: Any]
         precondition(body?["model"] as? String == "gpt-5.6-sol")
+        let instructions = body?["instructions"] as? String
+        precondition(instructions?.contains("MiniMax H3 image-to-video") == true)
+        precondition(instructions?.contains("ordered timeline") == true)
+        precondition(instructions?.contains("camera is fixed and stable") == true)
         let input = body?["input"] as? [[String: Any]]
         let content = input?.first?["content"] as? [[String: Any]]
         precondition(content?.filter { $0["type"] as? String == "input_image" }.count == 2)
@@ -192,7 +196,7 @@ struct MotionGenerationContractCheck {
                 url: received.url!, statusCode: 200,
                 httpVersion: nil, headerFields: nil)!
             let output = """
-            {"optimized_prompt":"纯白色背景，固定镜头，同一只小狗在原地匀速转一圈。","pet_description":"白色小狗","warnings":[]}
+            {"optimized_prompt":"首帧中的同一只白色小狗位于纯白无缝背景的全身中景中，先自然站稳，随后在原地平稳转一圈，最后回到面向镜头的站姿并短暂停留。镜头固定稳定，柔和均匀的棚拍光线，毛发和身体运动自然写实。","pet_description":"白色小狗","warnings":[]}
             """
             let payload = try JSONSerialization.data(withJSONObject: [
                 "output_text": output,
@@ -207,7 +211,7 @@ struct MotionGenerationContractCheck {
                 configuration: apiConfiguration,
                 model: "gpt-5.6-sol")
         precondition(result.petDescription == "白色小狗")
-        precondition(result.optimizedPrompt.contains("固定镜头"))
+        precondition(result.optimizedPrompt.contains("镜头固定稳定"))
     }
 
     private static func testAgnesReferenceAndMiniMaxPipelineCreatePollAndDownload() async throws {
