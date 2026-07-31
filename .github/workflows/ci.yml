@@ -80,11 +80,12 @@ jobs:
           swiftc Models/PetActionManifest.swift \
             Models/MotionGenerationModels.swift \
             Services/OpenAIImageAPIConfiguration.swift \
+            Services/MiniMaxVideoAPIConfiguration.swift \
             Services/PetReferenceImageData.swift \
             Services/AgnesImageReferenceGenerator.swift \
             Services/PetActionLibrary.swift \
             Services/OpenAIPetPromptOptimizer.swift \
-            Services/OpenAIVideoGenerationClient.swift \
+            Services/MiniMaxH3VideoGenerationClient.swift \
             Tests/MotionGenerationContractCheck.swift \
             -o /tmp/realpet-motion-generation-check
           /tmp/realpet-motion-generation-check

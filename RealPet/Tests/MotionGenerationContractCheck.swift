@@ -11,7 +11,7 @@ private final class MotionMockURLProtocol: URLProtocol {
     override func startLoading() {
         do {
             guard let handler = Self.handler else {
-                throw OpenAIVideoGenerationError.invalidResponse
+                throw MiniMaxH3VideoGenerationError.invalidResponse
             }
             let (response, data) = try handler(request)
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -29,10 +29,9 @@ private final class MotionMockURLProtocol: URLProtocol {
 struct MotionGenerationContractCheck {
     static func main() async throws {
         try testConfigurationAndGeneratedActionCapability()
-        try testAgnesReferenceAndVideoRequests()
-        try await testAgnesPipelineCreatePollAndDownload()
+        try testAgnesReferenceAndMiniMaxRequests()
+        try await testAgnesReferenceAndMiniMaxPipelineCreatePollAndDownload()
         try await testPromptOptimizationRequestAndResponse()
-        try await testVideoCreatePollAndDownload()
         print("Motion generation contract checks passed")
     }
 
@@ -55,16 +54,32 @@ struct MotionGenerationContractCheck {
         precondition(motionConfiguration.resolvedAgnesBaseURLString
                      == "https://apihub.agnes-ai.com/v1")
         precondition(motionConfiguration.imageModel == "agnes-image-2.0-flash")
-        precondition(motionConfiguration.videoModel == "agnes-video-v2.0")
+        precondition(motionConfiguration.resolvedMiniMaxBaseURLString
+                     == "https://api.minimaxi.com")
+        precondition(motionConfiguration.videoModel == "MiniMax-H3")
         precondition(motionConfiguration.seconds == 4)
         let validatedMotionConfiguration = try motionConfiguration.validated()
         let promptConfiguration = try validatedMotionConfiguration
             .validatedPromptAPIConfiguration()
         let agnesConfiguration = try validatedMotionConfiguration
             .validatedAgnesAPIConfiguration()
+        let miniMaxConfiguration = try validatedMotionConfiguration
+            .validatedMiniMaxAPIConfiguration()
         precondition(validatedMotionConfiguration.size == "1152x768")
         precondition(!promptConfiguration.isAgnesAPI)
         precondition(agnesConfiguration.isAgnesAPI)
+        precondition(miniMaxConfiguration.isOfficialAPI)
+
+        let savedAgnesVideoConfiguration = MotionServiceConfiguration(
+            baseURLString: OpenAIImageAPIConfiguration.defaultBaseURLString,
+            promptModel: "gpt-5.6-sol",
+            agnesBaseURLString: "https://apihub.agnes-ai.com/v1",
+            imageModel: "agnes-image-2.0-flash",
+            videoModel: "agnes-video-v2.0",
+            seconds: 4,
+            size: "1152x768")
+        precondition(savedAgnesVideoConfiguration.migratedToMiniMaxH3().videoModel
+                     == "MiniMax-H3")
 
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent(
@@ -85,7 +100,7 @@ struct MotionGenerationContractCheck {
         precondition(manifest.supports(animation: .paw))
     }
 
-    private static func testAgnesReferenceAndVideoRequests() throws {
+    private static func testAgnesReferenceAndMiniMaxRequests() throws {
         let reference = FileManager.default.temporaryDirectory
             .appendingPathComponent("realpet-agnes-reference.png")
         defer { try? FileManager.default.removeItem(at: reference) }
@@ -95,8 +110,6 @@ struct MotionGenerationContractCheck {
         precondition(configuration.isAgnesAPI)
         precondition(configuration.chatCompletionsURL.absoluteString
                      == "https://apihub.agnes-ai.com/v1/chat/completions")
-        precondition(configuration.agnesVideoResultURL.absoluteString
-                     == "https://apihub.agnes-ai.com/agnesapi")
 
         let imageRequest = try AgnesImageReferenceGenerator.makeRequest(
             referenceImageURLs: [reference, reference],
@@ -117,19 +130,32 @@ struct MotionGenerationContractCheck {
             configuration: configuration,
             model: "agnes-2.0-flash")
         precondition(chatRequest.url == configuration.chatCompletionsURL)
-        let videoRequest = try OpenAIVideoGenerationClient.makeAgnesCreateRequest(
+        let miniMaxConfiguration = try MiniMaxVideoAPIConfiguration(
+            baseURLString: "https://api.minimaxi.com")
+        precondition(miniMaxConfiguration.createURL.absoluteString
+                     == "https://api.minimaxi.com/v2/video_generation")
+        precondition(miniMaxConfiguration.queryURL(taskID: "task_1").absoluteString
+                     == "https://api.minimaxi.com/v2/query/video_generation/task_1")
+        let videoRequest = try MiniMaxH3VideoGenerationClient.makeCreateRequest(
             prompt: "纯白色背景，固定镜头，小狗在原地转一圈。",
-            publicReferenceImageURL: URL(string: "https://cdn.example.com/pet.png")!,
-            apiKey: "agnes-key",
-            configuration: configuration,
-            model: "agnes-video-v2.0",
-            seconds: 4,
-            size: "1152x768")
+            firstFrameURL: URL(string: "https://cdn.example.com/pet.png")!,
+            apiKey: "minimax-key",
+            configuration: miniMaxConfiguration,
+            seconds: 4)
         let videoBody = try JSONSerialization.jsonObject(
             with: videoRequest.httpBody ?? Data()) as? [String: Any]
-        precondition(videoBody?["image"] as? String == "https://cdn.example.com/pet.png")
-        precondition(videoBody?["num_frames"] as? Int == 97)
-        precondition(videoBody?["frame_rate"] as? Int == 24)
+        precondition(videoRequest.value(forHTTPHeaderField: "Authorization")
+                     == "Bearer minimax-key")
+        precondition(videoBody?["model"] as? String == "MiniMax-H3")
+        precondition(videoBody?["resolution"] as? String == "2K")
+        precondition(videoBody?["duration"] as? Int == 4)
+        precondition(videoBody?["ratio"] as? String == "adaptive")
+        let content = videoBody?["content"] as? [[String: Any]]
+        precondition(content?.first?["type"] as? String == "text")
+        precondition(content?.last?["type"] as? String == "image_url")
+        precondition((content?.last?["image_url"] as? [String: Any])?["url"] as? String
+                     == "https://cdn.example.com/pet.png")
+        precondition(content?.last?["role"] as? String == "first_frame")
     }
 
     private static func testPromptOptimizationRequestAndResponse() async throws {
@@ -184,7 +210,7 @@ struct MotionGenerationContractCheck {
         precondition(result.optimizedPrompt.contains("固定镜头"))
     }
 
-    private static func testAgnesPipelineCreatePollAndDownload() async throws {
+    private static func testAgnesReferenceAndMiniMaxPipelineCreatePollAndDownload() async throws {
         let temporary = FileManager.default.temporaryDirectory
             .appendingPathComponent("realpet-agnes-pipeline-reference.png")
         defer { try? FileManager.default.removeItem(at: temporary) }
@@ -193,6 +219,8 @@ struct MotionGenerationContractCheck {
             baseURLString: "https://relay.example.com/v1")
         let agnesAPIConfiguration = try OpenAIImageAPIConfiguration(
             baseURLString: "https://apihub.agnes-ai.com/v1")
+        let miniMaxAPIConfiguration = try MiniMaxVideoAPIConfiguration(
+            baseURLString: "https://api.minimaxi.com")
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.protocolClasses = [MotionMockURLProtocol.self]
         MotionMockURLProtocol.handler = { request in
@@ -202,6 +230,9 @@ struct MotionGenerationContractCheck {
             } else if request.url?.host == "relay.example.com" {
                 precondition(request.value(forHTTPHeaderField: "Authorization")
                              == "Bearer prompt-key")
+            } else if request.url?.host == "api.minimaxi.com" {
+                precondition(request.value(forHTTPHeaderField: "Authorization")
+                             == "Bearer minimax-key")
             }
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 200,
@@ -218,28 +249,22 @@ struct MotionGenerationContractCheck {
                 return (response, try JSONSerialization.data(withJSONObject: [
                     "output_text": output,
                 ]))
-            case ("POST", "apihub.agnes-ai.com", "/v1/videos"):
-                return (response, try JSONSerialization.data(withJSONObject: [
-                    "result": ["task": [
-                        "task_id": "task_1", "video_id": "video_1", "state": "submitted",
-                    ]],
-                ]))
-            case ("GET", "apihub.agnes-ai.com", "/agnesapi"):
-                let items = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
-                    .queryItems
-                precondition(items?.first(where: { $0.name == "video_id" })?.value == "video_1")
-                precondition(items?.first(where: { $0.name == "model_name" })?.value
-                             == "agnes-video-v2.0")
+            case ("POST", "api.minimaxi.com", "/v2/video_generation"):
                 return (response, try JSONSerialization.data(withJSONObject: [
                     "task_id": "task_1",
-                    "video_id": "video_1",
-                    "status": "completed",
-                    "metadata": ["url": "https://cdn.example.com/generated.mp4"],
+                ]))
+            case ("GET", "api.minimaxi.com", "/v2/query/video_generation/task_1"):
+                return (response, try JSONSerialization.data(withJSONObject: [
+                    "task": [
+                        "id": "task_1",
+                        "status": "succeeded",
+                        "content": ["url": "https://cdn.example.com/generated.mp4"],
+                    ],
                 ]))
             case ("GET", "cdn.example.com", "/generated.mp4"):
                 return (response, Data([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]))
             default:
-                preconditionFailure("Unexpected Agnes request: \(request.url?.absoluteString ?? "nil")")
+                preconditionFailure("Unexpected motion request: \(request.url?.absoluteString ?? "nil")")
             }
         }
 
@@ -259,87 +284,19 @@ struct MotionGenerationContractCheck {
             model: "agnes-image-2.0-flash")
         precondition(reference.absoluteString == "https://cdn.example.com/pet-anchor.png")
 
-        let client = OpenAIVideoGenerationClient(session: session)
+        let client = MiniMaxH3VideoGenerationClient(session: session)
         let queued = try await client.create(
             prompt: prompt.optimizedPrompt,
-            referenceImageURL: reference,
-            apiKey: "agnes-key",
-            configuration: agnesAPIConfiguration,
-            model: "agnes-video-v2.0",
-            seconds: 4,
-            size: "1152x768")
-        precondition(queued.provider == .agnes && queued.videoID == "video_1")
+            firstFrameURL: reference,
+            apiKey: "minimax-key",
+            configuration: miniMaxAPIConfiguration,
+            seconds: 4)
+        precondition(queued.status == .queued)
         let completed = try await client.retrieve(
-            job: queued, apiKey: "agnes-key", configuration: agnesAPIConfiguration)
+            id: queued.id, apiKey: "minimax-key", configuration: miniMaxAPIConfiguration)
         precondition(completed.status == .completed)
-        let video = try await client.downloadContent(
-            job: completed, apiKey: "agnes-key", configuration: agnesAPIConfiguration)
+        let video = try await client.downloadContent(job: completed)
         precondition(video.count == 8)
     }
 
-    private static func testVideoCreatePollAndDownload() async throws {
-        let temporary = FileManager.default.temporaryDirectory
-            .appendingPathComponent("realpet-motion-video-reference.jpg")
-        defer { try? FileManager.default.removeItem(at: temporary) }
-        try Data([0xff, 0xd8, 0xff]).write(to: temporary)
-        let apiConfiguration = try OpenAIImageAPIConfiguration(
-            baseURLString: "https://relay.example.com/v1")
-        let sessionConfiguration = URLSessionConfiguration.ephemeral
-        sessionConfiguration.protocolClasses = [MotionMockURLProtocol.self]
-        let builtRequest = try OpenAIVideoGenerationClient.makeCreateRequest(
-            prompt: "纯白色背景，固定镜头，同一只小狗在原地转一圈。",
-            referenceImageURL: temporary,
-            apiKey: "test-key",
-            configuration: apiConfiguration,
-            model: "sora-2",
-            seconds: 4,
-            size: "1280x720")
-        let builtBody = String(
-            decoding: builtRequest.httpBody ?? Data(), as: UTF8.self)
-        precondition(builtBody.contains("name=\"model\"\r\n\r\nsora-2"))
-        precondition(builtBody.contains("name=\"input_reference\""))
-        var retrieveCount = 0
-        MotionMockURLProtocol.handler = { request in
-            let response = HTTPURLResponse(
-                url: request.url!, statusCode: 200,
-                httpVersion: nil, headerFields: nil)!
-            switch (request.httpMethod, request.url?.path) {
-            case ("POST", "/v1/videos"):
-                return (response, try JSONSerialization.data(withJSONObject: [
-                    "id": "video_1", "status": "queued",
-                ]))
-            case ("GET", "/v1/videos/video_1"):
-                retrieveCount += 1
-                return (response, try JSONSerialization.data(withJSONObject: [
-                    "id": "video_1",
-                    "status": retrieveCount == 1 ? "processing" : "completed",
-                    "progress": retrieveCount == 1 ? 50 : 100,
-                ]))
-            case ("GET", "/v1/videos/video_1/content"):
-                return (response, Data([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]))
-            default:
-                preconditionFailure("Unexpected motion request: \(request.url?.absoluteString ?? "nil")")
-            }
-        }
-        let client = OpenAIVideoGenerationClient(
-            session: URLSession(configuration: sessionConfiguration))
-        let queued = try await client.create(
-            prompt: "纯白色背景，固定镜头，同一只小狗在原地转一圈。",
-            referenceImageURL: temporary,
-            apiKey: "test-key",
-            configuration: apiConfiguration,
-            model: "sora-2",
-            seconds: 4,
-            size: "1280x720")
-        precondition(queued.status == .queued)
-        let processing = try await client.retrieve(
-            id: queued.id, apiKey: "test-key", configuration: apiConfiguration)
-        precondition(processing.status == .processing && processing.progress == 50)
-        let completed = try await client.retrieve(
-            id: queued.id, apiKey: "test-key", configuration: apiConfiguration)
-        precondition(completed.status == .completed)
-        let video = try await client.downloadContent(
-            id: queued.id, apiKey: "test-key", configuration: apiConfiguration)
-        precondition(video.count == 8)
-    }
 }

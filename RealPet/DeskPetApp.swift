@@ -8,9 +8,11 @@ struct RealPetMain {
         if provisionImageServiceCredentialFromStandardInput() { return }
         if provisionPromptServiceCredentialFromStandardInput() { return }
         if provisionAgnesServiceCredentialFromStandardInput() { return }
+        if provisionMiniMaxServiceCredentialFromStandardInput() { return }
         if provisionMotionServiceCredentialFromStandardInput() { return }
         if configureMotionServiceFromCommandLine() { return }
         if configureAgnesMotionServiceFromCommandLine() { return }
+        if configureMiniMaxMotionServiceFromCommandLine() { return }
         if exportOriginalRigAtlasFromCommandLine() { return }
         if exportOriginalRigTorsoFromCommandLine() { return }
         let app = NSApplication.shared
@@ -105,13 +107,34 @@ struct RealPetMain {
         return true
     }
 
+    private static func provisionMiniMaxServiceCredentialFromStandardInput() -> Bool {
+        guard CommandLine.arguments.contains(
+            "--provision-minimax-service-credential") else { return false }
+        guard let input = readLine(strippingNewline: true) else {
+            fputs("RealPet: missing MiniMax service credential on stdin\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+        let key = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            fputs("RealPet: MiniMax service credential is empty\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+        do {
+            try OpenAIAPIKeyStore.saveMiniMaxMotionService(key)
+        } catch {
+            fputs("RealPet: failed to provision MiniMax service credential\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+        return true
+    }
+
     private static func configureMotionServiceFromCommandLine() -> Bool {
         guard let flagIndex = CommandLine.arguments.firstIndex(
             of: "--configure-motion-service") else { return false }
         let values = Array(CommandLine.arguments.dropFirst(flagIndex + 1))
-        guard values.count == 7, let seconds = Int(values[5]) else {
+        guard values.count == 8, let seconds = Int(values[6]) else {
             fputs(
-                "RealPet: expected prompt Base URL, prompt model, Agnes Base URL, image model, video model, seconds, and size\n",
+                "RealPet: expected prompt Base URL, prompt model, Agnes Base URL, image model, MiniMax Base URL, video model, seconds, and size\n",
                 stderr)
             exit(EXIT_FAILURE)
         }
@@ -121,9 +144,10 @@ struct RealPetMain {
                 promptModel: values[1],
                 agnesBaseURLString: values[2],
                 imageModel: values[3],
-                videoModel: values[4],
+                miniMaxBaseURLString: values[4],
+                videoModel: values[5],
                 seconds: seconds,
-                size: values[6]).validated()
+                size: values[7]).validated()
             MotionServiceConfigurationStore.save(configuration)
         } catch {
             fputs("RealPet: invalid motion service configuration\n", stderr)
@@ -136,9 +160,9 @@ struct RealPetMain {
         guard let flagIndex = CommandLine.arguments.firstIndex(
             of: "--configure-agnes-motion-service") else { return false }
         let values = Array(CommandLine.arguments.dropFirst(flagIndex + 1))
-        guard values.count == 5, let seconds = Int(values[3]) else {
+        guard values.count == 4, let seconds = Int(values[2]) else {
             fputs(
-                "RealPet: expected Agnes Base URL, image model, video model, seconds, and size\n",
+                "RealPet: expected Agnes Base URL, image model, seconds, and size\n",
                 stderr)
             exit(EXIT_FAILURE)
         }
@@ -149,12 +173,42 @@ struct RealPetMain {
                 promptModel: current.promptModel,
                 agnesBaseURLString: values[0],
                 imageModel: values[1],
-                videoModel: values[2],
+                miniMaxBaseURLString: current.resolvedMiniMaxBaseURLString,
+                videoModel: current.videoModel,
                 seconds: seconds,
-                size: values[4]).validated()
+                size: values[3]).validated()
             MotionServiceConfigurationStore.save(configuration)
         } catch {
             fputs("RealPet: invalid Agnes motion service configuration\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+        return true
+    }
+
+    private static func configureMiniMaxMotionServiceFromCommandLine() -> Bool {
+        guard let flagIndex = CommandLine.arguments.firstIndex(
+            of: "--configure-minimax-motion-service") else { return false }
+        let values = Array(CommandLine.arguments.dropFirst(flagIndex + 1))
+        guard values.count == 3, let seconds = Int(values[2]) else {
+            fputs(
+                "RealPet: expected MiniMax Base URL, video model, and seconds\n",
+                stderr)
+            exit(EXIT_FAILURE)
+        }
+        let current = MotionServiceConfigurationStore.load()
+        do {
+            let configuration = try MotionServiceConfiguration(
+                baseURLString: current.baseURLString,
+                promptModel: current.promptModel,
+                agnesBaseURLString: current.resolvedAgnesBaseURLString,
+                imageModel: current.imageModel,
+                miniMaxBaseURLString: values[0],
+                videoModel: values[1],
+                seconds: seconds,
+                size: current.size).validated()
+            MotionServiceConfigurationStore.save(configuration)
+        } catch {
+            fputs("RealPet: invalid MiniMax motion service configuration\n", stderr)
             exit(EXIT_FAILURE)
         }
         return true

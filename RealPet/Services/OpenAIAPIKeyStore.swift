@@ -7,6 +7,7 @@ enum OpenAIAPIKeyStore {
     private static let legacyMotionAccount = "motion-generation"
     private static let promptMotionAccount = "motion-prompt"
     private static let agnesMotionAccount = "motion-agnes"
+    private static let miniMaxMotionAccount = "motion-minimax"
 
     static func load() -> String? {
         load(account: imageAccount)
@@ -28,6 +29,12 @@ enum OpenAIAPIKeyStore {
         loadAgnesMotionService()
     }
 
+    /// MiniMax H3 is a separate provider. Do not fall back to the legacy
+    /// motion credential because existing installations store an Agnes key there.
+    static func loadMiniMaxMotionService() -> String? {
+        load(account: miniMaxMotionAccount)
+    }
+
     static func save(_ key: String) throws {
         try save(key, account: imageAccount)
     }
@@ -42,6 +49,10 @@ enum OpenAIAPIKeyStore {
 
     static func saveMotionService(_ key: String) throws {
         try saveAgnesMotionService(key)
+    }
+
+    static func saveMiniMaxMotionService(_ key: String) throws {
+        try save(key, account: miniMaxMotionAccount)
     }
 
     private static func load(account: String) -> String? {

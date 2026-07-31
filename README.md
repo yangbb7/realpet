@@ -17,8 +17,8 @@ always-on-top native window.
 
 - **Photos → Generated Pet Motion**: Import 1–6 owner photos; Agnes Image 2.0
   first creates a unified identity anchor, `gpt-5.6-sol` on the configured
-  compatible relay creates a constrained Chinese video prompt, and Agnes Video
-  V2.0 generates the motion
+  compatible relay creates a constrained Chinese video prompt, and MiniMax H3
+  generates the motion
 - **Prompt Review Before Generation**: The optimized prompt remains editable;
   generation is an explicit second action rather than an automatic upload
 - **Generated Action Installation**: Video jobs are created, polled, downloaded,
@@ -131,21 +131,22 @@ RealPet runs real-time AI models (SAM2 tracking + BiRefNet matting + Faster R-CN
 
 Click **导入宠物照片** and select 1–6 clear photos of the same pet. In the
 **动作工作台**, write what the pet should do in natural language, such as
-“让它慢慢转一圈”. Open the gear button once to configure two independent
+“让它慢慢转一圈”. Open the gear button once to configure three independent
 services. `gpt-5.6-sol` retains its existing OpenAI-compatible relay Base URL
 and relay key for Prompt optimization. Agnes uses the direct official endpoint
-`https://apihub.agnes-ai.com/v1`, `agnes-image-2.0-flash`, and
-`agnes-video-v2.0` with a separate Agnes key. Both keys are stored separately
-in the macOS Keychain.
+`https://apihub.agnes-ai.com/v1` and `agnes-image-2.0-flash` for the canonical
+reference image. MiniMax uses `https://api.minimaxi.com` and `MiniMax-H3` for
+the generated video. The three keys are stored separately in the macOS Keychain.
 
 Click **优化 Prompt**. The selected owner photos are sent only to the configured
 `gpt-5.6-sol` relay, which identifies the pet and produces an editable prompt
 constrained to a pure white background, fixed camera, photographic realism, and
 the same pet. After reviewing or editing it, click **生成动作**. Only then does
 RealPet call Agnes Image 2.0 to make one public identity anchor, followed by
-Agnes Video V2.0 with that anchor and the approved prompt. RealPet polls the
-task by its `video_id`, downloads the result, runs the local quality and
-identity checks, and asks for installation.
+MiniMax H3 with that anchor as its first frame and the approved prompt. RealPet
+submits `POST /v2/video_generation`, polls the returned `task_id`, downloads
+the result URL, runs the local quality and identity checks, and asks for
+installation.
 
 The initial generated action must be **待机**. Once it has been installed, use
 the same workbench to generate mouse gaze, lying down, pawing, and eating
@@ -244,11 +245,11 @@ camera evidence remains in bounded memory and is never written to disk by this
 workflow.
 
 The motion service is configured in the in-app action workbench, not through an
-environment variable. Its two Base URLs must be HTTPS unless they are loopback
+environment variable. Its three Base URLs must be HTTPS unless they are loopback
 addresses. `gpt-5.6-sol` remains on its configured compatible relay for Prompt
 optimization. Agnes is direct-only for the canonical reference
-(`agnes-image-2.0-flash`) and video (`agnes-video-v2.0`), using a separate
-credential.
+(`agnes-image-2.0-flash`); MiniMax is direct-only for video (`MiniMax-H3`, 2K,
+adaptive ratio), each using a separate credential.
 
 ## Building the App
 

@@ -267,22 +267,30 @@ class PetListViewModel: ObservableObject {
         return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    var hasMiniMaxMotionServiceCredential: Bool {
+        guard let key = OpenAIAPIKeyStore.loadMiniMaxMotionService() else { return false }
+        return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     func saveMotionServiceConfiguration(
         baseURLString: String,
         promptModel: String,
         agnesBaseURLString: String,
         imageModel: String,
+        miniMaxBaseURLString: String,
         videoModel: String,
         seconds: Int,
         size: String,
         promptAPIKey: String?,
-        agnesAPIKey: String?
+        agnesAPIKey: String?,
+        miniMaxAPIKey: String?
     ) throws {
         let configuration = try MotionServiceConfiguration(
             baseURLString: baseURLString,
             promptModel: promptModel,
             agnesBaseURLString: agnesBaseURLString,
             imageModel: imageModel,
+            miniMaxBaseURLString: miniMaxBaseURLString,
             videoModel: videoModel,
             seconds: seconds,
             size: size).validated()
@@ -296,6 +304,12 @@ class PetListViewModel: ObservableObject {
             let trimmed = agnesAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
                 try OpenAIAPIKeyStore.saveAgnesMotionService(trimmed)
+            }
+        }
+        if let miniMaxAPIKey {
+            let trimmed = miniMaxAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                try OpenAIAPIKeyStore.saveMiniMaxMotionService(trimmed)
             }
         }
         motionServiceConfiguration = configuration
@@ -355,6 +369,10 @@ class PetListViewModel: ObservableObject {
             motionWorkflowState = .failed("请先在服务配置中填写 Agnes API Key")
             return
         }
+        guard let miniMaxAPIKey = OpenAIAPIKeyStore.loadMiniMaxMotionService() else {
+            motionWorkflowState = .failed("请先在服务配置中填写 MiniMax API Key")
+            return
+        }
         let prompt = optimizedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else {
             motionWorkflowState = .failed("请先优化提示词")
@@ -363,6 +381,7 @@ class PetListViewModel: ObservableObject {
         do {
             let configuration = try motionServiceConfiguration.validated()
             let agnesAPIConfiguration = try configuration.validatedAgnesAPIConfiguration()
+            let miniMaxAPIConfiguration = try configuration.validatedMiniMaxAPIConfiguration()
             guard let imageModel = configuration.imageModel?.trimmingCharacters(
                 in: .whitespacesAndNewlines), !imageModel.isEmpty else {
                 throw MotionServiceConfigurationError.missingImageModel
@@ -385,35 +404,32 @@ class PetListViewModel: ObservableObject {
                             model: imageModel)
                     self.preparedAgnesReference = (pet.id, referenceImageURL)
                     self.motionWorkflowState = .submittingVideo
-                    let client = OpenAIVideoGenerationClient()
+                    let client = MiniMaxH3VideoGenerationClient()
                     var job = try await client.create(
                         prompt: prompt,
-                        referenceImageURL: referenceImageURL,
-                        apiKey: agnesAPIKey,
-                        configuration: agnesAPIConfiguration,
-                        model: configuration.videoModel,
-                        seconds: configuration.seconds,
-                        size: configuration.size)
+                        firstFrameURL: referenceImageURL,
+                        apiKey: miniMaxAPIKey,
+                        configuration: miniMaxAPIConfiguration,
+                        seconds: configuration.seconds)
                     while !Task.isCancelled {
                         switch job.status {
                         case .completed:
                             self.motionWorkflowState = .downloadingVideo
-                            let video = try await client.downloadContent(
-                                job: job, apiKey: agnesAPIKey,
-                                configuration: agnesAPIConfiguration)
+                            let video = try await client.downloadContent(job: job)
                             try self.installGeneratedVideo(
                                 data: video, for: pet, kind: kind, jobID: job.id)
                             return
                         case .failed(let message):
-                            throw OpenAIVideoGenerationError.failed(message)
+                            throw MiniMaxH3VideoGenerationError.failed(message)
                         case .queued, .processing:
                             self.motionWorkflowState = .waitingForVideo(
-                                progress: Self.normalizedVideoProgress(job.progress))
+                                progress: nil)
                             try await Task.sleep(for: .seconds(5))
                             try Task.checkCancellation()
                             job = try await client.retrieve(
-                                job: job, apiKey: agnesAPIKey,
-                                configuration: agnesAPIConfiguration)
+                                id: job.id,
+                                apiKey: miniMaxAPIKey,
+                                configuration: miniMaxAPIConfiguration)
                         }
                     }
                 } catch is CancellationError {
@@ -1570,10 +1586,10 @@ class PetListViewModel: ObservableObject {
         jobID: String
     ) throws {
         guard !data.isEmpty else {
-            throw OpenAIVideoGenerationError.invalidResponse
+            throw MiniMaxH3VideoGenerationError.invalidResponse
         }
         guard let currentPet = pets.first(where: { $0.id == pet.id }) else {
-            throw OpenAIVideoGenerationError.failed("宠物已被删除")
+            throw MiniMaxH3VideoGenerationError.failed("宠物已被删除")
         }
         let petDirectory = PetStorage.shared.petDirectory(for: currentPet.id)
         let workDirectory = petDirectory

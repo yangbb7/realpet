@@ -17,11 +17,12 @@ struct MotionStudioView: View {
     @State private var promptModel = ""
     @State private var agnesBaseURL = ""
     @State private var imageModel = ""
+    @State private var miniMaxBaseURL = ""
     @State private var videoModel = ""
     @State private var seconds = 4
-    @State private var size = "1280x720"
     @State private var promptAPIKey = ""
     @State private var agnesAPIKey = ""
+    @State private var miniMaxAPIKey = ""
     @State private var configurationMessage: String?
 
     private var references: [URL] {
@@ -35,16 +36,26 @@ struct MotionStudioView: View {
 
     private var isBusy: Bool { vm.motionWorkflowState.isBusy }
 
-    private var hasBothCredentials: Bool {
-        vm.hasPromptMotionServiceCredential && vm.hasAgnesMotionServiceCredential
+    private var hasAllCredentials: Bool {
+        vm.hasPromptMotionServiceCredential
+            && vm.hasAgnesMotionServiceCredential
+            && vm.hasMiniMaxMotionServiceCredential
+    }
+
+    private var hasGenerationCredentials: Bool {
+        vm.hasAgnesMotionServiceCredential && vm.hasMiniMaxMotionServiceCredential
     }
 
     private var credentialStatus: String {
-        switch (vm.hasPromptMotionServiceCredential, vm.hasAgnesMotionServiceCredential) {
-        case (true, true): return "两组 Key 已配置"
-        case (true, false): return "待配置 Agnes Key"
-        case (false, true): return "待配置 Prompt Key"
-        case (false, false): return "未配置服务 Key"
+        switch (
+            vm.hasPromptMotionServiceCredential,
+            vm.hasAgnesMotionServiceCredential,
+            vm.hasMiniMaxMotionServiceCredential
+        ) {
+        case (true, true, true): return "三组 Key 已配置"
+        case (false, _, _): return "待配置 Prompt Key"
+        case (_, false, _): return "待配置 Agnes Key"
+        case (_, _, false): return "待配置 MiniMax Key"
         }
     }
 
@@ -89,7 +100,7 @@ struct MotionStudioView: View {
                 Spacer()
                 Text(credentialStatus)
                     .font(.caption)
-                    .foregroundStyle(hasBothCredentials ? .green : .orange)
+                    .foregroundStyle(hasAllCredentials ? .green : .orange)
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -131,7 +142,7 @@ struct MotionStudioView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(isBusy || optimizedPrompt.trimmingCharacters(
-                    in: .whitespacesAndNewlines).isEmpty)
+                    in: .whitespacesAndNewlines).isEmpty || !hasGenerationCredentials)
             }
 
             if !optimizedPrompt.isEmpty {
@@ -210,26 +221,30 @@ struct MotionStudioView: View {
                 .font(.subheadline.weight(.semibold))
             TextField("Agnes API Base URL", text: $agnesBaseURL)
                 .textFieldStyle(.roundedBorder)
-            HStack {
-                TextField("参考图模型", text: $imageModel)
-                TextField("视频模型", text: $videoModel)
-            }
-            HStack {
-                Picker("时长", selection: $seconds) {
-                    Text("4 秒").tag(4)
-                    Text("8 秒").tag(8)
-                    Text("12 秒").tag(12)
-                }
-                Picker("尺寸", selection: $size) {
-                    Text("标准 1152x768").tag("1152x768")
-                    Text("横屏 1280x720").tag("1280x720")
-                    Text("竖屏 720x1280").tag("720x1280")
-                }
-            }
+            TextField("参考图模型", text: $imageModel)
+                .textFieldStyle(.roundedBorder)
             SecureField(
                 vm.hasAgnesMotionServiceCredential
                     ? "新的 Agnes API Key（留空则不修改）" : "Agnes API Key",
                 text: $agnesAPIKey)
+                .textFieldStyle(.roundedBorder)
+            Divider()
+            Text("MiniMax 官方直连")
+                .font(.subheadline.weight(.semibold))
+            TextField("MiniMax API Base URL", text: $miniMaxBaseURL)
+                .textFieldStyle(.roundedBorder)
+            Text("\(videoModel)  |  2K  |  首帧比例自适应")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Picker("时长", selection: $seconds) {
+                Text("4 秒").tag(4)
+                Text("8 秒").tag(8)
+                Text("12 秒").tag(12)
+            }
+            SecureField(
+                vm.hasMiniMaxMotionServiceCredential
+                    ? "新的 MiniMax API Key（留空则不修改）" : "MiniMax API Key",
+                text: $miniMaxAPIKey)
                 .textFieldStyle(.roundedBorder)
             HStack {
                 if let configurationMessage {
@@ -245,13 +260,16 @@ struct MotionStudioView: View {
                             promptModel: promptModel,
                             agnesBaseURLString: agnesBaseURL,
                             imageModel: imageModel,
+                            miniMaxBaseURLString: miniMaxBaseURL,
                             videoModel: videoModel,
                             seconds: seconds,
-                            size: size,
+                            size: "1152x768",
                             promptAPIKey: promptAPIKey,
-                            agnesAPIKey: agnesAPIKey)
+                            agnesAPIKey: agnesAPIKey,
+                            miniMaxAPIKey: miniMaxAPIKey)
                         promptAPIKey = ""
                         agnesAPIKey = ""
+                        miniMaxAPIKey = ""
                         configurationMessage = "已保存"
                     } catch {
                         configurationMessage = error.localizedDescription
@@ -268,9 +286,9 @@ struct MotionStudioView: View {
         promptModel = configuration.promptModel
         agnesBaseURL = configuration.resolvedAgnesBaseURLString
         imageModel = configuration.imageModel ?? ""
+        miniMaxBaseURL = configuration.resolvedMiniMaxBaseURLString
         videoModel = configuration.videoModel
         seconds = configuration.seconds
-        size = configuration.size
         if naturalPrompt.isEmpty {
             naturalPrompt = pet.framesDir == nil
                 ? "让它在原地自然待机，轻微眨眼和呼吸。"
