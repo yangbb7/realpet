@@ -129,6 +129,7 @@ struct MotionGenerationContractCheck {
         let tracking = DefaultMouseInteractionScenario.pointerTracking
         precondition(tracking.actionPlans.map(\.kind) == [.gazeOrbit])
         precondition(tracking.minimumVideoSeconds == 12)
+        precondition(tracking.canCreatePetFromPhotos)
         let orbitPrompt = tracking.actionPlans[0].prompt
         precondition(orbitPrompt.contains("首帧中的同一只宠物"))
         precondition(orbitPrompt.contains("完整旋转 360 度"))
@@ -139,6 +140,7 @@ struct MotionGenerationContractCheck {
         let bounce = DefaultMouseInteractionScenario.clickBounce
         precondition(bounce.actionPlans.map(\.kind) == [.play])
         precondition(bounce.minimumVideoSeconds == 4)
+        precondition(!bounce.canCreatePetFromPhotos)
         precondition(bounce.debugPrompt.contains("原地轻快蹦跳两次"))
         precondition(bounce.debugPrompt.contains("首帧中的同一只宠物"))
         precondition(PetActionManifest.Action.Kind.defaultMouseInteraction == [

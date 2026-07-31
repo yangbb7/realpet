@@ -67,7 +67,7 @@ class PetListViewModel: ObservableObject {
     private struct StagedGeneratedMotionVideo {
         let petID: UUID
         let kind: PetActionManifest.Action.Kind
-        let rootFramesDirectory: String
+        let rootFramesDirectory: String?
         let workDirectory: String
         let videoURL: URL
     }
@@ -226,10 +226,6 @@ class PetListViewModel: ObservableObject {
     }
 
     func presentMotionStudio(for pet: Pet) {
-        guard pet.framesDir != nil else {
-            pythonBridge.error = "请先导入宠物视频，完成桌宠基础帧处理后再生成默认鼠标动作"
-            return
-        }
         guard !referenceImages(for: pet).isEmpty else {
             pythonBridge.error = "找不到这只宠物的参考图"
             return
@@ -296,8 +292,8 @@ class PetListViewModel: ObservableObject {
         scenario: DefaultMouseInteractionScenario
     ) {
         guard !motionWorkflowState.isBusy else { return }
-        guard pet.framesDir != nil else {
-            motionWorkflowState = .failed("请先导入宠物视频，完成桌宠基础帧处理后再生成默认鼠标动作")
+        guard pet.framesDir != nil || scenario.canCreatePetFromPhotos else {
+            motionWorkflowState = .failed("请先生成鼠标注视跟随，为桌宠创建基础帧库")
             return
         }
         guard let agnesAPIKey = OpenAIAPIKeyStore.loadAgnesMotionService() else {
@@ -401,7 +397,7 @@ class PetListViewModel: ObservableObject {
         motionGenerationTask?.cancel()
         motionGenerationTask = nil
         clearGeneratedMotionInstallQueue()
-        if activeActionImport?.origin == .generated {
+        if activeActionImport?.origin == .generated || generatedInitialPetId != nil {
             pythonBridge.cancelProcessing()
         }
         if motionWorkflowState.isBusy {
@@ -739,16 +735,28 @@ class PetListViewModel: ObservableObject {
             pets[idx].framesDir = framesDir
             pets[idx].frameCount = frameCount
             pets[idx].rendererKind = .sourceFrames
-            let idleManifest = PetActionManifest(
-                version: PetActionManifest.currentVersion,
-                defaultAction: "idle",
-                actions: [PetActionManifest.Action(
-                    id: "idle", kind: .idle, framesDirectory: ".",
-                    fps: max(1, pets[idx].fps), loop: true,
-                    translatesWindow: false,
-                    origin: generatedInitialPetId == pets[idx].id
-                        ? .generated : .captured)])
-            try? idleManifest.save(framesDirectory: framesDir)
+            let isGeneratedInitialPet = generatedInitialPetId == pets[idx].id
+            do {
+                if isGeneratedInitialPet {
+                    try installGeneratedInitialOrbit(
+                        framesDirectory: framesDir,
+                        fps: max(1, pets[idx].fps))
+                } else {
+                    let idleManifest = PetActionManifest(
+                        version: PetActionManifest.currentVersion,
+                        defaultAction: "idle",
+                        actions: [PetActionManifest.Action(
+                            id: "idle", kind: .idle, framesDirectory: ".",
+                            fps: max(1, pets[idx].fps), loop: true,
+                            translatesWindow: false, origin: .captured)])
+                    try idleManifest.save(framesDirectory: framesDir)
+                }
+            } catch {
+                failPreparation(
+                    petId: pets[idx].id,
+                    message: "无法安装 360° 注视帧库：\(error.localizedDescription)")
+                return
+            }
             let petId = pets[idx].id
             pets[idx].status = .processing
             PetStorage.shared.save(pets)
@@ -1506,8 +1514,7 @@ class PetListViewModel: ObservableObject {
         guard !data.isEmpty else {
             throw MiniMaxH3VideoGenerationError.invalidResponse
         }
-        guard let currentPet = pets.first(where: { $0.id == pet.id }),
-              let rootFramesDirectory = currentPet.framesDir else {
+        guard let currentPet = pets.first(where: { $0.id == pet.id }) else {
             throw MiniMaxH3VideoGenerationError.failed("宠物已被删除")
         }
         let petDirectory = PetStorage.shared.petDirectory(for: currentPet.id)
@@ -1521,27 +1528,107 @@ class PetListViewModel: ObservableObject {
         return StagedGeneratedMotionVideo(
             petID: currentPet.id,
             kind: kind,
-            rootFramesDirectory: rootFramesDirectory,
+            rootFramesDirectory: currentPet.framesDir,
             workDirectory: workDirectory.path,
             videoURL: videoURL)
     }
 
     private func startGeneratedActionImport(_ stagedVideo: StagedGeneratedMotionVideo) throws {
-        guard pets.contains(where: { $0.id == stagedVideo.petID }) else {
+        guard let currentPet = pets.first(where: { $0.id == stagedVideo.petID }) else {
             throw MiniMaxH3VideoGenerationError.failed("宠物已被删除")
         }
         motionWorkflowState = .installing
         motionStudioPet = nil
-        activeActionImport = ActiveActionImport(
-            petId: stagedVideo.petID,
-            kind: stagedVideo.kind,
-            rootFramesDirectory: stagedVideo.rootFramesDirectory,
-            workDirectory: stagedVideo.workDirectory,
-            origin: .generated)
+        if let rootFramesDirectory = stagedVideo.rootFramesDirectory {
+            activeActionImport = ActiveActionImport(
+                petId: stagedVideo.petID,
+                kind: stagedVideo.kind,
+                rootFramesDirectory: rootFramesDirectory,
+                workDirectory: stagedVideo.workDirectory,
+                origin: .generated)
+            beginPreparation(
+                petId: stagedVideo.petID,
+                videoPath: stagedVideo.videoURL.path,
+                outputDir: stagedVideo.workDirectory)
+            return
+        }
+        guard stagedVideo.kind == .gazeOrbit else {
+            throw MiniMaxH3VideoGenerationError.failed(
+                "请先生成鼠标注视跟随，为桌宠创建基础帧库")
+        }
+        generatedInitialPetId = currentPet.id
+        if let index = pets.firstIndex(where: { $0.id == currentPet.id }) {
+            pets[index].sourcePath = stagedVideo.videoURL.path
+            pets[index].status = .detecting
+            PetStorage.shared.save(pets)
+        }
         beginPreparation(
-            petId: stagedVideo.petID,
+            petId: currentPet.id,
             videoPath: stagedVideo.videoURL.path,
-            outputDir: stagedVideo.workDirectory)
+            outputDir: PetStorage.shared.petDirectory(for: currentPet.id).path)
+    }
+
+    /// A photo-only pet uses the first stable orbit frame as its idle base and
+    /// installs the complete generated sequence as the mouse-facing frame bank.
+    private func installGeneratedInitialOrbit(
+        framesDirectory: String,
+        fps: Int
+    ) throws {
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: framesDirectory)
+        let frameEntries = try fm.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: nil).filter {
+                $0.lastPathComponent.hasPrefix("frame_")
+            }
+        let colorFrames = frameEntries.filter { entry in
+            let name = entry.lastPathComponent.lowercased()
+            return !name.hasSuffix("_a.jpg")
+                && ["png", "jpg"].contains(entry.pathExtension.lowercased())
+        }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard let initialFrame = colorFrames.first else {
+            throw PetActionLibrary.InstallError.noFrames
+        }
+
+        let staging = root.appendingPathComponent(
+            ".generated-gaze-orbit-\(UUID().uuidString)")
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        do {
+            for entry in frameEntries {
+                try fm.copyItem(at: entry, to: staging.appendingPathComponent(
+                    entry.lastPathComponent))
+            }
+            let alphaName = "\(initialFrame.deletingPathExtension().lastPathComponent)_a.jpg"
+            for entry in frameEntries where entry != initialFrame
+                && entry.lastPathComponent != alphaName {
+                try? fm.removeItem(at: entry)
+            }
+
+            let manifest = try PetActionLibrary.install(
+                kind: .gazeOrbit,
+                processedFramesDirectory: staging,
+                rootFramesDirectory: root,
+                fps: fps,
+                origin: .generated)
+            let generatedBaseManifest = PetActionManifest(
+                version: manifest.version,
+                defaultAction: manifest.defaultAction,
+                actions: manifest.actions.map { action in
+                    guard action.kind == .idle else { return action }
+                    return PetActionManifest.Action(
+                        id: action.id,
+                        kind: action.kind,
+                        framesDirectory: action.framesDirectory,
+                        fps: action.fps,
+                        loop: action.loop,
+                        translatesWindow: action.translatesWindow,
+                        origin: .generated)
+                })
+            try generatedBaseManifest.save(framesDirectory: framesDirectory)
+            actionLibraryRevision += 1
+        } catch {
+            try? fm.removeItem(at: staging)
+            throw error
+        }
     }
 
     private func clearGeneratedMotionInstallQueue() {

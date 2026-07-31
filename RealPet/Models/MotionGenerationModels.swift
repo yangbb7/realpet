@@ -36,6 +36,12 @@ enum DefaultMouseInteractionScenario: String, CaseIterable, Identifiable, Sendab
         }
     }
 
+    /// The 360-degree orbit can become the first source-frame pet. A bounce
+    /// needs an existing base pet to play against.
+    var canCreatePetFromPhotos: Bool {
+        self == .pointerTracking
+    }
+
     var actionPlans: [DefaultMotionActionPlan] {
         switch self {
         case .pointerTracking:
