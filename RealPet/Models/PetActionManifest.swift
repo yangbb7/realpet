@@ -101,9 +101,7 @@ struct PetActionManifest: Codable, Equatable, Sendable {
                 .lieDown, .paw, .eat,
             ]
 
-            static let importable: [Kind] = gazeCapture + requiredResponseCapture + [
-                .walk, .run, .shakeHead, .react, .play,
-            ]
+            static let defaultMouseInteraction: [Kind] = gazeCapture + [.play]
 
             static func gazeAction(
                 horizontalOffset: Double,
@@ -241,7 +239,8 @@ struct PetActionManifest: Codable, Equatable, Sendable {
             kind: kind,
             framesDirectory: relativeFramesDirectory,
             fps: fps,
-            loop: ![.react, .shakeHead, .play, .lieDown, .paw, .eat].contains(kind),
+            loop: !([.react, .shakeHead, .play, .lieDown, .paw, .eat]
+                + Action.Kind.gazeCapture).contains(kind),
             translatesWindow: kind.translatesWindow,
             origin: origin)
         if let index = actions.firstIndex(where: { $0.id == action.id }) {

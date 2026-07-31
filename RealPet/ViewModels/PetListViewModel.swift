@@ -7,7 +7,6 @@ class PetListViewModel: ObservableObject {
     @Published var pets: [Pet] = []
     @Published var showFilePicker = false
     @Published var showPhotoPicker = false
-    @Published var showActionFilePicker = false
     @Published private(set) var activeActionImport: ActiveActionImport?
     @Published private(set) var actionLibraryRevision = 0
     @Published private(set) var validatingActionPetId: UUID?
@@ -27,7 +26,6 @@ class PetListViewModel: ObservableObject {
     @Published var personalitySetupPet: Pet?
     @Published private(set) var rigGenerationPetId: UUID?
     @Published private(set) var rigGenerationStage: String?
-    @Published var capturePackPet: Pet?
     @Published private(set) var pendingActionReview: PendingActionReview?
     @Published var motionStudioPet: Pet?
     @Published private(set) var motionWorkflowState: MotionWorkflowState = .idle
@@ -37,21 +35,15 @@ class PetListViewModel: ObservableObject {
     let petLauncher = PetLauncher()
     let multimodalEvidenceBuffer = EphemeralEvidenceBuffer()
 
-    private var pendingActionImportRequest: ActionImportRequest?
     private var generatedInitialPetId: UUID?
     private var motionGenerationTask: Task<Void, Never>?
-    private var preparedAgnesReference: (petID: UUID, url: URL)?
+    private var generatedMotionInstallQueue: [StagedGeneratedMotionVideo] = []
     private var cameraInteractionAdapter: CameraInteractionAdapter?
     private var vlmInteractionAdapter: VLMInteractionAdapter?
     private var speechInteractionAdapter: SpeechInteractionAdapter?
     private var behaviorSnapshotsCancellable: AnyCancellable?
     private var behaviorPlanningCoordinator: BehaviorPlanningCoordinator?
     private let templateClassifier = PetTemplateClassifier()
-
-    struct ActionImportRequest {
-        let petId: UUID
-        let kind: PetActionManifest.Action.Kind
-    }
 
     struct ActiveActionImport: Equatable {
         let petId: UUID
@@ -70,6 +62,14 @@ class PetListViewModel: ObservableObject {
         let fps: Int
         let identitySimilarity: Double?
         let origin: PetActionManifest.Action.Origin
+    }
+
+    private struct StagedGeneratedMotionVideo {
+        let petID: UUID
+        let kind: PetActionManifest.Action.Kind
+        let rootFramesDirectory: String
+        let workDirectory: String
+        let videoURL: URL
     }
 
     struct ClipChoice {
@@ -124,7 +124,6 @@ class PetListViewModel: ObservableObject {
         rigGenerationPetId != nil
             || motionWorkflowState.isBusy
             || activeActionImport != nil
-            || pendingActionImportRequest != nil
             || pythonBridge.isProcessing
             || pets.contains {
                 $0.status == .detecting
@@ -226,18 +225,11 @@ class PetListViewModel: ObservableObject {
         }
     }
 
-    func beginActionImport(for pet: Pet, kind: PetActionManifest.Action.Kind) {
-        guard !hasActiveWorkflow,
-              pet.status == .ready || pet.status == .showing,
-              pet.framesDir != nil else {
-            pythonBridge.error = "当前有其他任务正在处理"
+    func presentMotionStudio(for pet: Pet) {
+        guard pet.framesDir != nil else {
+            pythonBridge.error = "请先导入宠物视频，完成桌宠基础帧处理后再生成默认鼠标动作"
             return
         }
-        pendingActionImportRequest = ActionImportRequest(petId: pet.id, kind: kind)
-        showActionFilePicker = true
-    }
-
-    func presentMotionStudio(for pet: Pet) {
         guard !referenceImages(for: pet).isEmpty else {
             pythonBridge.error = "找不到这只宠物的参考图"
             return
@@ -257,11 +249,6 @@ class PetListViewModel: ObservableObject {
         }
     }
 
-    var hasPromptMotionServiceCredential: Bool {
-        guard let key = OpenAIAPIKeyStore.loadPromptMotionService() else { return false }
-        return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
     var hasAgnesMotionServiceCredential: Bool {
         guard let key = OpenAIAPIKeyStore.loadAgnesMotionService() else { return false }
         return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -273,33 +260,21 @@ class PetListViewModel: ObservableObject {
     }
 
     func saveMotionServiceConfiguration(
-        baseURLString: String,
-        promptModel: String,
         agnesBaseURLString: String,
         imageModel: String,
         miniMaxBaseURLString: String,
         videoModel: String,
         seconds: Int,
-        size: String,
-        promptAPIKey: String?,
         agnesAPIKey: String?,
         miniMaxAPIKey: String?
     ) throws {
         let configuration = try MotionServiceConfiguration(
-            baseURLString: baseURLString,
-            promptModel: promptModel,
             agnesBaseURLString: agnesBaseURLString,
             imageModel: imageModel,
             miniMaxBaseURLString: miniMaxBaseURLString,
             videoModel: videoModel,
             seconds: seconds,
-            size: size).validated()
-        if let promptAPIKey {
-            let trimmed = promptAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                try OpenAIAPIKeyStore.savePromptMotionService(trimmed)
-            }
-        }
+            size: motionServiceConfiguration.size).validated()
         if let agnesAPIKey {
             let trimmed = agnesAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
@@ -316,53 +291,13 @@ class PetListViewModel: ObservableObject {
         MotionServiceConfigurationStore.save(configuration)
     }
 
-    func optimizeMotionPrompt(
+    func generateDefaultMotionScenario(
         for pet: Pet,
-        kind: PetActionManifest.Action.Kind,
-        naturalLanguage: String
-    ) async -> PetMotionPromptOptimization? {
-        guard !motionWorkflowState.isBusy else { return nil }
-        guard !naturalLanguage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            motionWorkflowState = .failed("请先描述希望宠物做什么动作")
-            return nil
-        }
-        let references = referenceImages(for: pet)
-        guard !references.isEmpty else {
-            motionWorkflowState = .failed("找不到这只宠物的参考图")
-            return nil
-        }
-        guard let promptAPIKey = OpenAIAPIKeyStore.loadPromptMotionService() else {
-            motionWorkflowState = .failed("请先在服务配置中填写中转 Prompt Key")
-            return nil
-        }
-        do {
-            let configuration = try motionServiceConfiguration.validated()
-            let promptAPIConfiguration = try configuration.validatedPromptAPIConfiguration()
-            preparedAgnesReference = nil
-            motionWorkflowState = .optimizing
-            let result = try await OpenAIPetPromptOptimizer().optimize(
-                naturalLanguage: "目标动作：\(kind.displayName)。\(naturalLanguage)",
-                referenceImageURLs: references,
-                apiKey: promptAPIKey,
-                configuration: promptAPIConfiguration,
-                model: configuration.promptModel)
-            guard motionStudioPet?.id == pet.id else { return nil }
-            motionWorkflowState = .optimized
-            return result
-        } catch {
-            motionWorkflowState = .failed(error.localizedDescription)
-            return nil
-        }
-    }
-
-    func generateMotion(
-        for pet: Pet,
-        kind: PetActionManifest.Action.Kind,
-        optimizedPrompt: String
+        scenario: DefaultMouseInteractionScenario
     ) {
         guard !motionWorkflowState.isBusy else { return }
-        guard pet.framesDir != nil || kind == .idle else {
-            motionWorkflowState = .failed("请先生成待机动作，再生成互动动作")
+        guard pet.framesDir != nil else {
+            motionWorkflowState = .failed("请先导入宠物视频，完成桌宠基础帧处理后再生成默认鼠标动作")
             return
         }
         guard let agnesAPIKey = OpenAIAPIKeyStore.loadAgnesMotionService() else {
@@ -371,11 +306,6 @@ class PetListViewModel: ObservableObject {
         }
         guard let miniMaxAPIKey = OpenAIAPIKeyStore.loadMiniMaxMotionService() else {
             motionWorkflowState = .failed("请先在服务配置中填写 MiniMax API Key")
-            return
-        }
-        let prompt = optimizedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else {
-            motionWorkflowState = .failed("请先优化提示词")
             return
         }
         do {
@@ -392,8 +322,18 @@ class PetListViewModel: ObservableObject {
                 return
             }
             motionGenerationTask?.cancel()
+            generatedMotionInstallQueue.removeAll()
             motionGenerationTask = Task { [weak self] in
                 guard let self else { return }
+                var stagedVideos: [StagedGeneratedMotionVideo] = []
+                var didHandoffStagedVideos = false
+                defer {
+                    if !didHandoffStagedVideos {
+                        for stagedVideo in stagedVideos {
+                            try? FileManager.default.removeItem(atPath: stagedVideo.workDirectory)
+                        }
+                    }
+                }
                 do {
                     self.motionWorkflowState = .preparingReference
                     let referenceImageURL = try await AgnesImageReferenceGenerator()
@@ -402,39 +342,51 @@ class PetListViewModel: ObservableObject {
                             apiKey: agnesAPIKey,
                             configuration: agnesAPIConfiguration,
                             model: imageModel)
-                    self.preparedAgnesReference = (pet.id, referenceImageURL)
-                    self.motionWorkflowState = .submittingVideo
                     let client = MiniMaxH3VideoGenerationClient()
-                    var job = try await client.create(
-                        prompt: prompt,
-                        firstFrameURL: referenceImageURL,
-                        apiKey: miniMaxAPIKey,
-                        configuration: miniMaxAPIConfiguration,
-                        seconds: configuration.seconds)
-                    while !Task.isCancelled {
-                        switch job.status {
-                        case .completed:
-                            self.motionWorkflowState = .downloadingVideo
-                            let video = try await client.downloadContent(job: job)
-                            try self.installGeneratedVideo(
-                                data: video, for: pet, kind: kind, jobID: job.id)
-                            return
-                        case .failed(let message):
-                            throw MiniMaxH3VideoGenerationError.failed(message)
-                        case .queued, .processing:
-                            self.motionWorkflowState = .waitingForVideo(
-                                progress: nil)
-                            try await Task.sleep(for: .seconds(5))
-                            try Task.checkCancellation()
-                            job = try await client.retrieve(
-                                id: job.id,
-                                apiKey: miniMaxAPIKey,
-                                configuration: miniMaxAPIConfiguration)
+                    for plan in scenario.actionPlans {
+                        try Task.checkCancellation()
+                        self.motionWorkflowState = .submittingVideo
+                        var job = try await client.create(
+                            prompt: plan.prompt,
+                            firstFrameURL: referenceImageURL,
+                            apiKey: miniMaxAPIKey,
+                            configuration: miniMaxAPIConfiguration,
+                            seconds: configuration.seconds)
+                        while !Task.isCancelled {
+                            switch job.status {
+                            case .completed:
+                                self.motionWorkflowState = .downloadingVideo
+                                let video = try await client.downloadContent(job: job)
+                                stagedVideos.append(try self.stageGeneratedMotionVideo(
+                                    data: video, for: pet, kind: plan.kind, jobID: job.id))
+                                break
+                            case .failed(let message):
+                                throw MiniMaxH3VideoGenerationError.failed(message)
+                            case .queued, .processing:
+                                self.motionWorkflowState = .waitingForVideo(progress: nil)
+                                try await Task.sleep(for: .seconds(5))
+                                try Task.checkCancellation()
+                                job = try await client.retrieve(
+                                    id: job.id,
+                                    apiKey: miniMaxAPIKey,
+                                    configuration: miniMaxAPIConfiguration)
+                                continue
+                            }
+                            break
                         }
                     }
+                    try Task.checkCancellation()
+                    guard let firstVideo = stagedVideos.first else {
+                        throw MiniMaxH3VideoGenerationError.invalidResponse
+                    }
+                    self.generatedMotionInstallQueue = Array(stagedVideos.dropFirst())
+                    try self.startGeneratedActionImport(firstVideo)
+                    didHandoffStagedVideos = true
                 } catch is CancellationError {
+                    self.clearGeneratedMotionInstallQueue()
                     self.motionWorkflowState = .idle
                 } catch {
+                    self.clearGeneratedMotionInstallQueue()
                     self.motionWorkflowState = .failed(error.localizedDescription)
                 }
             }
@@ -446,60 +398,13 @@ class PetListViewModel: ObservableObject {
     func cancelMotionGeneration() {
         motionGenerationTask?.cancel()
         motionGenerationTask = nil
+        clearGeneratedMotionInstallQueue()
+        if activeActionImport?.origin == .generated {
+            pythonBridge.cancelProcessing()
+        }
         if motionWorkflowState.isBusy {
             motionWorkflowState = .idle
         }
-    }
-
-    func presentCapturePack(for pet: Pet) {
-        guard pet.framesDir != nil else { return }
-        capturePackPet = pets.first(where: { $0.id == pet.id })
-    }
-
-    func dismissCapturePack() {
-        capturePackPet = nil
-    }
-
-    func importActionVideo(url: URL) {
-        guard let request = pendingActionImportRequest,
-              let pet = pets.first(where: { $0.id == request.petId }),
-              let rootFramesDirectory = pet.framesDir else { return }
-        pendingActionImportRequest = nil
-
-        let hasSecurityScopedAccess = url.startAccessingSecurityScopedResource()
-        defer {
-            if hasSecurityScopedAccess {
-                url.stopAccessingSecurityScopedResource()
-            }
-        }
-
-        let petDirectory = PetStorage.shared.petDirectory(for: pet.id)
-        let workDirectory = petDirectory
-            .appendingPathComponent("action_work")
-            .appendingPathComponent("\(request.kind.rawValue)-\(UUID().uuidString)")
-        do {
-            try FileManager.default.createDirectory(
-                at: workDirectory, withIntermediateDirectories: true)
-            let destination = workDirectory.appendingPathComponent(url.lastPathComponent)
-            try FileManager.default.copyItem(at: url, to: destination)
-            activeActionImport = ActiveActionImport(
-                petId: pet.id,
-                kind: request.kind,
-                rootFramesDirectory: rootFramesDirectory,
-                workDirectory: workDirectory.path,
-                origin: .captured)
-            beginPreparation(
-                petId: pet.id,
-                videoPath: destination.path,
-                outputDir: workDirectory.path)
-        } catch {
-            try? FileManager.default.removeItem(at: workDirectory)
-            pythonBridge.error = "动作视频导入失败：\(error.localizedDescription)"
-        }
-    }
-
-    func cancelActionImportSelection() {
-        pendingActionImportRequest = nil
     }
 
     /// Retry an interrupted or failed import without copying the source again.
@@ -782,12 +687,16 @@ class PetListViewModel: ObservableObject {
     private func failPreparation(petId: UUID, message: String) {
         if let actionImport = activeActionImport,
            actionImport.petId == petId {
+            let wasGeneratedDefaultMotion = actionImport.origin == .generated
             activeActionImport = nil
             pendingActionReview = nil
             preparingActionPetId = nil
             validatingActionPetId = nil
             try? FileManager.default.removeItem(
                 atPath: actionImport.workDirectory)
+            if wasGeneratedDefaultMotion {
+                clearGeneratedMotionInstallQueue()
+            }
         } else {
             updatePetStatus(id: petId, status: .failed)
         }
@@ -1504,7 +1413,6 @@ class PetListViewModel: ObservableObject {
                 }
                 let identity = (result["identity"] as? [String: Any])?["similarity"]
                     as? Double
-                self.capturePackPet = nil
                 self.pendingActionReview = PendingActionReview(
                     id: UUID(), petId: context.petId, kind: context.kind,
                     framesDirectory: framesDirectory, frameCount: frameCount,
@@ -1527,6 +1435,7 @@ class PetListViewModel: ObservableObject {
             return
         }
         try? FileManager.default.removeItem(atPath: context.workDirectory)
+        clearGeneratedMotionInstallQueue()
         pendingActionReview = nil
         activeActionImport = nil
         preparingActionPetId = nil
@@ -1557,7 +1466,6 @@ class PetListViewModel: ObservableObject {
             preparingActionPetId = nil
             validatingActionPetId = nil
             actionLibraryRevision += 1
-            motionWorkflowState = .idle
             pythonBridge.error = nil
 
             if let pet = pets.first(where: {
@@ -1568,27 +1476,36 @@ class PetListViewModel: ObservableObject {
                     pythonBridge.error = message
                 }
             }
+
+            if let nextVideo = generatedMotionInstallQueue.first {
+                generatedMotionInstallQueue.removeFirst()
+                try startGeneratedActionImport(nextVideo)
+            } else {
+                motionWorkflowState = .idle
+            }
         } catch {
             try? fm.removeItem(atPath: context.workDirectory)
             activeActionImport = nil
             pendingActionReview = nil
             preparingActionPetId = nil
             validatingActionPetId = nil
+            clearGeneratedMotionInstallQueue()
             motionWorkflowState = .failed("动作安装失败：\(error.localizedDescription)")
             pythonBridge.error = "动作安装失败：\(error.localizedDescription)"
         }
     }
 
-    private func installGeneratedVideo(
+    private func stageGeneratedMotionVideo(
         data: Data,
         for pet: Pet,
         kind: PetActionManifest.Action.Kind,
         jobID: String
-    ) throws {
+    ) throws -> StagedGeneratedMotionVideo {
         guard !data.isEmpty else {
             throw MiniMaxH3VideoGenerationError.invalidResponse
         }
-        guard let currentPet = pets.first(where: { $0.id == pet.id }) else {
+        guard let currentPet = pets.first(where: { $0.id == pet.id }),
+              let rootFramesDirectory = currentPet.framesDir else {
             throw MiniMaxH3VideoGenerationError.failed("宠物已被删除")
         }
         let petDirectory = PetStorage.shared.petDirectory(for: currentPet.id)
@@ -1599,32 +1516,37 @@ class PetListViewModel: ObservableObject {
             at: workDirectory, withIntermediateDirectories: true)
         let videoURL = workDirectory.appendingPathComponent("generated.mp4")
         try data.write(to: videoURL, options: .atomic)
+        return StagedGeneratedMotionVideo(
+            petID: currentPet.id,
+            kind: kind,
+            rootFramesDirectory: rootFramesDirectory,
+            workDirectory: workDirectory.path,
+            videoURL: videoURL)
+    }
 
+    private func startGeneratedActionImport(_ stagedVideo: StagedGeneratedMotionVideo) throws {
+        guard pets.contains(where: { $0.id == stagedVideo.petID }) else {
+            throw MiniMaxH3VideoGenerationError.failed("宠物已被删除")
+        }
         motionWorkflowState = .installing
         motionStudioPet = nil
-        if let rootFramesDirectory = currentPet.framesDir {
-            activeActionImport = ActiveActionImport(
-                petId: currentPet.id,
-                kind: kind,
-                rootFramesDirectory: rootFramesDirectory,
-                workDirectory: workDirectory.path,
-                origin: .generated)
-            beginPreparation(
-                petId: currentPet.id,
-                videoPath: videoURL.path,
-                outputDir: workDirectory.path)
-        } else {
-            generatedInitialPetId = currentPet.id
-            if let index = pets.firstIndex(where: { $0.id == currentPet.id }) {
-                pets[index].sourcePath = videoURL.path
-                pets[index].status = .detecting
-                PetStorage.shared.save(pets)
-            }
-            beginPreparation(
-                petId: currentPet.id,
-                videoPath: videoURL.path,
-                outputDir: petDirectory.path)
+        activeActionImport = ActiveActionImport(
+            petId: stagedVideo.petID,
+            kind: stagedVideo.kind,
+            rootFramesDirectory: stagedVideo.rootFramesDirectory,
+            workDirectory: stagedVideo.workDirectory,
+            origin: .generated)
+        beginPreparation(
+            petId: stagedVideo.petID,
+            videoPath: stagedVideo.videoURL.path,
+            outputDir: stagedVideo.workDirectory)
+    }
+
+    private func clearGeneratedMotionInstallQueue() {
+        for stagedVideo in generatedMotionInstallQueue {
+            try? FileManager.default.removeItem(atPath: stagedVideo.workDirectory)
         }
+        generatedMotionInstallQueue.removeAll()
     }
 
     private func referenceImages(for pet: Pet) -> [URL] {

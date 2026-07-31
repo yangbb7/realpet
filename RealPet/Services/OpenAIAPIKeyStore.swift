@@ -5,18 +5,11 @@ enum OpenAIAPIKeyStore {
     private static let service = "com.realpet.app.openai"
     private static let imageAccount = "gpt-image"
     private static let legacyMotionAccount = "motion-generation"
-    private static let promptMotionAccount = "motion-prompt"
     private static let agnesMotionAccount = "motion-agnes"
     private static let miniMaxMotionAccount = "motion-minimax"
 
     static func load() -> String? {
         load(account: imageAccount)
-    }
-
-    /// Prompt optimization stays on the user's OpenAI-compatible service.
-    /// Fall back to the older generic service key for upgraded installations.
-    static func loadPromptMotionService() -> String? {
-        load(account: promptMotionAccount) ?? load()
     }
 
     /// Agnes owns a distinct direct credential. The legacy motion account is
@@ -37,10 +30,6 @@ enum OpenAIAPIKeyStore {
 
     static func save(_ key: String) throws {
         try save(key, account: imageAccount)
-    }
-
-    static func savePromptMotionService(_ key: String) throws {
-        try save(key, account: promptMotionAccount)
     }
 
     static func saveAgnesMotionService(_ key: String) throws {

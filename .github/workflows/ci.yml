@@ -84,7 +84,6 @@ jobs:
             Services/PetReferenceImageData.swift \
             Services/AgnesImageReferenceGenerator.swift \
             Services/PetActionLibrary.swift \
-            Services/OpenAIPetPromptOptimizer.swift \
             Services/MiniMaxH3VideoGenerationClient.swift \
             Tests/MotionGenerationContractCheck.swift \
             -o /tmp/realpet-motion-generation-check

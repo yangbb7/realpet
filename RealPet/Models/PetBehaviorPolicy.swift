@@ -14,7 +14,7 @@ enum PetBehaviorPolicy {
                 petId: observation.petId, action: .react,
                 target: observation.spatial, emotion: "engaged", priority: 80,
                 duration: 0.7, intensity: 0.35 + personality.affection * 0.45,
-                interruptPolicy: .replace, animation: .lieDown)
+                interruptPolicy: .replace, animation: .play)
 
         case InteractionKind.petDoubleTapped:
             return PetIntent(

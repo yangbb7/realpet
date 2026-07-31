@@ -9,8 +9,6 @@ struct PetRowView: View {
     let workflowLabel: String?
     let workflowLocked: Bool
     let onRetry: () -> Void
-    let onImportAction: (PetActionManifest.Action.Kind) -> Void
-    let onOpenCapturePack: () -> Void
     let onOpenMotionStudio: () -> Void
     let onSetPersonality: (PetPersonality.Preset) -> Void
     let onEditPersonality: () -> Void
@@ -59,40 +57,12 @@ struct PetRowView: View {
                 .help("Retry")
             }
 
-            Menu {
-                ForEach(PetActionManifest.Action.Kind.importable, id: \.self) { kind in
-                    let currentAction = actionManifest?.actions.first {
-                        $0.kind == kind
-                    }
-                    Button(action: { onImportAction(kind) }) {
-                        Label(
-                            currentAction.map {
-                                "替换\(kind.displayName)素材（\($0.effectiveOrigin.displayName)）"
-                            } ?? "添加\(kind.displayName)素材",
-                            systemImage: kind.symbolName)
-                    }
-                }
-            } label: {
-                Image(systemName: "video.badge.plus")
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .disabled(isBusy || workflowLocked || pet.framesDir == nil)
-            .help("添加这只宠物的实拍互动素材")
-
             Button(action: onOpenMotionStudio) {
                 Image(systemName: "wand.and.stars")
             }
             .buttonStyle(.borderless)
             .disabled(isBusy || workflowLocked || pet.referenceImages.isEmpty && pet.framesDir == nil)
             .help("生成宠物动作")
-
-            Button(action: onOpenCapturePack) {
-                Image(systemName: "checklist")
-            }
-            .buttonStyle(.borderless)
-            .disabled(isBusy || workflowLocked || pet.framesDir == nil)
-            .help("管理实拍响应素材")
 
             Menu {
                 ForEach(PetPersonality.Preset.builtIn, id: \.self) { preset in
@@ -195,12 +165,10 @@ struct PetRowView: View {
     }
 
     private var captureCoverageText: String {
-        let total = PetActionManifest.Action.Kind.gazeCapture.count
-            + PetActionManifest.Action.Kind.requiredResponseCapture.count
+        let total = PetActionManifest.Action.Kind.defaultMouseInteraction.count
         let installed = Set(actionManifest?.actions.map(\.kind) ?? [])
-        let required = Set(PetActionManifest.Action.Kind.gazeCapture
-            + PetActionManifest.Action.Kind.requiredResponseCapture)
-        return "互动动作 \(installed.intersection(required).count)/\(total)"
+        let required = Set(PetActionManifest.Action.Kind.defaultMouseInteraction)
+        return "鼠标动作 \(installed.intersection(required).count)/\(total)"
     }
 
     private var behaviorHelp: String {

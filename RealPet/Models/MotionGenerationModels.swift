@@ -1,22 +1,67 @@
 import Foundation
 
-struct PetMotionPromptOptimization: Codable, Equatable, Sendable {
-    let optimizedPrompt: String
-    let petDescription: String
-    let warnings: [String]
+struct DefaultMotionActionPlan: Equatable, Sendable {
+    let kind: PetActionManifest.Action.Kind
+    let prompt: String
+}
 
-    enum CodingKeys: String, CodingKey {
-        case optimizedPrompt = "optimized_prompt"
-        case petDescription = "pet_description"
-        case warnings
+/// These prompt packages follow MiniMax H3's image-to-video formula: the
+/// first-frame subject, one ordered motion, fixed camera, and visual direction.
+/// They are read-only because their output is installed into runtime-owned slots.
+enum DefaultMouseInteractionScenario: String, CaseIterable, Identifiable, Sendable {
+    case pointerTracking
+    case clickBounce
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .pointerTracking: return "鼠标注视跟随"
+        case .clickBounce: return "点击原地蹦跳"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .pointerTracking: return "eye"
+        case .clickBounce: return "hand.tap"
+        }
+    }
+
+    var actionPlans: [DefaultMotionActionPlan] {
+        switch self {
+        case .pointerTracking:
+            return [
+                .init(kind: .gazeLeft, prompt: Self.gazePrompt(direction: "画面左侧", motion: "向左轻转")),
+                .init(kind: .gazeRight, prompt: Self.gazePrompt(direction: "画面右侧", motion: "向右轻转")),
+                .init(kind: .gazeUp, prompt: Self.gazePrompt(direction: "画面上方", motion: "轻轻抬起")),
+                .init(kind: .gazeDown, prompt: Self.gazePrompt(direction: "画面下方", motion: "轻轻低下")),
+            ]
+        case .clickBounce:
+            return [
+                .init(kind: .play, prompt: """
+                首帧中的同一只宠物位于纯白无缝背景的平视全身中景中。先以自然站姿稳定停留，随后四肢协调地在原地轻快蹦跳两次，每次落点保持原位，耳朵、尾巴和毛发随身体产生自然惯性摆动，最后平稳落回初始站姿并短暂停留。镜头固定稳定，无推拉摇移、缩放或剪辑。真实摄影质感，自然动物解剖，柔和均匀的棚拍光线，轮廓干净，画面安静自然。
+                """.trimmingCharacters(in: .whitespacesAndNewlines)),
+            ]
+        }
+    }
+
+    var debugPrompt: String {
+        actionPlans.map { plan in
+            "[\(plan.kind.displayName)]\n\(plan.prompt)"
+        }.joined(separator: "\n\n")
+    }
+
+    private static func gazePrompt(direction: String, motion: String) -> String {
+        """
+        首帧中的同一只宠物位于纯白无缝背景的平视全身中景中。先以自然站姿稳定看向前方，随后仅头部和双眼\(motion)并注视\(direction)，躯干和四肢保持稳定，最后保持该方向的自然注视姿态。镜头固定稳定，无推拉摇移、缩放或剪辑。真实摄影质感，自然动物解剖和细微毛发运动，柔和均匀的棚拍光线，轮廓干净，画面安静自然。
+        """.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
 enum MotionWorkflowState: Equatable {
     case idle
     case preparingReference
-    case optimizing
-    case optimized
     case submittingVideo
     case waitingForVideo(progress: Double?)
     case downloadingVideo
@@ -25,10 +70,10 @@ enum MotionWorkflowState: Equatable {
 
     var isBusy: Bool {
         switch self {
-        case .preparingReference, .optimizing, .submittingVideo, .waitingForVideo,
+        case .preparingReference, .submittingVideo, .waitingForVideo,
                 .downloadingVideo, .installing:
             return true
-        case .idle, .optimized, .failed:
+        case .idle, .failed:
             return false
         }
     }
@@ -37,8 +82,6 @@ enum MotionWorkflowState: Equatable {
         switch self {
         case .idle: return nil
         case .preparingReference: return "正在使用 Agnes Image 2.0 统一宠物参考图…"
-        case .optimizing: return "正在识别宠物并优化提示词…"
-        case .optimized: return "提示词已优化"
         case .submittingVideo: return "正在提交 MiniMax H3 视频任务…"
         case .waitingForVideo(let progress):
             guard let progress else { return "MiniMax H3 正在生成动作…" }
@@ -52,8 +95,6 @@ enum MotionWorkflowState: Equatable {
 
 struct MotionServiceConfiguration: Codable, Equatable, Sendable {
     static let defaultValue = MotionServiceConfiguration(
-        baseURLString: OpenAIImageAPIConfiguration.defaultBaseURLString,
-        promptModel: "gpt-5.6-sol",
         agnesBaseURLString: "https://apihub.agnes-ai.com/v1",
         imageModel: "agnes-image-2.0-flash",
         miniMaxBaseURLString: MiniMaxVideoAPIConfiguration.defaultBaseURLString,
@@ -61,10 +102,8 @@ struct MotionServiceConfiguration: Codable, Equatable, Sendable {
         seconds: 4,
         size: "1152x768")
 
-    var baseURLString: String
-    var promptModel: String
-    /// Optional so configurations saved before the Agnes media stage remain
-    /// decodable. New configurations always use the official Agnes endpoint.
+    /// Optional so configurations saved before the direct-provider workflow
+    /// remain decodable. New configurations always use the official endpoint.
     var agnesBaseURLString: String? = nil
     /// Optional so configurations saved before the Agnes reference stage remain
     /// decodable. Agnes generation requires this model.
@@ -77,8 +116,6 @@ struct MotionServiceConfiguration: Codable, Equatable, Sendable {
     var size: String
 
     init(
-        baseURLString: String,
-        promptModel: String,
         agnesBaseURLString: String? = nil,
         imageModel: String? = nil,
         miniMaxBaseURLString: String? = nil,
@@ -86,8 +123,6 @@ struct MotionServiceConfiguration: Codable, Equatable, Sendable {
         seconds: Int,
         size: String
     ) {
-        self.baseURLString = baseURLString
-        self.promptModel = promptModel
         self.agnesBaseURLString = agnesBaseURLString
         self.imageModel = imageModel
         self.miniMaxBaseURLString = miniMaxBaseURLString
@@ -104,10 +139,6 @@ struct MotionServiceConfiguration: Codable, Equatable, Sendable {
         miniMaxBaseURLString ?? MiniMaxVideoAPIConfiguration.defaultBaseURLString
     }
 
-    func validatedPromptAPIConfiguration() throws -> OpenAIImageAPIConfiguration {
-        try OpenAIImageAPIConfiguration(baseURLString: baseURLString)
-    }
-
     func validatedAgnesAPIConfiguration() throws -> OpenAIImageAPIConfiguration {
         try OpenAIImageAPIConfiguration(baseURLString: resolvedAgnesBaseURLString)
     }
@@ -117,11 +148,9 @@ struct MotionServiceConfiguration: Codable, Equatable, Sendable {
     }
 
     func validated() throws -> MotionServiceConfiguration {
-        _ = try validatedPromptAPIConfiguration()
         let agnesConfiguration = try validatedAgnesAPIConfiguration()
         let miniMaxConfiguration = try validatedMiniMaxAPIConfiguration()
-        guard !promptModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              imageModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+        guard imageModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
               !videoModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MotionServiceConfigurationError.missingModel
         }
@@ -160,7 +189,7 @@ enum MotionServiceConfigurationError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .missingModel: return "请填写提示词、参考图和视频模型名称"
+        case .missingModel: return "请填写参考图和视频模型名称"
         case .missingImageModel: return "Agnes 图像链路需要填写参考图模型"
         case .invalidDuration: return "MiniMax H3 视频时长仅支持 4 到 15 秒"
         case .invalidAgnesAPI: return "参考图必须使用 Agnes 官方 API"

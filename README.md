@@ -2,11 +2,13 @@
 
 Turn photos of your real pet into a realistic desktop companion on macOS.
 
-RealPet identifies the owner's pet across several photos, turns a natural-language
-motion request into an image-grounded video prompt, and installs the generated
-motion only after the same local quality and identity checks used for imported
-footage. The source-frame renderer replays alpha-matted frames in a borderless,
-always-on-top native window.
+RealPet turns an owner's pet video into a source-faithful desktop companion. It
+can also create two fixed mouse-interaction scenarios from the pet's identity:
+pointer tracking and click bounce. Their MiniMax H3 prompts are built in,
+visible for debugging, and not editable. Generated motion is installed only
+after the same local quality and identity checks used for imported footage. The
+source-frame renderer replays alpha-matted frames in a borderless, always-on-top
+native window.
 
 > **v0.2.0 — Double-click to use**
 > - All model weights and ffmpeg are bundled inside the .app. **No first-launch downloads.**
@@ -15,18 +17,16 @@ always-on-top native window.
 
 ## Features
 
-- **Photos → Generated Pet Motion**: Import 1–6 owner photos; Agnes Image 2.0
-  first creates a unified identity anchor, `gpt-5.6-sol` on the configured
-  compatible relay creates a constrained Chinese video prompt, and MiniMax H3
-  generates the motion
-- **Prompt Review Before Generation**: The optimized prompt remains editable;
-  generation is an explicit second action rather than an automatic upload
+- **Video → Source-Faithful Pet**: Import original pet footage; clip selection,
+  pet classification, tracking, alpha matting, landmark extraction, and display
+  run automatically
+- **Default Mouse Actions**: Built-in MiniMax H3 prompts generate four fixed
+  head-and-eye tracking directions for pointer tracking and one stationary
+  two-hop bounce for primary-click feedback. Prompts are read-only and visible
+  in the app for debugging
 - **Generated Action Installation**: Video jobs are created, polled, downloaded,
   segmented, identity-validated, previewed, and only then added to the pet's
   action library as `AI 生成`
-- **Video → Source-Faithful Pet**: Owners may still import original footage;
-  clip selection, pet classification, tracking, alpha matting, landmark
-  extraction, and display run automatically
 - **AI-Powered Extraction**: SAM2 tracking + BiRefNet matting for high-quality alpha extraction
 - **Smart Clip Selection**: Long videos are automatically analyzed for the best pet segments
 - **Transparent Window**: Borderless, always-on-top, click-through window with real transparency
@@ -40,9 +40,9 @@ always-on-top native window.
 - **Source-Frame Runtime**: A bounded native frame cache renders processed
   RGB/alpha pairs directly; no template, breed model, or cloud generation is
   needed to display a pet
-- **Action Workbench**: Generate idle, gaze, lie-down, paw, and eat actions from
-  the pet's photo identity. Original owner footage can still replace any action
-  when recorded fidelity is preferred
+- **Fixed Action Surface**: The app does not accept user-written motion prompts
+  or per-action video uploads; the two default scenarios prevent identity and
+  motion contracts from drifting
 - **Unified Multimodal Input**: Pointer, camera, local VLM, and speech sources
   share one expiring observation pipeline with bounded evidence and backpressure
 - **Local Visual Interaction**: Optional Apple Vision processing detects when
@@ -129,29 +129,28 @@ RealPet runs real-time AI models (SAM2 tracking + BiRefNet matting + Faster R-CN
 2. Double-click the DMG and drag `RealPet.app` to `/Applications`.
 3. Launch from `/Applications` (right-click → Open the first time — the app is ad-hoc signed). First run sets up Python (~2 minutes, one-time).
 
-Click **导入宠物照片** and select 1–6 clear photos of the same pet. In the
-**动作工作台**, write what the pet should do in natural language, such as
-“让它慢慢转一圈”. Open the gear button once to configure three independent
-services. `gpt-5.6-sol` retains its existing OpenAI-compatible relay Base URL
-and relay key for Prompt optimization. Agnes uses the direct official endpoint
-`https://apihub.agnes-ai.com/v1` and `agnes-image-2.0-flash` for the canonical
-reference image. MiniMax uses `https://api.minimaxi.com` and `MiniMax-H3` for
-the generated video. The three keys are stored separately in the macOS Keychain.
+Click **导入宠物视频** and select clear footage of the same pet. Once the base
+frames are ready, open **默认鼠标动作** from that pet's row. Choose either
+**鼠标跟随** or **点击蹦跳**. The displayed MiniMax H3 prompt is for debugging
+only: it cannot be edited and no custom action can be added.
 
-Click **优化 Prompt**. The selected owner photos are sent only to the configured
-`gpt-5.6-sol` relay, which identifies the pet and produces an editable prompt
-constrained to a pure white background, fixed camera, photographic realism, and
-the same pet. After reviewing or editing it, click **生成动作**. Only then does
-RealPet call Agnes Image 2.0 to make one public identity anchor, followed by
-MiniMax H3 with that anchor as its first frame and the approved prompt. RealPet
-submits `POST /v2/video_generation`, polls the returned `task_id`, downloads
-the result URL, runs the local quality and identity checks, and asks for
-installation.
+Each built-in prompt follows MiniMax's image-to-video structure: identify the
+first-frame subject, describe an ordered motion, keep the camera fixed, then
+state the photographic visual direction. See the [official MiniMax video prompt
+guide](https://platform.minimaxi.com/docs/guides/video-prompt).
 
-The initial generated action must be **待机**. Once it has been installed, use
-the same workbench to generate mouse gaze, lying down, pawing, and eating
-actions. **导入实拍视频** remains available for a full source-frame pet or to
-replace any generated action with owner-recorded footage.
+Open the gear button once to configure two independent official services. Agnes
+uses `https://apihub.agnes-ai.com/v1` and `agnes-image-2.0-flash` to make the
+identity anchor. MiniMax uses `https://api.minimaxi.com` and `MiniMax-H3` for
+the video. The two keys are stored separately in the macOS Keychain.
+
+For a selected scenario, RealPet first calls Agnes Image 2.0 to make one public
+identity anchor, then submits its built-in H3 prompt and that anchor as the
+first frame. Pointer tracking creates four directional clips (left, right, up,
+and down); click bounce creates one clip. RealPet submits
+`POST /v2/video_generation`, polls the returned `task_id`, downloads the result,
+runs local quality and identity checks, and asks for installation before each
+clip becomes available to the desktop runtime.
 
 For developers who prefer to build from source, see `docs/RELEASE.md`.
 
@@ -244,12 +243,13 @@ When enabled, the app discovers installed models with the `vision` capability;
 camera evidence remains in bounded memory and is never written to disk by this
 workflow.
 
-The motion service is configured in the in-app action workbench, not through an
-environment variable. Its three Base URLs must be HTTPS unless they are loopback
-addresses. `gpt-5.6-sol` remains on its configured compatible relay for Prompt
-optimization. Agnes is direct-only for the canonical reference
-(`agnes-image-2.0-flash`); MiniMax is direct-only for video (`MiniMax-H3`, 2K,
-adaptive ratio), each using a separate credential.
+The default mouse-action services are configured in the in-app **默认鼠标动作**
+sheet, not through an environment variable. Their two Base URLs must be HTTPS
+unless they are loopback addresses. Agnes is direct-only for the canonical
+reference (`agnes-image-2.0-flash`); MiniMax is direct-only for video
+(`MiniMax-H3`, 2K, adaptive ratio), each using a separate credential. There is
+no Prompt-relay configuration because the app uses only its read-only built-in
+scenario prompts.
 
 ## Building the App
 

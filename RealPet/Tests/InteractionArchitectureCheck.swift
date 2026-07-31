@@ -10,6 +10,7 @@ struct InteractionArchitectureCheck {
         testPersonalityChangesBehavior()
         try testCustomPersonalityContract()
         testCustomPersonalityHotUpdate()
+        testMouseClickUsesDefaultBounceAction()
         testPettingUsesUnifiedPolicyAndMemory()
         testFileDropSemanticsMapToDedicatedSourceActions()
         testMultimodalSemanticsUseExistingBehaviorPolicy()
@@ -98,6 +99,20 @@ struct InteractionArchitectureCheck {
         precondition(decoded == event)
         precondition(decoded.isFresh(at: now + 0.5))
         precondition(!decoded.isFresh(at: now + 2))
+    }
+
+    private static func testMouseClickUsesDefaultBounceAction() {
+        let now = Date().timeIntervalSince1970
+        let intent = PetBehaviorPolicy.intent(
+            for: InteractionObservation(
+                petId: UUID(), source: InteractionSource.pointer,
+                kind: InteractionKind.petTapped,
+                occurredAt: now, expiresAt: now + 1,
+                spatial: SpatialContext(space: .petLocalNormalized, x: 0.5, y: 0.5)),
+            personality: .balanced,
+            now: now)
+        precondition(intent?.action == .react)
+        precondition(intent?.animation == .play)
     }
 
     private static func testPersonalityChangesBehavior() {

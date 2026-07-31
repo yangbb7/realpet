@@ -22,6 +22,7 @@ struct SourceFrameSequence: Equatable {
     let root: URL
     let frames: [Frame]
     let fps: Int
+    let loop: Bool
 
     static func load(at directory: URL, fps: Int) throws -> SourceFrameSequence {
         let root = directory.standardizedFileURL.resolvingSymlinksInPath()
@@ -37,7 +38,8 @@ struct SourceFrameSequence: Equatable {
             return SourceFrameSequence(
                 root: root,
                 frames: pngs.map { Frame(rgbURL: $0, alphaURL: nil) },
-                fps: max(1, min(60, fps)))
+                fps: max(1, min(60, fps)),
+                loop: true)
         }
 
         let jpegs = entries.filter {
@@ -56,7 +58,11 @@ struct SourceFrameSequence: Equatable {
         }
         guard !frames.isEmpty else { throw FrameSequenceRuntimeError.noFrames(root) }
         return SourceFrameSequence(
-            root: root, frames: frames, fps: max(1, min(60, fps)))
+            root: root, frames: frames, fps: max(1, min(60, fps)), loop: true)
+    }
+
+    func with(loop: Bool) -> SourceFrameSequence {
+        SourceFrameSequence(root: root, frames: frames, fps: fps, loop: loop)
     }
 }
 
@@ -101,13 +107,12 @@ enum SourceFrameActionResolver {
         framesDirectory: URL,
         fallbackFPS: Int
     ) -> SourceFrameSequence? {
-        guard let action = manifest.actions.first(where: {
-            $0.kind == kind && $0.effectiveOrigin == .captured
-        }),
+        guard let action = manifest.actions.first(where: { $0.kind == kind }),
               let actionRoot = safeActionDirectory(
                 action.framesDirectory, beneath: framesDirectory) else { return nil }
         let fps = action.fps > 0 ? action.fps : fallbackFPS
         return try? SourceFrameSequence.load(at: actionRoot, fps: fps)
+            .with(loop: action.loop)
     }
 
     static func capabilities(
@@ -468,8 +473,13 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
             advanceFrame()
             return
         }
-        view.image = cache.image(for: sequence.frames[frameIndex % sequence.frames.count])
-        frameIndex = (frameIndex + 1) % sequence.frames.count
+        let displayIndex = sequence.loop
+            ? frameIndex % sequence.frames.count
+            : min(frameIndex, sequence.frames.count - 1)
+        view.image = cache.image(for: sequence.frames[displayIndex])
+        frameIndex = sequence.loop
+            ? (frameIndex + 1) % sequence.frames.count
+            : min(frameIndex + 1, sequence.frames.count - 1)
         view.needsDisplay = true
     }
 

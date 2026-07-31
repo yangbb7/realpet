@@ -7,20 +7,13 @@ struct MotionStudioView: View {
     let pet: Pet
     let onDismiss: () -> Void
 
-    @State private var selectedKind: PetActionManifest.Action.Kind = .idle
-    @State private var naturalPrompt = ""
-    @State private var optimizedPrompt = ""
-    @State private var petDescription = ""
-    @State private var warnings: [String] = []
+    @State private var selectedScenario: DefaultMouseInteractionScenario = .pointerTracking
     @State private var showServiceConfiguration = false
-    @State private var baseURL = ""
-    @State private var promptModel = ""
     @State private var agnesBaseURL = ""
     @State private var imageModel = ""
     @State private var miniMaxBaseURL = ""
     @State private var videoModel = ""
     @State private var seconds = 4
-    @State private var promptAPIKey = ""
     @State private var agnesAPIKey = ""
     @State private var miniMaxAPIKey = ""
     @State private var configurationMessage: String?
@@ -29,33 +22,18 @@ struct MotionStudioView: View {
         vm.motionReferenceImages(for: pet)
     }
 
-    private var actionKinds: [PetActionManifest.Action.Kind] {
-        if pet.framesDir == nil { return [.idle] }
-        return [.idle] + PetActionManifest.Action.Kind.importable
-    }
-
     private var isBusy: Bool { vm.motionWorkflowState.isBusy }
-
-    private var hasAllCredentials: Bool {
-        vm.hasPromptMotionServiceCredential
-            && vm.hasAgnesMotionServiceCredential
-            && vm.hasMiniMaxMotionServiceCredential
-    }
 
     private var hasGenerationCredentials: Bool {
         vm.hasAgnesMotionServiceCredential && vm.hasMiniMaxMotionServiceCredential
     }
 
     private var credentialStatus: String {
-        switch (
-            vm.hasPromptMotionServiceCredential,
-            vm.hasAgnesMotionServiceCredential,
-            vm.hasMiniMaxMotionServiceCredential
-        ) {
-        case (true, true, true): return "三组 Key 已配置"
-        case (false, _, _): return "待配置 Prompt Key"
-        case (_, false, _): return "待配置 Agnes Key"
-        case (_, _, false): return "待配置 MiniMax Key"
+        switch (vm.hasAgnesMotionServiceCredential, vm.hasMiniMaxMotionServiceCredential) {
+        case (true, true): return "两组 Key 已配置"
+        case (false, true): return "待配置 Agnes Key"
+        case (true, false): return "待配置 MiniMax Key"
+        case (false, false): return "待配置服务 Key"
         }
     }
 
@@ -63,7 +41,7 @@ struct MotionStudioView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("动作工作台")
+                    Text("默认鼠标动作")
                         .font(.title3.weight(.semibold))
                     Text(pet.name)
                         .font(.subheadline)
@@ -88,86 +66,44 @@ struct MotionStudioView: View {
             MotionReferenceStrip(urls: references)
 
             HStack(spacing: 10) {
-                Label("动作", systemImage: selectedKind.symbolName)
+                Label("默认场景", systemImage: selectedScenario.symbolName)
                     .font(.subheadline.weight(.medium))
-                Picker("动作", selection: $selectedKind) {
-                    ForEach(actionKinds, id: \.self) { kind in
-                        Text(kind.displayName).tag(kind)
+                Picker("默认场景", selection: $selectedScenario) {
+                    ForEach(DefaultMouseInteractionScenario.allCases) { scenario in
+                        Text(scenario.displayName).tag(scenario)
                     }
                 }
                 .labelsHidden()
-                .frame(width: 165)
+                .frame(width: 180)
                 Spacer()
                 Text(credentialStatus)
                     .font(.caption)
-                    .foregroundStyle(hasAllCredentials ? .green : .orange)
+                    .foregroundStyle(hasGenerationCredentials ? .green : .orange)
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("自然语言描述")
+                Text("预置 MiniMax H3 Prompt")
                     .font(.subheadline.weight(.medium))
-                TextEditor(text: $naturalPrompt)
+                TextEditor(text: .constant(selectedScenario.debugPrompt))
                     .font(.body)
                     .scrollContentBackground(.hidden)
                     .padding(7)
-                    .frame(height: 78)
+                    .frame(height: selectedScenario == .pointerTracking ? 188 : 112)
                     .background(Color.black.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
-                    .disabled(isBusy)
+                    .disabled(true)
             }
 
             HStack {
-                Button {
-                    Task {
-                        guard let result = await vm.optimizeMotionPrompt(
-                            for: pet, kind: selectedKind,
-                            naturalLanguage: naturalPrompt) else { return }
-                        optimizedPrompt = result.optimizedPrompt
-                        petDescription = result.petDescription
-                        warnings = result.warnings
-                    }
-                } label: {
-                    Label("优化 Prompt", systemImage: "wand.and.stars")
-                }
-                .disabled(isBusy || naturalPrompt.trimmingCharacters(
-                    in: .whitespacesAndNewlines).isEmpty)
-
                 Spacer()
 
                 Button {
-                    vm.generateMotion(
-                        for: pet, kind: selectedKind,
-                        optimizedPrompt: optimizedPrompt)
+                    vm.generateDefaultMotionScenario(
+                        for: pet, scenario: selectedScenario)
                 } label: {
-                    Label("生成动作", systemImage: "video.badge.plus")
+                    Label("生成默认动作", systemImage: "video.badge.plus")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isBusy || optimizedPrompt.trimmingCharacters(
-                    in: .whitespacesAndNewlines).isEmpty || !hasGenerationCredentials)
-            }
-
-            if !optimizedPrompt.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("适配 MiniMax H3 的 Prompt")
-                        .font(.subheadline.weight(.medium))
-                    TextEditor(text: $optimizedPrompt)
-                        .font(.body)
-                        .scrollContentBackground(.hidden)
-                        .padding(7)
-                        .frame(height: 90)
-                        .background(Color.black.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
-                        .disabled(isBusy)
-                    if !petDescription.isEmpty {
-                        Text(petDescription)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
-                    ForEach(warnings, id: \.self) { warning in
-                        Label(warning, systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    }
-                }
+                .disabled(isBusy || !hasGenerationCredentials)
             }
 
             if let status = vm.motionWorkflowState.displayName {
@@ -205,18 +141,6 @@ struct MotionStudioView: View {
 
     private var serviceConfiguration: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Prompt 中转站")
-                .font(.subheadline.weight(.semibold))
-            TextField("Prompt API Base URL", text: $baseURL)
-                .textFieldStyle(.roundedBorder)
-            TextField("提示词模型", text: $promptModel)
-                .textFieldStyle(.roundedBorder)
-            SecureField(
-                vm.hasPromptMotionServiceCredential
-                    ? "新的 Prompt API Key（留空则不修改）" : "Prompt API Key",
-                text: $promptAPIKey)
-                .textFieldStyle(.roundedBorder)
-            Divider()
             Text("Agnes 官方直连")
                 .font(.subheadline.weight(.semibold))
             TextField("Agnes API Base URL", text: $agnesBaseURL)
@@ -256,18 +180,13 @@ struct MotionStudioView: View {
                 Button("保存") {
                     do {
                         try vm.saveMotionServiceConfiguration(
-                            baseURLString: baseURL,
-                            promptModel: promptModel,
                             agnesBaseURLString: agnesBaseURL,
                             imageModel: imageModel,
                             miniMaxBaseURLString: miniMaxBaseURL,
                             videoModel: videoModel,
                             seconds: seconds,
-                            size: "1152x768",
-                            promptAPIKey: promptAPIKey,
                             agnesAPIKey: agnesAPIKey,
                             miniMaxAPIKey: miniMaxAPIKey)
-                        promptAPIKey = ""
                         agnesAPIKey = ""
                         miniMaxAPIKey = ""
                         configurationMessage = "已保存"
@@ -282,18 +201,11 @@ struct MotionStudioView: View {
 
     private func loadConfiguration() {
         let configuration = vm.motionServiceConfiguration
-        baseURL = configuration.baseURLString
-        promptModel = configuration.promptModel
         agnesBaseURL = configuration.resolvedAgnesBaseURLString
         imageModel = configuration.imageModel ?? ""
         miniMaxBaseURL = configuration.resolvedMiniMaxBaseURLString
         videoModel = configuration.videoModel
         seconds = configuration.seconds
-        if naturalPrompt.isEmpty {
-            naturalPrompt = pet.framesDir == nil
-                ? "让它在原地自然待机，轻微眨眼和呼吸。"
-                : "让它\(selectedKind.displayName)，动作自然且完整。"
-        }
     }
 }
 

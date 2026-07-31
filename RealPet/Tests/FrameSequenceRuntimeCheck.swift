@@ -39,6 +39,9 @@ struct FrameSequenceRuntimeCheck {
         let actionRoot = root.appendingPathComponent("actions/lie_down", isDirectory: true)
         try FileManager.default.createDirectory(at: actionRoot, withIntermediateDirectories: true)
         try Data("frame".utf8).write(to: actionRoot.appendingPathComponent("frame_0000.png"))
+        let playRoot = root.appendingPathComponent("actions/play", isDirectory: true)
+        try FileManager.default.createDirectory(at: playRoot, withIntermediateDirectories: true)
+        try Data("frame".utf8).write(to: playRoot.appendingPathComponent("frame_0000.png"))
         let gazeKinds: [PetActionManifest.Action.Kind] = [
             .gazeLeft, .gazeRight, .gazeUp, .gazeDown,
         ]
@@ -62,7 +65,7 @@ struct FrameSequenceRuntimeCheck {
             ] + gazeKinds.map {
                 .init(id: $0.rawValue, kind: $0,
                       framesDirectory: "actions/\($0.rawValue)", fps: 8,
-                      loop: true, translatesWindow: false)
+                      loop: false, translatesWindow: false, origin: .generated)
             })
         try manifest.save(framesDirectory: root.path)
         let action = SourceFrameActionResolver.sequence(
@@ -76,6 +79,7 @@ struct FrameSequenceRuntimeCheck {
         let gaze = SourceFrameActionResolver.sequence(
             for: .gazeLeft, framesDirectory: root, fallbackFPS: 10)
         precondition(gaze?.frames.count == 1)
+        precondition(gaze?.loop == false)
         precondition(PetActionManifest.Action.Kind.gazeAction(
             horizontalOffset: -0.8, verticalOffset: 0) == .gazeLeft)
         precondition(PetActionManifest.Action.Kind.gazeAction(
@@ -98,7 +102,7 @@ struct FrameSequenceRuntimeCheck {
             for: .eat, framesDirectory: root, fallbackFPS: 10) == nil)
 
         let generated = PetActionManifest.Action(
-            id: "generated_paw", kind: .paw, framesDirectory: "actions/paw",
+            id: "generated_play", kind: .play, framesDirectory: "actions/play",
             fps: 10, loop: false, translatesWindow: false, origin: .generated)
         precondition(generated.effectiveOrigin == .generated)
         let generatedOnly = PetActionManifest(
@@ -109,8 +113,10 @@ struct FrameSequenceRuntimeCheck {
                 generated,
             ])
         try generatedOnly.save(framesDirectory: root.path)
-        precondition(SourceFrameActionResolver.sequence(
-            for: .paw, framesDirectory: root, fallbackFPS: 10) == nil)
+        let generatedSequence = SourceFrameActionResolver.sequence(
+            for: .play, framesDirectory: root, fallbackFPS: 10)
+        precondition(generatedSequence?.frames.count == 1)
+        precondition(generatedSequence?.loop == false)
         let legacy = PetActionManifest.Action(
             id: "legacy_paw", kind: .paw, framesDirectory: "actions/paw",
             fps: 10, loop: false, translatesWindow: false)

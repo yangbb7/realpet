@@ -29,9 +29,9 @@ private final class MotionMockURLProtocol: URLProtocol {
 struct MotionGenerationContractCheck {
     static func main() async throws {
         try testConfigurationAndGeneratedActionCapability()
+        try testDefaultMouseInteractionPrompts()
         try testAgnesReferenceAndMiniMaxRequests()
         try await testAgnesReferenceAndMiniMaxPipelineCreatePollAndDownload()
-        try await testPromptOptimizationRequestAndResponse()
         print("Motion generation contract checks passed")
     }
 
@@ -48,9 +48,6 @@ struct MotionGenerationContractCheck {
                      == "https://relay.example.com/openai/v1/videos/video_1/content")
 
         let motionConfiguration = MotionServiceConfiguration.defaultValue
-        precondition(motionConfiguration.baseURLString
-                     == OpenAIImageAPIConfiguration.defaultBaseURLString)
-        precondition(motionConfiguration.promptModel == "gpt-5.6-sol")
         precondition(motionConfiguration.resolvedAgnesBaseURLString
                      == "https://apihub.agnes-ai.com/v1")
         precondition(motionConfiguration.imageModel == "agnes-image-2.0-flash")
@@ -59,20 +56,15 @@ struct MotionGenerationContractCheck {
         precondition(motionConfiguration.videoModel == "MiniMax-H3")
         precondition(motionConfiguration.seconds == 4)
         let validatedMotionConfiguration = try motionConfiguration.validated()
-        let promptConfiguration = try validatedMotionConfiguration
-            .validatedPromptAPIConfiguration()
         let agnesConfiguration = try validatedMotionConfiguration
             .validatedAgnesAPIConfiguration()
         let miniMaxConfiguration = try validatedMotionConfiguration
             .validatedMiniMaxAPIConfiguration()
         precondition(validatedMotionConfiguration.size == "1152x768")
-        precondition(!promptConfiguration.isAgnesAPI)
         precondition(agnesConfiguration.isAgnesAPI)
         precondition(miniMaxConfiguration.isOfficialAPI)
 
         let savedAgnesVideoConfiguration = MotionServiceConfiguration(
-            baseURLString: OpenAIImageAPIConfiguration.defaultBaseURLString,
-            promptModel: "gpt-5.6-sol",
             agnesBaseURLString: "https://apihub.agnes-ai.com/v1",
             imageModel: "agnes-image-2.0-flash",
             videoModel: "agnes-video-v2.0",
@@ -98,6 +90,46 @@ struct MotionGenerationContractCheck {
                      == .generated)
         precondition(manifest.capabilities.reaction)
         precondition(manifest.supports(animation: .paw))
+
+        var gazeManifest = manifest
+        for kind in PetActionManifest.Action.Kind.gazeCapture {
+            let gazeSource = root.appendingPathComponent("source-\(kind.rawValue)")
+            try fm.createDirectory(at: gazeSource, withIntermediateDirectories: true)
+            try Data("frame".utf8).write(
+                to: gazeSource.appendingPathComponent("frame_0000.png"))
+            gazeManifest = try PetActionLibrary.install(
+                kind: kind,
+                processedFramesDirectory: gazeSource,
+                rootFramesDirectory: root,
+                fps: 10,
+                origin: .generated)
+            let generatedGaze = gazeManifest.actions.first(where: { $0.kind == kind })
+            precondition(generatedGaze?.effectiveOrigin == .generated)
+            precondition(generatedGaze?.loop == false)
+        }
+        precondition(gazeManifest.capabilities.orientation)
+    }
+
+    private static func testDefaultMouseInteractionPrompts() throws {
+        let tracking = DefaultMouseInteractionScenario.pointerTracking
+        precondition(tracking.actionPlans.map(\.kind) == [
+            .gazeLeft, .gazeRight, .gazeUp, .gazeDown,
+        ])
+        precondition(tracking.actionPlans.allSatisfy { plan in
+            plan.prompt.contains("首帧中的同一只宠物")
+                && plan.prompt.contains("先")
+                && plan.prompt.contains("随后")
+                && plan.prompt.contains("最后")
+                && plan.prompt.contains("镜头固定稳定")
+                && plan.prompt.contains("真实摄影质感")
+        })
+        let bounce = DefaultMouseInteractionScenario.clickBounce
+        precondition(bounce.actionPlans.map(\.kind) == [.play])
+        precondition(bounce.debugPrompt.contains("原地轻快蹦跳两次"))
+        precondition(bounce.debugPrompt.contains("首帧中的同一只宠物"))
+        precondition(PetActionManifest.Action.Kind.defaultMouseInteraction == [
+            .gazeLeft, .gazeRight, .gazeUp, .gazeDown, .play,
+        ])
     }
 
     private static func testAgnesReferenceAndMiniMaxRequests() throws {
@@ -123,13 +155,6 @@ struct MotionGenerationContractCheck {
         precondition((extraBody?["image"] as? [String])?.count == 2)
         precondition(extraBody?["response_format"] as? String == "url")
 
-        let chatRequest = try OpenAIPetPromptOptimizer.makeAgnesRequest(
-            naturalLanguage: "让它转一圈",
-            remoteReferenceImageURLs: [URL(string: "https://cdn.example.com/pet.png")!],
-            apiKey: "agnes-key",
-            configuration: configuration,
-            model: "agnes-2.0-flash")
-        precondition(chatRequest.url == configuration.chatCompletionsURL)
         let miniMaxConfiguration = try MiniMaxVideoAPIConfiguration(
             baseURLString: "https://api.minimaxi.com")
         precondition(miniMaxConfiguration.createURL.absoluteString
@@ -158,69 +183,11 @@ struct MotionGenerationContractCheck {
         precondition(content?.last?["role"] as? String == "first_frame")
     }
 
-    private static func testPromptOptimizationRequestAndResponse() async throws {
-        let temporary = FileManager.default.temporaryDirectory
-            .appendingPathComponent("realpet-motion-reference.png")
-        defer { try? FileManager.default.removeItem(at: temporary) }
-        try Data([0x89, 0x50, 0x4e, 0x47]).write(to: temporary)
-        let apiConfiguration = try OpenAIImageAPIConfiguration(
-            baseURLString: "https://relay.example.com/v1")
-        let request = try OpenAIPetPromptOptimizer.makeRequest(
-            naturalLanguage: "让它慢慢转一圈",
-            referenceImageURLs: [temporary, temporary],
-            apiKey: "test-key",
-            configuration: apiConfiguration,
-            model: "gpt-5.6-sol")
-        precondition(request.url == apiConfiguration.responsesURL)
-        precondition(request.value(forHTTPHeaderField: "Authorization")
-                     == "Bearer test-key")
-        let body = try JSONSerialization.jsonObject(
-            with: request.httpBody ?? Data()) as? [String: Any]
-        precondition(body?["model"] as? String == "gpt-5.6-sol")
-        let instructions = body?["instructions"] as? String
-        precondition(instructions?.contains("MiniMax H3 image-to-video") == true)
-        precondition(instructions?.contains("ordered timeline") == true)
-        precondition(instructions?.contains("camera is fixed and stable") == true)
-        let input = body?["input"] as? [[String: Any]]
-        let content = input?.first?["content"] as? [[String: Any]]
-        precondition(content?.filter { $0["type"] as? String == "input_image" }.count == 2)
-        let text = body?["text"] as? [String: Any]
-        let format = text?["format"] as? [String: Any]
-        precondition(format?["type"] as? String == "json_schema")
-
-        let sessionConfiguration = URLSessionConfiguration.ephemeral
-        sessionConfiguration.protocolClasses = [MotionMockURLProtocol.self]
-        MotionMockURLProtocol.handler = { received in
-            precondition(received.url == apiConfiguration.responsesURL)
-            let response = HTTPURLResponse(
-                url: received.url!, statusCode: 200,
-                httpVersion: nil, headerFields: nil)!
-            let output = """
-            {"optimized_prompt":"首帧中的同一只白色小狗位于纯白无缝背景的全身中景中，先自然站稳，随后在原地平稳转一圈，最后回到面向镜头的站姿并短暂停留。镜头固定稳定，柔和均匀的棚拍光线，毛发和身体运动自然写实。","pet_description":"白色小狗","warnings":[]}
-            """
-            let payload = try JSONSerialization.data(withJSONObject: [
-                "output_text": output,
-            ])
-            return (response, payload)
-        }
-        let result = try await OpenAIPetPromptOptimizer(
-            session: URLSession(configuration: sessionConfiguration)).optimize(
-                naturalLanguage: "让它慢慢转一圈",
-                referenceImageURLs: [temporary],
-                apiKey: "test-key",
-                configuration: apiConfiguration,
-                model: "gpt-5.6-sol")
-        precondition(result.petDescription == "白色小狗")
-        precondition(result.optimizedPrompt.contains("镜头固定稳定"))
-    }
-
     private static func testAgnesReferenceAndMiniMaxPipelineCreatePollAndDownload() async throws {
         let temporary = FileManager.default.temporaryDirectory
             .appendingPathComponent("realpet-agnes-pipeline-reference.png")
         defer { try? FileManager.default.removeItem(at: temporary) }
         try Data([0x89, 0x50, 0x4e, 0x47]).write(to: temporary)
-        let promptAPIConfiguration = try OpenAIImageAPIConfiguration(
-            baseURLString: "https://relay.example.com/v1")
         let agnesAPIConfiguration = try OpenAIImageAPIConfiguration(
             baseURLString: "https://apihub.agnes-ai.com/v1")
         let miniMaxAPIConfiguration = try MiniMaxVideoAPIConfiguration(
@@ -231,9 +198,6 @@ struct MotionGenerationContractCheck {
             if request.url?.host == "apihub.agnes-ai.com" {
                 precondition(request.value(forHTTPHeaderField: "Authorization")
                              == "Bearer agnes-key")
-            } else if request.url?.host == "relay.example.com" {
-                precondition(request.value(forHTTPHeaderField: "Authorization")
-                             == "Bearer prompt-key")
             } else if request.url?.host == "api.minimaxi.com" {
                 precondition(request.value(forHTTPHeaderField: "Authorization")
                              == "Bearer minimax-key")
@@ -245,13 +209,6 @@ struct MotionGenerationContractCheck {
             case ("POST", "apihub.agnes-ai.com", "/v1/images/generations"):
                 return (response, try JSONSerialization.data(withJSONObject: [
                     "data": [["url": "https://cdn.example.com/pet-anchor.png"]],
-                ]))
-            case ("POST", "relay.example.com", "/v1/responses"):
-                let output = """
-                {"optimized_prompt":"纯白背景，固定镜头，同一只宠物抬起前爪。","pet_description":"棕白小狗","warnings":[]}
-                """
-                return (response, try JSONSerialization.data(withJSONObject: [
-                    "output_text": output,
                 ]))
             case ("POST", "api.minimaxi.com", "/v2/video_generation"):
                 return (response, try JSONSerialization.data(withJSONObject: [
@@ -273,14 +230,6 @@ struct MotionGenerationContractCheck {
         }
 
         let session = URLSession(configuration: sessionConfiguration)
-        let prompt = try await OpenAIPetPromptOptimizer(session: session).optimize(
-            naturalLanguage: "抬起前爪",
-            referenceImageURLs: [temporary],
-            apiKey: "prompt-key",
-            configuration: promptAPIConfiguration,
-            model: "gpt-5.6-sol")
-        precondition(prompt.petDescription == "棕白小狗")
-
         let reference = try await AgnesImageReferenceGenerator(session: session).generateReference(
             referenceImageURLs: [temporary],
             apiKey: "agnes-key",
@@ -290,7 +239,7 @@ struct MotionGenerationContractCheck {
 
         let client = MiniMaxH3VideoGenerationClient(session: session)
         let queued = try await client.create(
-            prompt: prompt.optimizedPrompt,
+            prompt: DefaultMouseInteractionScenario.clickBounce.actionPlans[0].prompt,
             firstFrameURL: reference,
             apiKey: "minimax-key",
             configuration: miniMaxAPIConfiguration,

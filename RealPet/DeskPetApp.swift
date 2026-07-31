@@ -6,11 +6,9 @@ import SwiftUI
 struct RealPetMain {
     static func main() {
         if provisionImageServiceCredentialFromStandardInput() { return }
-        if provisionPromptServiceCredentialFromStandardInput() { return }
         if provisionAgnesServiceCredentialFromStandardInput() { return }
         if provisionMiniMaxServiceCredentialFromStandardInput() { return }
         if provisionMotionServiceCredentialFromStandardInput() { return }
-        if configureMotionServiceFromCommandLine() { return }
         if configureAgnesMotionServiceFromCommandLine() { return }
         if configureMiniMaxMotionServiceFromCommandLine() { return }
         if exportOriginalRigAtlasFromCommandLine() { return }
@@ -65,27 +63,6 @@ struct RealPetMain {
         return true
     }
 
-    private static func provisionPromptServiceCredentialFromStandardInput() -> Bool {
-        guard CommandLine.arguments.contains(
-            "--provision-prompt-service-credential") else { return false }
-        guard let input = readLine(strippingNewline: true) else {
-            fputs("RealPet: missing prompt service credential on stdin\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        let key = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else {
-            fputs("RealPet: prompt service credential is empty\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        do {
-            try OpenAIAPIKeyStore.savePromptMotionService(key)
-        } catch {
-            fputs("RealPet: failed to provision prompt service credential\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        return true
-    }
-
     private static func provisionAgnesServiceCredentialFromStandardInput() -> Bool {
         guard CommandLine.arguments.contains(
             "--provision-agnes-service-credential") else { return false }
@@ -128,34 +105,6 @@ struct RealPetMain {
         return true
     }
 
-    private static func configureMotionServiceFromCommandLine() -> Bool {
-        guard let flagIndex = CommandLine.arguments.firstIndex(
-            of: "--configure-motion-service") else { return false }
-        let values = Array(CommandLine.arguments.dropFirst(flagIndex + 1))
-        guard values.count == 8, let seconds = Int(values[6]) else {
-            fputs(
-                "RealPet: expected prompt Base URL, prompt model, Agnes Base URL, image model, MiniMax Base URL, video model, seconds, and size\n",
-                stderr)
-            exit(EXIT_FAILURE)
-        }
-        do {
-            let configuration = try MotionServiceConfiguration(
-                baseURLString: values[0],
-                promptModel: values[1],
-                agnesBaseURLString: values[2],
-                imageModel: values[3],
-                miniMaxBaseURLString: values[4],
-                videoModel: values[5],
-                seconds: seconds,
-                size: values[7]).validated()
-            MotionServiceConfigurationStore.save(configuration)
-        } catch {
-            fputs("RealPet: invalid motion service configuration\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        return true
-    }
-
     private static func configureAgnesMotionServiceFromCommandLine() -> Bool {
         guard let flagIndex = CommandLine.arguments.firstIndex(
             of: "--configure-agnes-motion-service") else { return false }
@@ -169,8 +118,6 @@ struct RealPetMain {
         let current = MotionServiceConfigurationStore.load()
         do {
             let configuration = try MotionServiceConfiguration(
-                baseURLString: current.baseURLString,
-                promptModel: current.promptModel,
                 agnesBaseURLString: values[0],
                 imageModel: values[1],
                 miniMaxBaseURLString: current.resolvedMiniMaxBaseURLString,
@@ -198,8 +145,6 @@ struct RealPetMain {
         let current = MotionServiceConfigurationStore.load()
         do {
             let configuration = try MotionServiceConfiguration(
-                baseURLString: current.baseURLString,
-                promptModel: current.promptModel,
                 agnesBaseURLString: current.resolvedAgnesBaseURLString,
                 imageModel: current.imageModel,
                 miniMaxBaseURLString: values[0],

@@ -145,8 +145,6 @@ struct MainPanelView: View {
                             workflowLabel: vm.rigGenerationLabel(for: pet),
                             workflowLocked: vm.hasActiveWorkflow,
                             onRetry: { vm.retryPet(pet) },
-                            onImportAction: { vm.beginActionImport(for: pet, kind: $0) },
-                            onOpenCapturePack: { vm.presentCapturePack(for: pet) },
                             onOpenMotionStudio: { vm.presentMotionStudio(for: pet) },
                             onSetPersonality: { vm.setPersonality($0, for: pet) },
                             onEditPersonality: { vm.presentPersonalityEditor(for: pet) },
@@ -177,28 +175,6 @@ struct MainPanelView: View {
             .frame(maxWidth: .infinity)
         }
         .frame(width: 300)
-        // Keep action imports out of the primary import button's presentation
-        // chain. Multiple file importers on one view can suppress each other.
-        .overlay {
-            Color.clear
-                .frame(width: 0, height: 0)
-                .allowsHitTesting(false)
-                .fileImporter(
-                    isPresented: $vm.showActionFilePicker,
-                    allowedContentTypes: [
-                        UTType.movie,
-                        UTType.quickTimeMovie,
-                        UTType.mpeg4Movie
-                    ],
-                    allowsMultipleSelection: false
-                ) { result in
-                    if case .success(let urls) = result, let url = urls.first {
-                        vm.importActionVideo(url: url)
-                    } else {
-                        vm.cancelActionImportSelection()
-                    }
-                }
-        }
         .sheet(item: $vm.personalitySetupPet) { pet in
             PersonalityEditorView(
                 pet: pet,
@@ -212,14 +188,6 @@ struct MainPanelView: View {
             VisualInteractionSetupView(
                 viewModel: vm,
                 onCancel: { vm.showVisionModelSetup = false })
-        }
-        .sheet(item: $vm.capturePackPet) { pet in
-            CapturePackView(
-                pet: pet,
-                manifest: vm.actionManifest(for: pet),
-                isBusy: vm.hasActiveWorkflow,
-                onImport: { kind in vm.beginActionImport(for: pet, kind: kind) },
-                onDismiss: { vm.dismissCapturePack() })
         }
         .sheet(item: $vm.motionStudioPet) { pet in
             MotionStudioView(
