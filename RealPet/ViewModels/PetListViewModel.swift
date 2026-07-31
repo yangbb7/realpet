@@ -423,7 +423,15 @@ class PetListViewModel: ObservableObject {
             return
         }
 
-        let outputDir = PetStorage.shared.petDirectory(for: pet.id).path
+        let petDirectory = PetStorage.shared.petDirectory(for: pet.id)
+        let outputDir = petDirectory.path
+        let generatedVideoDirectory = petDirectory
+            .appendingPathComponent("generated-video")
+            .standardizedFileURL.path + "/"
+        if URL(fileURLWithPath: sourcePath).standardizedFileURL.path
+            .hasPrefix(generatedVideoDirectory) {
+            generatedInitialPetId = pet.id
+        }
         beginPreparation(petId: pet.id, videoPath: sourcePath, outputDir: outputDir)
     }
 
@@ -579,6 +587,17 @@ class PetListViewModel: ObservableObject {
             updatePetStatus(id: petId, status: .detecting)
         }
 
+        let isGeneratedMotion = GeneratedMotionProcessingPolicy
+            .bypassesRecordedFootageQualityGate(
+                actionOrigin: activeActionImport?.origin,
+                isInitialGeneratedPet: generatedInitialPetId == petId)
+        if isGeneratedMotion {
+            pythonBridge.statusText = "正在分析生成的宠物动作…"
+            beginClipAnalysis(
+                petId: petId, videoPath: videoPath, outputDir: outputDir)
+            return
+        }
+
         // Step 0: Quality gate — reject bad videos before clip analysis.
         pythonBridge.qualityCheck(videoPath: videoPath, outputDir: outputDir) { [weak self] qcResult in
             guard let self = self else { return }
@@ -587,35 +606,39 @@ class PetListViewModel: ObservableObject {
                 self.failPreparation(petId: petId, message: reason)
                 return
             }
-            // QC passed → continue to clip analysis.
-            self.pythonBridge.analyzeClips(
-                videoPath: videoPath, outputDir: outputDir) { [weak self] clips in
-                    guard let self = self else { return }
-                    if let clips = clips, (clips["needs_selection"] as? Bool) == true {
-                        let cands = (clips["candidates"] as? [[String: Any]] ?? []).map { c in
-                            ClipChoice(start: c["start"] as? Double ?? 0,
-                                       duration: c["duration"] as? Double ?? 0,
-                                       score: c["score"] as? Double ?? 0,
-                                       recommended: c["recommended"] as? Bool ?? false)
-                        }
-                        guard let selected = cands.first(where: \.recommended)
-                                ?? cands.max(by: { $0.score < $1.score }) else {
-                            self.failPreparation(
-                                petId: petId, message: "没有找到适合制作宠物的片段")
-                            return
-                        }
-                        self.runDetection(
-                            petId: petId, videoPath: videoPath,
-                            outputDir: outputDir, startTime: selected.start,
-                            duration: selected.duration)
-                    } else {
-                        // Short video / analysis unavailable → use the whole clip.
-                        self.runDetection(petId: petId, videoPath: videoPath,
-                                          outputDir: outputDir,
-                                          startTime: -1, duration: -1)
-                    }
-                }
+            self.beginClipAnalysis(
+                petId: petId, videoPath: videoPath, outputDir: outputDir)
         } // QC gate closure
+    }
+
+    private func beginClipAnalysis(petId: UUID, videoPath: String, outputDir: String) {
+        pythonBridge.analyzeClips(
+            videoPath: videoPath, outputDir: outputDir) { [weak self] clips in
+                guard let self = self else { return }
+                if let clips = clips, (clips["needs_selection"] as? Bool) == true {
+                    let cands = (clips["candidates"] as? [[String: Any]] ?? []).map { c in
+                        ClipChoice(start: c["start"] as? Double ?? 0,
+                                   duration: c["duration"] as? Double ?? 0,
+                                   score: c["score"] as? Double ?? 0,
+                                   recommended: c["recommended"] as? Bool ?? false)
+                    }
+                    guard let selected = cands.first(where: \.recommended)
+                            ?? cands.max(by: { $0.score < $1.score }) else {
+                        self.failPreparation(
+                            petId: petId, message: "没有找到适合制作宠物的片段")
+                        return
+                    }
+                    self.runDetection(
+                        petId: petId, videoPath: videoPath,
+                        outputDir: outputDir, startTime: selected.start,
+                        duration: selected.duration)
+                } else {
+                    // Short video / analysis unavailable → use the whole clip.
+                    self.runDetection(petId: petId, videoPath: videoPath,
+                                      outputDir: outputDir,
+                                      startTime: -1, duration: -1)
+                }
+            }
     }
 
     /// Detect the pet in the automatically selected segment.

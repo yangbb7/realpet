@@ -5,6 +5,18 @@ struct DefaultMotionActionPlan: Equatable, Sendable {
     let prompt: String
 }
 
+enum GeneratedMotionProcessingPolicy {
+    /// White studio backgrounds are intentional for generated motion. Keep
+    /// pet detection, segmentation, and identity validation, but do not apply
+    /// the recorded-footage exposure gate to these clips.
+    static func bypassesRecordedFootageQualityGate(
+        actionOrigin: PetActionManifest.Action.Origin?,
+        isInitialGeneratedPet: Bool
+    ) -> Bool {
+        actionOrigin == .generated || isInitialGeneratedPet
+    }
+}
+
 /// These prompt packages follow MiniMax H3's image-to-video formula: the
 /// first-frame subject, one ordered motion, fixed camera, and visual direction.
 /// They are read-only because their output is installed into runtime-owned slots.

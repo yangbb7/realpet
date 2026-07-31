@@ -126,6 +126,15 @@ struct MotionGenerationContractCheck {
     }
 
     private static func testDefaultMouseInteractionPrompts() throws {
+        precondition(GeneratedMotionProcessingPolicy
+            .bypassesRecordedFootageQualityGate(
+                actionOrigin: .generated, isInitialGeneratedPet: false))
+        precondition(GeneratedMotionProcessingPolicy
+            .bypassesRecordedFootageQualityGate(
+                actionOrigin: nil, isInitialGeneratedPet: true))
+        precondition(!GeneratedMotionProcessingPolicy
+            .bypassesRecordedFootageQualityGate(
+                actionOrigin: .captured, isInitialGeneratedPet: false))
         let tracking = DefaultMouseInteractionScenario.pointerTracking
         precondition(tracking.actionPlans.map(\.kind) == [.gazeOrbit])
         precondition(tracking.minimumVideoSeconds == 12)
