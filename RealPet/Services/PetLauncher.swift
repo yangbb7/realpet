@@ -5,7 +5,6 @@ class PetLauncher: ObservableObject {
     private var runningPets: [UUID: any PetRuntimeController] = [:]
     private var supplementalAdapters: [ObjectIdentifier: InteractionAdapter] = [:]
     @Published private(set) var lastRuntimeError: String?
-    @Published private(set) var behaviorSnapshots: [UUID: PetBehaviorSnapshot] = [:]
     let interactionHub = InteractionHub()
 
     private lazy var interactionAdapterBus = InteractionAdapterBus(
@@ -13,24 +12,29 @@ class PetLauncher: ObservableObject {
 
     private lazy var behaviorDirector = PetBehaviorDirector(
         hub: interactionHub,
-        onStateChange: { [weak self] petId, snapshot in
-            self?.behaviorSnapshots[petId] = snapshot
-        }) { [weak self] petId, command in
+        startTimer: false) { [weak self] petId, command in
             self?.runningPets[petId]?.send(command)
         }
 
     @discardableResult
     func launch(pet: Pet) -> Bool {
         lastRuntimeError = nil
+        // A desktop session exposes one global pet. Stop any stale renderer
+        // before creating the next one so two independent windows cannot run.
+        let otherPetIDs = runningPets.keys.filter { $0 != pet.id }
+        for petID in otherPetIDs {
+            stop(petId: petID)
+        }
         if let configuration = sourceFrameConfiguration(for: pet) {
             let runtime = FrameSequencePetRuntime(
                 petId: pet.id,
                 framesDirectory: configuration.framesDirectory,
                 fps: configuration.fps,
+                displayScale: pet.resolvedDisplayScale,
+                initialWindowOrigin: initialWindowOrigin(for: pet),
                 startHidden: false)
             let started = activate(
                 runtime,
-                personality: pet.personality ?? .balanced,
                 capabilities: configuration.capabilities)
             if started { lastRuntimeError = nil }
             return started
@@ -42,10 +46,11 @@ class PetLauncher: ObservableObject {
             petId: pet.id,
             modelURL: configuration.modelURL,
             resources: configuration.resources,
+            displayScale: pet.resolvedDisplayScale,
+            initialWindowOrigin: initialWindowOrigin(for: pet),
             startHidden: false)
         let started = activate(
             runtime,
-            personality: pet.personality ?? .balanced,
             capabilities: configuration.manifest.runtimeCapabilities)
         if started {
             lastRuntimeError = nil
@@ -58,25 +63,29 @@ class PetLauncher: ObservableObject {
             || live2DConfiguration(for: pet, publishError: false) != nil
     }
 
-    func stop(petId: UUID) {
+    @discardableResult
+    func stop(petId: UUID) -> CGPoint? {
         let runtime = runningPets.removeValue(forKey: petId)
+        let origin = runtime?.windowOrigin
         behaviorDirector.unregister(petId: petId)
-        behaviorSnapshots.removeValue(forKey: petId)
         runtime?.terminate()
+        return origin
     }
 
     func isRunning(petId: UUID) -> Bool {
         runningPets[petId]?.isRunning == true
     }
 
-    func updatePersonality(petId: UUID, personality: PetPersonality) {
-        behaviorDirector.updatePersonality(petId: petId, personality: personality)
+    @discardableResult
+    func setDisplayScale(petId: UUID, scale: Double) -> CGPoint? {
+        runningPets[petId]?.setDisplayScale(scale)
+        return runningPets[petId]?.windowOrigin
     }
 
-    func setBehaviorPlanningCoordinator(
-        _ coordinator: BehaviorPlanningCoordinator?
-    ) {
-        behaviorDirector.setPlanningCoordinator(coordinator)
+    @discardableResult
+    func playCustomAction(petId: UUID, actionID: String) -> Bool {
+        (runningPets[petId] as? FrameSequencePetRuntime)?
+            .playCustomAction(id: actionID) ?? false
     }
 
     func attachInteractionAdapter(_ adapter: InteractionAdapter) throws {
@@ -101,14 +110,12 @@ class PetLauncher: ObservableObject {
     }
 
     func stopAll() {
-        behaviorDirector.cancelPlanning()
         let runtimes = runningPets
         runningPets.removeAll()
         for (petId, runtime) in runtimes {
             behaviorDirector.unregister(petId: petId)
             runtime.terminate()
         }
-        behaviorSnapshots.removeAll()
         let adapters = supplementalAdapters.values
         supplementalAdapters.removeAll()
         for adapter in adapters {
@@ -120,7 +127,6 @@ class PetLauncher: ObservableObject {
     @discardableResult
     private func activate(
         _ runtime: any PetRuntimeController,
-        personality: PetPersonality,
         capabilities: PetActionCapabilities
     ) -> Bool {
         let petId = runtime.petId
@@ -131,7 +137,6 @@ class PetLauncher: ObservableObject {
             if let current = self.runningPets[petId], current === runtime {
                 self.runningPets.removeValue(forKey: petId)
                 self.behaviorDirector.unregister(petId: petId)
-                self.behaviorSnapshots.removeValue(forKey: petId)
                 NotificationCenter.default.post(
                     name: .petStopped,
                     object: nil,
@@ -152,7 +157,7 @@ class PetLauncher: ObservableObject {
         runningPets[petId] = runtime
         behaviorDirector.register(
             petId: petId,
-            personality: personality,
+            personality: .balanced,
             capabilities: capabilities)
         if let previous {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
@@ -172,6 +177,11 @@ class PetLauncher: ObservableObject {
         let framesDirectory: URL
         let fps: Int
         let capabilities: PetActionCapabilities
+    }
+
+    private func initialWindowOrigin(for pet: Pet) -> CGPoint? {
+        guard let position = pet.desktopPosition else { return nil }
+        return CGPoint(x: position.x, y: position.y)
     }
 
     private func sourceFrameConfiguration(for pet: Pet) -> SourceFrameConfiguration? {

@@ -18,12 +18,12 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--kind", required=True,
-        choices=["react", "shake_head", "play", "lie_down", "paw", "eat"])
-    parser.add_argument("--fps", type=int, default=10)
+        choices=["react", "shake_head", "play", "lie_down", "paw", "eat", "custom"])
+    parser.add_argument("--fps", type=int, default=0)
     args = parser.parse_args()
 
     result = prepare_reaction_sequence(
-        args.frames_dir, args.output_dir, fps=max(1, min(60, args.fps)))
+        args.frames_dir, args.output_dir, fps=max(0, args.fps))
     print(json.dumps({"type": "action_prepared", **result}, ensure_ascii=False))
 
 

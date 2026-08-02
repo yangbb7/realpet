@@ -26,8 +26,8 @@ jobs:
         run: |
           cd RealPet
           swiftc Models/PetPersonality.swift Models/PetTemplateProfile.swift \
+            Models/PetCloudReference.swift \
             Models/PetRendererKind.swift Models/Pet.swift \
-            Models/MainWindowLayout.swift \
             Tests/PetRecoveryCheck.swift \
             -o /tmp/realpet-pet-recovery-check
           /tmp/realpet-pet-recovery-check
@@ -65,7 +65,8 @@ jobs:
       - name: Test rig asset generation
         run: |
           cd RealPet
-          swiftc Models/PetActionManifest.swift Models/PetTemplateProfile.swift \
+          swiftc Models/PetActionManifest.swift Models/PetFeatureManifest.swift \
+            Models/PetTemplateProfile.swift \
             Models/InteractivePetModel.swift \
             Services/OpenAIImageAPIConfiguration.swift \
             Services/OpenAIAPIKeyStore.swift \
@@ -78,31 +79,53 @@ jobs:
         run: |
           cd RealPet
           swiftc Models/PetActionManifest.swift \
+            Models/PetCloudReference.swift \
             Models/MotionGenerationModels.swift \
             Services/OpenAIImageAPIConfiguration.swift \
+            Services/OpenAIAPIKeyStore.swift \
             Services/MiniMaxVideoAPIConfiguration.swift \
             Services/PetReferenceImageData.swift \
-            Services/AgnesImageReferenceGenerator.swift \
-            Services/PetActionLibrary.swift \
+            Services/AgnesVideoGenerationClient.swift \
             Services/MiniMaxH3VideoGenerationClient.swift \
+            Services/SupabasePetReferenceStorage.swift \
+            Services/SupabaseGoogleSession.swift \
+            Services/PetActionLibrary.swift \
+            Services/TrackMatteCommand.swift \
             Tests/MotionGenerationContractCheck.swift \
             -o /tmp/realpet-motion-generation-check
           /tmp/realpet-motion-generation-check
       - name: Test Cubism runtime contracts
         run: |
           cd RealPet
-          swiftc Models/PetActionManifest.swift Models/PetTemplateProfile.swift \
+          swiftc Models/PetActionManifest.swift Models/PetFeatureManifest.swift \
+            Models/PetTemplateProfile.swift \
             Models/InteractionModels.swift \
             Models/InteractivePetModel.swift Models/PetRendererKind.swift \
             Models/CubismParameterMapper.swift Models/CubismProceduralMotion.swift \
             Services/CubismWebRuntimeResources.swift \
-            Services/CubismTemplateResources.swift \
             Services/PetRuntimeController.swift Services/InteractionHub.swift \
             Services/InteractionAdapter.swift \
+            Services/FrameSequencePetRuntime.swift \
             Services/CubismWebPetRuntime.swift \
             Tests/CubismRuntimeContractCheck.swift \
             -o /tmp/realpet-cubism-runtime-check
           /tmp/realpet-cubism-runtime-check
+      - name: Package app structural smoke
+        run: |
+          printf '#!/bin/sh\nprintf "ffmpeg version realpet-ci\\n"\n' > /tmp/realpet-ci-ffmpeg
+          chmod +x /tmp/realpet-ci-ffmpeg
+          REALPET_SUPABASE_PUBLISHABLE_KEY=publishable-ci-key \
+          REALPET_AGNES_API_KEY=agnes-ci-key \
+          REALPET_FFMPEG_PATH=/tmp/realpet-ci-ffmpeg \
+          REALPET_FFMPEG_SHA256="$(shasum -a 256 /tmp/realpet-ci-ffmpeg | awk '{print $1}')" \
+          REALPET_DIST_DIR="${RUNNER_TEMP}/realpet-ci-package" \
+          ./build_app.sh --stub-weights --reuse-swift-build
+          test -x "${RUNNER_TEMP}/realpet-ci-package/RealPet.app/Contents/MacOS/RealPet"
+          test -f "${RUNNER_TEMP}/realpet-ci-package/RealPet.app/Contents/Resources/requirements.lock"
+          plutil -extract RealPetSupabasePublishableKey raw \
+            "${RUNNER_TEMP}/realpet-ci-package/RealPet.app/Contents/Info.plist" | grep -qx publishable-ci-key
+          plutil -extract CFBundleURLTypes.0.CFBundleURLSchemes.0 raw \
+            "${RUNNER_TEMP}/realpet-ci-package/RealPet.app/Contents/Info.plist" | grep -qx realpet-auth
 
   python:
     name: Python Tests
@@ -115,9 +138,7 @@ jobs:
           python-version: "3.10"
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-timeout ruff
+          pip install --require-hashes -r requirements-dev.lock
       - name: Lint
         run: ruff check scripts/ pipeline/ tests/ --select E,F,W --ignore E501
       - name: Run tests (unit only)
@@ -125,8 +146,7 @@ jobs:
           pytest tests/test_quality_check.py tests/test_pet_detector.py
           tests/test_memory_optimization.py
           tests/test_model_packaging.py tests/test_action_quality.py
-          tests/test_rig_assets.py
-          tests/test_cubism_model.py tests/test_cubism_template.py
+          tests/test_frame_preservation.py
           -v --timeout=60
         env:
           REALPET_WEIGHTS_DIR: /tmp/weights

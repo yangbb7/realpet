@@ -25,7 +25,7 @@ final class PetBehaviorDirector {
 
     init(
         hub: InteractionHub,
-        startTimer: Bool = true,
+        startTimer: Bool = false,
         now: @escaping () -> TimeInterval = { Date().timeIntervalSince1970 },
         randomUnit: @escaping () -> Double = { Double.random(in: 0...1) },
         onStateChange: @escaping (UUID, PetBehaviorSnapshot) -> Void = { _, _ in },

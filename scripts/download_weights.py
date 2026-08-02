@@ -10,6 +10,7 @@ Usage:
     python scripts/download_weights.py --check   # only verify, don't download
 """
 import argparse
+import hashlib
 import os
 import sys
 import urllib.request
@@ -25,22 +26,38 @@ SAM2_URL = (
 )
 SAM2_SUBDIR = "sam2"
 SAM2_FILENAME = "sam2.1_hiera_tiny.pt"
-SAM2_EXPECTED_SIZE = 156_000_000  # ~156MB, used for rough validation
+SAM2_EXPECTED_SIZE = 156_000_000
+SAM2_SHA256 = "7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69"
 
 
 def _sam2_path():
     return os.path.join(WEIGHTS_DIR, SAM2_SUBDIR, SAM2_FILENAME)
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sam2_is_verified(path):
+    return (os.path.isfile(path)
+            and os.path.getsize(path) >= SAM2_EXPECTED_SIZE * 0.9
+            and sha256_file(path) == SAM2_SHA256)
+
+
 def download_sam2(force=False):
     """Download SAM2 checkpoint. Returns True if already present or downloaded."""
     dest = _sam2_path()
     if os.path.exists(dest) and not force:
-        size = os.path.getsize(dest)
-        if size > SAM2_EXPECTED_SIZE * 0.9:
-            print(f"SAM2 checkpoint already exists: {dest} ({size:,} bytes)")
+        if sam2_is_verified(dest):
+            size = os.path.getsize(dest)
+            print(f"SAM2 checkpoint verified: {dest} ({size:,} bytes)")
             return True
-        print(f"Existing file too small ({size:,} bytes), re-downloading...")
+        print("Existing SAM2 checkpoint does not match the pinned SHA-256, "
+              "re-downloading...")
 
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     print(f"Downloading SAM2 checkpoint to {dest} ...")
@@ -58,6 +75,10 @@ def download_sam2(force=False):
         urllib.request.urlretrieve(SAM2_URL, dest, reporthook=_progress)
         print()
         size = os.path.getsize(dest)
+        if not sam2_is_verified(dest):
+            os.remove(dest)
+            print("Downloaded SAM2 checkpoint does not match the pinned SHA-256")
+            return False
         print(f"Done. ({size:,} bytes)")
         return True
     except Exception as e:
@@ -91,8 +112,11 @@ def check_all():
     if not os.path.exists(sam2):
         missing.append(f"SAM2 checkpoint: {sam2}")
     else:
-        size = os.path.getsize(sam2)
-        print(f"✓ SAM2 checkpoint: {sam2} ({size:,} bytes)")
+        if sam2_is_verified(sam2):
+            size = os.path.getsize(sam2)
+            print(f"✓ SAM2 checkpoint: {sam2} ({size:,} bytes, SHA-256 verified)")
+        else:
+            missing.append(f"SAM2 checkpoint digest: {sam2}")
 
     # BiRefNet (auto-downloaded by HuggingFace)
     print("✓ BiRefNet-matting: auto-downloaded by HuggingFace from_pretrained()")

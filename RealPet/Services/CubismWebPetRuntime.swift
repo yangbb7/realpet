@@ -148,6 +148,7 @@ final class CubismWebPetRuntime: NSObject, PetRuntimeController,
     var onObservation: ((InteractionObservation) -> Void)?
     var onTermination: (() -> Void)?
     private(set) var isRunning = false
+    var windowOrigin: CGPoint? { window?.frame.origin }
 
     private let modelURL: URL
     private let resources: CubismWebRuntimeResources
@@ -165,6 +166,8 @@ final class CubismWebPetRuntime: NSObject, PetRuntimeController,
     private var windowMotion: WindowMotion?
     private var pettingRecognizer = PettingGestureRecognizer()
     private var isPresentationActive: Bool
+    private var displayScale: Double
+    private let initialWindowOrigin: CGPoint?
 
     private struct WindowMotion {
         let startOrigin: NSPoint
@@ -177,11 +180,15 @@ final class CubismWebPetRuntime: NSObject, PetRuntimeController,
         petId: UUID,
         modelURL: URL,
         resources: CubismWebRuntimeResources,
+        displayScale: Double = 1.0,
+        initialWindowOrigin: CGPoint? = nil,
         startHidden: Bool = false
     ) {
         self.petId = petId
         self.modelURL = modelURL.standardizedFileURL
         self.resources = resources
+        self.displayScale = Self.clampedDisplayScale(displayScale)
+        self.initialWindowOrigin = initialWindowOrigin
         isPresentationActive = !startHidden
     }
 
@@ -200,14 +207,13 @@ final class CubismWebPetRuntime: NSObject, PetRuntimeController,
         configuration.setURLSchemeHandler(schemeHandler, forURLScheme: "realpet")
         configuration.userContentController.add(self, name: "realpet")
 
-        let size = NSSize(width: 420, height: 520)
+        let size = windowSize()
         let visible = NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let rect = NSRect(
-            x: visible.midX - size.width / 2,
-            y: visible.midY - size.height / 2,
-            width: size.width,
-            height: size.height)
+            origin: PetWindowPlacement.origin(
+                preferred: initialWindowOrigin, size: size, visibleFrame: visible),
+            size: size)
         let window = NSWindow(
             contentRect: rect,
             styleMask: .borderless,
@@ -226,6 +232,7 @@ final class CubismWebPetRuntime: NSObject, PetRuntimeController,
             configuration: configuration)
         webView.setValue(false, forKey: "drawsBackground")
         webView.wantsLayer = true
+        webView.autoresizingMask = [.width, .height]
         webView.layer?.backgroundColor = NSColor.clear.cgColor
         window.contentView = webView
 
@@ -241,6 +248,17 @@ final class CubismWebPetRuntime: NSObject, PetRuntimeController,
             window.orderOut(nil)
         }
         startPointerObservation()
+    }
+
+    func setDisplayScale(_ scale: Double) {
+        displayScale = Self.clampedDisplayScale(scale)
+        guard let window else { return }
+        let size = windowSize()
+        let visible = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let origin = PetWindowPlacement.origin(
+            preferred: window.frame.origin, size: size, visibleFrame: visible)
+        window.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
     }
 
     func send(_ command: PetCommand) {
@@ -281,6 +299,10 @@ final class CubismWebPetRuntime: NSObject, PetRuntimeController,
         case .react:
             let action: CubismSemanticAction
             switch command.animation {
+            case .cry, .angryStomp, .roll, .stretch, .sleepSnore, .wave,
+                    .jumpCheer, .puzzledTilt, .cuddle, .startledRetreat,
+                    .patrolRun:
+                action = .react
             case .shakeHead: action = .shakeHead
             case .play: action = .play
             case .react, .lieDown, .paw, .eat, .none: action = .react
@@ -324,6 +346,14 @@ final class CubismWebPetRuntime: NSObject, PetRuntimeController,
 
     func windowWillClose(_ notification: Notification) {
         terminate()
+    }
+
+    private static func clampedDisplayScale(_ scale: Double) -> Double {
+        min(1.75, max(0.55, scale))
+    }
+
+    private func windowSize() -> NSSize {
+        NSSize(width: 300 * displayScale, height: 370 * displayScale)
     }
 
     func userContentController(

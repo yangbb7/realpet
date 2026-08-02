@@ -48,10 +48,6 @@ final class InteractionHub {
         return token
     }
 
-    func removeObserver(_ token: UUID) {
-        observers.removeValue(forKey: token)
-    }
-
     func publish(
         _ observation: InteractionObservation,
         now: TimeInterval = Date().timeIntervalSince1970

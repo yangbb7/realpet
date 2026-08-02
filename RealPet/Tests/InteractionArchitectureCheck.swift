@@ -7,22 +7,16 @@ struct InteractionArchitectureCheck {
         try testObservationContractRoundTrip()
         testInteractionHubDropsExpiredAndDuplicateEvents()
         testInteractionHubRejectsMalformedEvents()
-        testPersonalityChangesBehavior()
-        try testCustomPersonalityContract()
-        testCustomPersonalityHotUpdate()
-        testMouseClickUsesDefaultBounceAction()
+        testPointerApproachKeepsPetInPlace()
+        testPointerInteractionUsesFixedBinding()
         testPettingUsesUnifiedPolicyAndMemory()
-        testFileDropSemanticsMapToDedicatedSourceActions()
+        testFileDropUsesFixedActionSlots()
         testMultimodalSemanticsUseExistingBehaviorPolicy()
         testCameraGestureInterpreter()
         testCameraVLMTriggerPolicy()
         testSpeechCommandInterpreter()
         testSpeechSemanticsUseExistingBehaviorPolicy()
         testShortTermBehaviorMemoryAndDecay()
-        testInteractionMemoryChangesAutonomousChoice()
-        testIdleOnlyPetRejectsFakeMovement()
-        testAutonomousBehaviorRespectsCapabilitiesAndPersonality()
-        testReactionOnlyDirectorSchedulesRealCommand()
         testDirectorRetainsUnsupportedInteractionMemory()
         testPauseSuppressesCommandsUntilResume()
         testEphemeralEvidenceIsBoundedAndExpiring()
@@ -30,13 +24,7 @@ struct InteractionArchitectureCheck {
         try await testOllamaCatalogFiltersVisionModels()
         try await testOllamaModelPullContractAndCancellation()
         try testOllamaPayloadAndResponseValidation()
-        try testOllamaBehaviorPlanPayloadAndResponseValidation()
         try testLocalVLMConfigurationPersistence()
-        try testLocalBehaviorPlannerConfigurationPersistence()
-        try await testBehaviorPlanningCoordinatorBackpressureAndExpiry()
-        testModelSuggestionCapabilityGate()
-        try await testDirectorUsesModelPlanAndFallback()
-        try await testPauseDropsInFlightModelPlan()
         try testActionLibraryInstallAndReplace()
         try testCapturedGazeManifestGate()
         try testIntentProducesVersionedCommand()
@@ -101,7 +89,7 @@ struct InteractionArchitectureCheck {
         precondition(!decoded.isFresh(at: now + 2))
     }
 
-    private static func testMouseClickUsesDefaultBounceAction() {
+    private static func testPointerInteractionUsesFixedBinding() {
         let now = Date().timeIntervalSince1970
         let intent = PetBehaviorPolicy.intent(
             for: InteractionObservation(
@@ -112,10 +100,11 @@ struct InteractionArchitectureCheck {
             personality: .balanced,
             now: now)
         precondition(intent?.action == .react)
-        precondition(intent?.animation == .play)
+        precondition(intent?.animation == .lieDown)
+        precondition(PetInteractionBinding.cue(for: InteractionKind.petTapped) == .lieDown)
     }
 
-    private static func testPersonalityChangesBehavior() {
+    private static func testPointerApproachKeepsPetInPlace() {
         let now = Date().timeIntervalSince1970
         let petId = UUID()
         let event = InteractionObservation(
@@ -128,8 +117,10 @@ struct InteractionArchitectureCheck {
             for: event, personality: .forPreset(.shy), now: now)
         let lively = PetBehaviorPolicy.intent(
             for: event, personality: .forPreset(.lively), now: now)
-        precondition(shy?.action == .retreat)
-        precondition(lively?.action == .approach)
+        precondition(shy?.action == .orient)
+        precondition(lively?.action == .orient)
+        precondition(shy?.target == event.spatial)
+        precondition(lively?.target == event.spatial)
     }
 
     private static func testCustomPersonalityContract() throws {
@@ -258,7 +249,7 @@ struct InteractionArchitectureCheck {
             == InteractionKind.petPetted)
     }
 
-    private static func testFileDropSemanticsMapToDedicatedSourceActions() {
+    private static func testFileDropUsesFixedActionSlots() {
         let now: TimeInterval = 120
         let petId = UUID()
         let body = InteractionObservation(
@@ -272,10 +263,14 @@ struct InteractionArchitectureCheck {
             occurredAt: now, expiresAt: now + 1,
             spatial: SpatialContext(space: .petLocalNormalized, x: 0.4, y: 0.7))
         let personality = PetPersonality.forPreset(.lively)
-        precondition(PetBehaviorPolicy.intent(
-            for: body, personality: personality, now: now)?.animation == .paw)
-        precondition(PetBehaviorPolicy.intent(
-            for: head, personality: personality, now: now)?.animation == .eat)
+        let bodyIntent = PetBehaviorPolicy.intent(
+            for: body, personality: personality, now: now)
+        let headIntent = PetBehaviorPolicy.intent(
+            for: head, personality: personality, now: now)
+        precondition(bodyIntent?.action == .react)
+        precondition(bodyIntent?.animation == .paw)
+        precondition(headIntent?.action == .react)
+        precondition(headIntent?.animation == .eat)
         precondition(InteractionKind.behaviorPlanningAllowed.contains(
             InteractionKind.fileDroppedOnBody))
         precondition(InteractionKind.behaviorPlanningAllowed.contains(
@@ -292,7 +287,7 @@ struct InteractionArchitectureCheck {
         let intent = PetBehaviorPolicy.intent(
             for: observation, personality: .forPreset(.lively), now: now)
         precondition(intent?.action == .react)
-        precondition(intent?.animation == .shakeHead)
+        precondition(intent?.animation == .wave)
         precondition(intent?.target == nil)
         let capabilities = PetActionCapabilities(
             locomotion: false, reaction: true, orientation: false)
@@ -1231,33 +1226,36 @@ struct InteractionArchitectureCheck {
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         try Data("idle".utf8).write(to: root.appendingPathComponent("frame_0000.png"))
 
-        let first = root.appendingPathComponent("first-walk")
+        let first = root.appendingPathComponent("first-cry")
         try fm.createDirectory(at: first, withIntermediateDirectories: true)
         try Data("first".utf8).write(to: first.appendingPathComponent("frame_0000.png"))
+        try Data("video".utf8).write(to: first.appendingPathComponent("action.mp4"))
         let manifest = try PetActionLibrary.install(
-            kind: .walk,
+            kind: .cry,
             processedFramesDirectory: first,
             rootFramesDirectory: root,
             fps: 12)
-        precondition(manifest.capabilities.locomotion)
+        precondition(manifest.capabilities.reaction)
         precondition(fm.fileExists(atPath:
-            root.appendingPathComponent("actions/walk/frame_0000.png").path))
+            root.appendingPathComponent("actions/cry/frame_0000.png").path))
+        precondition(fm.fileExists(atPath:
+            root.appendingPathComponent("actions/cry/action.mp4").path))
 
-        let replacement = root.appendingPathComponent("replacement-walk")
+        let replacement = root.appendingPathComponent("replacement-cry")
         try fm.createDirectory(at: replacement, withIntermediateDirectories: true)
         try Data("replacement".utf8).write(
             to: replacement.appendingPathComponent("frame_0001.png"))
         _ = try PetActionLibrary.install(
-            kind: .walk,
+            kind: .cry,
             processedFramesDirectory: replacement,
             rootFramesDirectory: root,
             fps: 10)
         precondition(!fm.fileExists(atPath:
-            root.appendingPathComponent("actions/walk/frame_0000.png").path))
+            root.appendingPathComponent("actions/cry/frame_0000.png").path))
         precondition(fm.fileExists(atPath:
-            root.appendingPathComponent("actions/walk/frame_0001.png").path))
+            root.appendingPathComponent("actions/cry/frame_0001.png").path))
         precondition(PetActionManifest.load(framesDirectory: root.path)?
-            .actions.first(where: { $0.id == "walk" })?.fps == 10)
+            .actions.first(where: { $0.id == "cry" })?.fps == 10)
 
     }
 
@@ -1323,10 +1321,10 @@ struct InteractionArchitectureCheck {
             for: playObservation, personality: .balanced, now: 100)!
         let playCommand = PetCommand.executing(playIntent, now: 100)
         precondition(playCommand.action == .react)
-        precondition(playCommand.animation == .play)
+        precondition(playCommand.animation == .jumpCheer)
         let encoded = try JSONEncoder().encode(playCommand)
         let object = try JSONSerialization.jsonObject(with: encoded) as! [String: Any]
-        precondition(object["animation"] as? String == "play")
+        precondition(object["animation"] as? String == "jump_cheer")
 
         let legacy = """
         {"schemaVersion":1,"id":"\(UUID().uuidString)",

@@ -11,10 +11,8 @@ struct VisualInteractionSetupView: View {
     let onCancel: () -> Void
 
     @State private var visionEnabled: Bool
-    @State private var behaviorEnabled: Bool
     @State private var endpoint: String
     @State private var visionModelName: String
-    @State private var behaviorModelName: String
     @State private var installedModels: [OllamaInstalledModel] = []
     @State private var visionModels: [OllamaInstalledModel] = []
     @State private var pullModelName = "gemma3:4b"
@@ -29,13 +27,9 @@ struct VisualInteractionSetupView: View {
         self.viewModel = viewModel
         self.onCancel = onCancel
         let vision = viewModel.localVLMConfiguration
-        let behavior = viewModel.localBehaviorPlannerConfiguration
         _visionEnabled = State(initialValue: vision.isEnabled)
-        _behaviorEnabled = State(initialValue: behavior.isEnabled)
-        _endpoint = State(initialValue:
-            behavior.isEnabled ? behavior.endpoint : vision.endpoint)
+        _endpoint = State(initialValue: vision.endpoint)
         _visionModelName = State(initialValue: vision.modelName ?? "")
-        _behaviorModelName = State(initialValue: behavior.modelName ?? "")
     }
 
     var body: some View {
@@ -114,21 +108,6 @@ struct VisualInteractionSetupView: View {
             }
             .disabled(isLoading || isPulling || selectableVisionModels.isEmpty)
 
-            Divider()
-
-            Toggle("使用行为模型规划自主活动", isOn: $behaviorEnabled)
-                .toggleStyle(.checkbox)
-
-            Picker("行为模型", selection: $behaviorModelName) {
-                if behaviorModelName.isEmpty {
-                    Text("未选择").tag("")
-                }
-                ForEach(selectableBehaviorModels) { model in
-                    Text(modelLabel(model)).tag(model.name)
-                }
-            }
-            .disabled(isLoading || isPulling || selectableBehaviorModels.isEmpty)
-
             if let message {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Label(message, systemImage: messageIcon)
@@ -146,7 +125,7 @@ struct VisualInteractionSetupView: View {
                 }
             } else {
                 Label(
-                    "行为规划只发送性格、心情和语义记忆到本机回环地址",
+                    "视觉互动仅将摄像头理解请求发送到本机 Ollama 回环地址",
                     systemImage: "lock.shield")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -174,22 +153,13 @@ struct VisualInteractionSetupView: View {
         includingCurrent(visionModelName, in: visionModels)
     }
 
-    private var selectableBehaviorModels: [OllamaInstalledModel] {
-        includingCurrent(behaviorModelName, in: installedModels)
-    }
-
     private var canSave: Bool {
         guard !isPulling else { return false }
         guard (try? LocalVLMConfiguration(
             isEnabled: visionEnabled,
             endpoint: endpoint,
-            modelName: visionModelName)) != nil,
-              (try? LocalBehaviorPlannerConfiguration(
-                isEnabled: behaviorEnabled,
-                endpoint: endpoint,
-                modelName: behaviorModelName)) != nil else { return false }
-        return (!visionEnabled || !visionModelName.isEmpty)
-            && (!behaviorEnabled || !behaviorModelName.isEmpty)
+            modelName: visionModelName)) != nil else { return false }
+        return !visionEnabled || !visionModelName.isEmpty
     }
 
     private var normalizedPullModelName: String {
@@ -251,9 +221,6 @@ struct VisualInteractionSetupView: View {
                 message = "Ollama 正在运行，但尚未安装模型"
                 messageTone = .warning
             } else {
-                if behaviorModelName.isEmpty {
-                    behaviorModelName = installedModels[0].name
-                }
                 if visionModelName.isEmpty, let first = visionModels.first {
                     visionModelName = first.name
                 }
@@ -291,9 +258,6 @@ struct VisualInteractionSetupView: View {
                 }
                 try Task.checkCancellation()
                 await refreshModels()
-                if installedModels.contains(where: { $0.name == requestedModel }) {
-                    behaviorModelName = requestedModel
-                }
                 if visionModels.contains(where: { $0.name == requestedModel }) {
                     visionModelName = requestedModel
                 }
@@ -339,9 +303,7 @@ struct VisualInteractionSetupView: View {
             try viewModel.updateLocalIntelligenceConfigurations(
                 endpoint: endpoint,
                 visionEnabled: visionEnabled,
-                visionModelName: visionModelName,
-                behaviorEnabled: behaviorEnabled,
-                behaviorModelName: behaviorModelName)
+                visionModelName: visionModelName)
             onCancel()
         } catch {
             message = error.localizedDescription

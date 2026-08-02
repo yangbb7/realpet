@@ -19,8 +19,13 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="RealPet"
 BUILD_DIR="$SCRIPT_DIR/RealPet/.build/release"
-DIST_DIR="$SCRIPT_DIR/dist"
+# CI/package verification must never replace a developer's existing release
+# bundle. Release builds use dist/ by default; callers can opt into an isolated
+# output directory with REALPET_DIST_DIR.
+DIST_DIR="${REALPET_DIST_DIR:-$SCRIPT_DIR/dist}"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
+SUPABASE_PUBLISHABLE_KEY="${REALPET_SUPABASE_PUBLISHABLE_KEY:-}"
+AGNES_API_KEY="${REALPET_AGNES_API_KEY:-}"
 
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -109,9 +114,34 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
     <string>public.app-category.entertainment</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.realpet.app.auth</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>realpet-auth</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST
+if [ -n "$SUPABASE_PUBLISHABLE_KEY" ]; then
+    plutil -replace RealPetSupabasePublishableKey -string "$SUPABASE_PUBLISHABLE_KEY" \
+        "$APP_BUNDLE/Contents/Info.plist"
+else
+    echo "Error: REALPET_SUPABASE_PUBLISHABLE_KEY is required to bundle Supabase Storage" >&2
+    exit 1
+fi
+if [ -n "$AGNES_API_KEY" ]; then
+    plutil -replace RealPetAgnesAPIKey -string "$AGNES_API_KEY" \
+        "$APP_BUNDLE/Contents/Info.plist"
+else
+    echo "Error: REALPET_AGNES_API_KEY is required to bundle Agnes Video" >&2
+    exit 1
+fi
 
 # --- App icon ---
 cp "$SCRIPT_DIR/assets/icon/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
@@ -128,7 +158,8 @@ rsync -a --exclude '__pycache__' --exclude '*.pyc' \
 rsync -a --exclude '__pycache__' --exclude '*.pyc' \
     "$SCRIPT_DIR/scripts/" "$RES_DIR/scripts/"
 cp "$SCRIPT_DIR/requirements.txt" "$RES_DIR/requirements.txt"
-ok "Bundled Python source (pipeline/, scripts/, requirements.txt)"
+cp "$SCRIPT_DIR/requirements.lock" "$RES_DIR/requirements.lock"
+ok "Bundled Python source and hash-locked requirements"
 
 if [ "$INCLUDE_LEGACY_CUBISM" = "1" ]; then
     # Legacy-only: existing Cubism pets require a locally licensed Web runtime.
@@ -167,28 +198,8 @@ if [ "$STUB_WEIGHTS" = "1" ]; then
     ok "Stub weights created (structural check only, app will NOT run)"
 elif [ ! -d "$WEIGHTS_DIR/sam2" ] || [ ! -d "$WEIGHTS_DIR/hf" ] \
    || [ ! -d "$WEIGHTS_DIR/torch" ]; then
-    echo "--- Bundling model weights (first build, downloads ~1 GB) ---"
-    # 用临时 venv 跑 bundle_weights.py(避免要求 build 机器已装 pip)
-    TMP_VENV=$(mktemp -d)/venv
-    BUILD_PYTHON=""
-    for candidate in python3.12 python3.11 python3.10 python3; do
-        if command -v "$candidate" >/dev/null 2>&1 \
-           && "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
-            BUILD_PYTHON="$candidate"
-            break
-        fi
-    done
-    if [ -z "$BUILD_PYTHON" ]; then
-        echo "Error: Python 3.10+ is required to bundle model weights" >&2
-        exit 1
-    fi
-    "$BUILD_PYTHON" -m venv "$TMP_VENV" >/dev/null
-    "$TMP_VENV/bin/pip" install -q huggingface_hub numpy safetensors
-    REALPET_WEIGHTS_DIR="$WEIGHTS_DIR" \
-        "$TMP_VENV/bin/python" "$SCRIPT_DIR/scripts/bundle_weights.py" \
-        --out "$WEIGHTS_DIR"
-    rm -rf "$(dirname "$TMP_VENV")"
-    ok "Weights bundled"
+    echo "Error: verified model weights are required at $WEIGHTS_DIR; run the locked release-preparation workflow before packaging" >&2
+    exit 1
 else
     ok "Weights already present, skipping"
 fi
@@ -207,27 +218,14 @@ if [ "$STUB_WEIGHTS" != "1" ]; then
             break
         fi
     done
-    MODEL_VENV=""
     if [ -z "$MODEL_PYTHON" ]; then
-        MODEL_VENV=$(mktemp -d)/venv
-        BUILD_PYTHON=""
-        for candidate in python3.12 python3.11 python3.10 python3; do
-            if command -v "$candidate" >/dev/null 2>&1 \
-               && "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
-                BUILD_PYTHON="$candidate"
-                break
-            fi
-        done
-        [ -n "$BUILD_PYTHON" ] || { echo "Error: Python 3.10+ is required" >&2; exit 1; }
-        "$BUILD_PYTHON" -m venv "$MODEL_VENV" >/dev/null
-        "$MODEL_VENV/bin/pip" install -q numpy safetensors
-        MODEL_PYTHON="$MODEL_VENV/bin/python"
+        echo "Error: REALPET_BUILD_PYTHON must point to the hash-locked release environment" >&2
+        exit 1
     fi
     "$MODEL_PYTHON" "$SCRIPT_DIR/scripts/prepare_birefnet_fp16.py" \
         --weights-dir "$WEIGHTS_DIR"
-    if [ -n "$MODEL_VENV" ]; then
-        rm -rf "$(dirname "$MODEL_VENV")"
-    fi
+    "$MODEL_PYTHON" "$SCRIPT_DIR/scripts/verify_release_assets.py" \
+        --weights-dir "$WEIGHTS_DIR"
     ok "BiRefNet FP16 weights are current"
 fi
 
@@ -239,20 +237,18 @@ ok "Bundled release weights ($(du -sh "$APP_BUNDLE/Contents/Resources/weights" |
 # --- Bundle static ffmpeg (NEW v0.2.0) ---
 FFMPEG_DIR="$APP_BUNDLE/Contents/Resources/bin"
 mkdir -p "$FFMPEG_DIR"
-if [ -n "${REALPET_FFMPEG_PATH:-}" ]; then
-    if [ ! -x "$REALPET_FFMPEG_PATH" ]; then
-        echo "Error: REALPET_FFMPEG_PATH is not an executable file" >&2
-        exit 1
-    fi
-    cp "$REALPET_FFMPEG_PATH" "$FFMPEG_DIR/ffmpeg"
-else
-    FFMPEG_TMP=$(mktemp -d)
-    curl -fsSL --connect-timeout 15 --max-time 180 \
-        -o "$FFMPEG_TMP/ffmpeg.zip" \
-        https://evermeet.cx/ffmpeg/getrelease/zip
-    unzip -q "$FFMPEG_TMP/ffmpeg.zip" -d "$FFMPEG_DIR"
-    rm -rf "$FFMPEG_TMP"
+FFMPEG_SOURCE="${REALPET_FFMPEG_PATH:-$SCRIPT_DIR/assets/bin/ffmpeg}"
+FFMPEG_SHA256="${REALPET_FFMPEG_SHA256:-}"
+if [ ! -x "$FFMPEG_SOURCE" ] || [ -z "$FFMPEG_SHA256" ]; then
+    echo "Error: set REALPET_FFMPEG_PATH and REALPET_FFMPEG_SHA256 for the verified release binary" >&2
+    exit 1
 fi
+ACTUAL_FFMPEG_SHA256="$(shasum -a 256 "$FFMPEG_SOURCE" | awk '{print $1}')"
+if [ "$ACTUAL_FFMPEG_SHA256" != "$FFMPEG_SHA256" ]; then
+    echo "Error: ffmpeg SHA-256 does not match REALPET_FFMPEG_SHA256" >&2
+    exit 1
+fi
+cp "$FFMPEG_SOURCE" "$FFMPEG_DIR/ffmpeg"
 chmod +x "$FFMPEG_DIR/ffmpeg"
 "$FFMPEG_DIR/ffmpeg" -version | head -1
 ok "Bundled static ffmpeg"

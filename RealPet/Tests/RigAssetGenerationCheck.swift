@@ -145,26 +145,6 @@ struct RigAssetGenerationCheck {
         precondition(builtBody.contains("5-column by 4-row grid"))
         precondition(builtBody.contains("exactly twenty isolated components"))
         precondition(builtBody.contains("muzzle without nose or mouth; nose"))
-        precondition(
-            PetTemplateSelection.select(
-                detectedClass: "cat", classificationIdentifiers: []) == .cat)
-        precondition(
-            PetTemplateSelection.select(
-                detectedClass: "dog", classificationIdentifiers: ["pug"])
-                == .dogShortSnout)
-        precondition(
-            PetTemplateSelection.select(
-                detectedClass: "dog",
-                classificationIdentifiers: ["golden retriever"])
-                == .dogLongSnout)
-        precondition(
-            PetTemplateSelection.select(
-                detectedClass: "dog", classificationIdentifiers: ["pomeranian"])
-                == .dogLongSnout)
-        precondition(
-            PetTemplateSelection.select(
-                detectedClass: "horse", classificationIdentifiers: []) == nil)
-
         let torsoRequest = try GPTImage2RigAssetGenerator.makeRequest(
             referenceImageURL: reference,
             apiKey: "relay-token",

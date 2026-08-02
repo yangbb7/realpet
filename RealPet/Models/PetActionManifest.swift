@@ -1,12 +1,43 @@
 import Foundation
 
 enum PetAnimationCue: String, Codable, Hashable, Sendable {
+    case cry
+    case angryStomp = "angry_stomp"
+    case roll
+    case stretch
+    case sleepSnore = "sleep_snore"
+    case wave
+    case jumpCheer = "jump_cheer"
+    case puzzledTilt = "puzzled_tilt"
+    case cuddle
+    case startledRetreat = "startled_retreat"
+    case patrolRun = "patrol_run"
+    // Legacy cues remain decodable for pets created before the fixed action kit.
     case react
     case shakeHead = "shake_head"
     case play
     case lieDown = "lie_down"
     case paw
     case eat
+}
+
+/// Single source of truth for direct desktop interactions. The behavior layer
+/// emits these cues and the runtime only plays the cue it receives.
+enum PetInteractionBinding {
+    static let cueByInteraction: [String: PetAnimationCue] = [
+        "user.pet.tap": .lieDown,
+        "user.pet.file_drop.body": .paw,
+        "user.pet.file_drop.head": .eat,
+    ]
+
+    static let fallbackReactionPriority: [PetAnimationCue] = [
+        .cuddle, .wave, .jumpCheer, .cry, .stretch, .roll,
+        .lieDown, .paw, .eat,
+    ]
+
+    static func cue(for interactionKind: String) -> PetAnimationCue? {
+        cueByInteraction[interactionKind]
+    }
 }
 
 struct PetActionCapabilities: Codable, Equatable, Sendable {
@@ -51,6 +82,18 @@ struct PetActionManifest: Codable, Equatable, Sendable {
             case gazeUp = "gaze_up"
             case gazeDown = "gaze_down"
             case gazeOrbit = "gaze_orbit"
+            case cry
+            case angryStomp = "angry_stomp"
+            case roll
+            case stretch
+            case sleepSnore = "sleep_snore"
+            case wave
+            case jumpCheer = "jump_cheer"
+            case puzzledTilt = "puzzled_tilt"
+            case cuddle
+            case startledRetreat = "startled_retreat"
+            case patrolRun = "patrol_run"
+            case custom
 
             var displayName: String {
                 switch self {
@@ -69,7 +112,19 @@ struct PetActionManifest: Codable, Equatable, Sendable {
                 case .gazeRight: return "注视右侧"
                 case .gazeUp: return "注视上方"
                 case .gazeDown: return "注视下方"
-                case .gazeOrbit: return "360° 注视帧库"
+                case .gazeOrbit: return "头眼注视帧库"
+                case .cry: return "委屈哭泣"
+                case .angryStomp: return "生气跺脚"
+                case .roll: return "满地打滚"
+                case .stretch: return "伸懒腰"
+                case .sleepSnore: return "睡觉打呼噜"
+                case .wave: return "招手拜拜"
+                case .jumpCheer: return "跳跃欢呼"
+                case .puzzledTilt: return "疑惑歪头"
+                case .cuddle: return "撒娇求贴贴"
+                case .startledRetreat: return "惊吓后退"
+                case .patrolRun: return "奔跑巡逻"
+                case .custom: return "自定义动作"
                 }
             }
 
@@ -88,7 +143,19 @@ struct PetActionManifest: Codable, Equatable, Sendable {
                 case .gazeRight: return "arrow.right"
                 case .gazeUp: return "arrow.up"
                 case .gazeDown: return "arrow.down"
-                case .gazeOrbit: return "rotate.3d"
+                case .gazeOrbit: return "eye"
+                case .cry: return "cloud.rain"
+                case .angryStomp: return "flame"
+                case .roll: return "arrow.triangle.2.circlepath"
+                case .stretch: return "figure.flexibility"
+                case .sleepSnore: return "moon.zzz"
+                case .wave: return "hand.wave"
+                case .jumpCheer: return "figure.jump"
+                case .puzzledTilt: return "questionmark.circle"
+                case .cuddle: return "heart"
+                case .startledRetreat: return "exclamationmark.triangle"
+                case .patrolRun: return "figure.run"
+                case .custom: return "video"
                 }
             }
 
@@ -104,9 +171,16 @@ struct PetActionManifest: Codable, Equatable, Sendable {
                 .lieDown, .paw, .eat,
             ]
 
-            /// New pets generate this single multi-angle action once. The four
-            /// directional kinds above remain readable for existing pets.
-            static let defaultMouseInteraction: [Kind] = [.gazeOrbit, .play]
+            static let fixedTapActions: [Kind] = [
+                .lieDown, .paw, .eat, .cry, .angryStomp, .roll, .stretch,
+                .sleepSnore, .wave, .jumpCheer, .cuddle,
+            ]
+
+            static let fixedActionKinds: [Kind] = [.gazeOrbit] + fixedTapActions
+
+            var isFixedAction: Bool {
+                Self.fixedActionKinds.contains(self)
+            }
 
             static func gazeAction(
                 horizontalOffset: Double,
@@ -127,6 +201,9 @@ struct PetActionManifest: Codable, Equatable, Sendable {
 
         let id: String
         let kind: Kind
+        /// User-facing name for a captured custom action. Fixed actions retain
+        /// their catalog names when this is absent.
+        let displayNameOverride: String?
         let framesDirectory: String
         let fps: Int
         let loop: Bool
@@ -139,6 +216,7 @@ struct PetActionManifest: Codable, Equatable, Sendable {
         init(
             id: String,
             kind: Kind,
+            displayNameOverride: String? = nil,
             framesDirectory: String,
             fps: Int,
             loop: Bool,
@@ -147,12 +225,21 @@ struct PetActionManifest: Codable, Equatable, Sendable {
         ) {
             self.id = id
             self.kind = kind
+            self.displayNameOverride = displayNameOverride
             self.framesDirectory = framesDirectory
             self.fps = fps
             self.loop = loop
             self.translatesWindow = translatesWindow
             self.origin = origin
         }
+
+        var displayName: String {
+            let name = displayNameOverride?.trimmingCharacters(
+                in: .whitespacesAndNewlines) ?? ""
+            return name.isEmpty ? kind.displayName : name
+        }
+
+        var isCustom: Bool { kind == .custom }
     }
 
     static let currentVersion = 1
@@ -179,8 +266,7 @@ struct PetActionManifest: Codable, Equatable, Sendable {
                     && $0.translatesWindow
             },
             reaction: actions.contains {
-                ($0.kind == .react || $0.kind == .shakeHead || $0.kind == .play
-                    || $0.kind == .lieDown || $0.kind == .paw || $0.kind == .eat)
+                Action.Kind.fixedTapActions.contains($0.kind)
             },
             orientation: installedKinds.contains(.gazeOrbit)
                 || Action.Kind.gazeCapture.allSatisfy(installedKinds.contains))
@@ -196,22 +282,6 @@ struct PetActionManifest: Codable, Equatable, Sendable {
 
     var isFidelityResponsePackReady: Bool {
         missingFidelityResponseKinds.isEmpty
-    }
-
-    func supports(animation: PetAnimationCue?) -> Bool {
-        guard let animation else { return capabilities.reaction }
-        let kind: Action.Kind
-        switch animation {
-        case .react: kind = .react
-        case .shakeHead: kind = .shakeHead
-        case .play: kind = .play
-        case .lieDown: kind = .lieDown
-        case .paw: kind = .paw
-        case .eat: kind = .eat
-        }
-        return actions.contains {
-            $0.kind == kind
-        }
     }
 
     static func load(framesDirectory: String) -> PetActionManifest? {
@@ -231,6 +301,8 @@ struct PetActionManifest: Codable, Equatable, Sendable {
         relativeFramesDirectory: String,
         fps: Int,
         origin: Action.Origin = .captured,
+        actionID: String? = nil,
+        displayNameOverride: String? = nil,
         in existing: PetActionManifest?
     ) -> PetActionManifest {
         let idle = Action(
@@ -241,12 +313,12 @@ struct PetActionManifest: Codable, Equatable, Sendable {
             actions.insert(idle, at: 0)
         }
         let action = Action(
-            id: kind.rawValue,
+            id: actionID ?? kind.rawValue,
             kind: kind,
+            displayNameOverride: displayNameOverride,
             framesDirectory: relativeFramesDirectory,
             fps: fps,
-            loop: !([.react, .shakeHead, .play, .lieDown, .paw, .eat, .gazeOrbit]
-                + Action.Kind.gazeCapture).contains(kind),
+            loop: kind == .idle,
             translatesWindow: kind.translatesWindow,
             origin: origin)
         if let index = actions.firstIndex(where: { $0.id == action.id }) {

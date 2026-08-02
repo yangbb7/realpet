@@ -7,7 +7,7 @@ import AppKit
 /// cannot be shipped inside the .app (PyTorch dylib signing + AGPL risks).
 /// Instead, on first launch we guide the user to install Python via Homebrew
 /// (one copy-paste command, no sudo on Apple Silicon) and then automatically
-/// create the venv, install pip dependencies, install SAM2, and write a marker
+/// create the venv, install a hash-locked dependency set, and write a marker
 /// file so subsequent launches skip this step.
 // Background setup only performs process and file work; every UI mutation is
 // dispatched to the main queue by the helpers below.
@@ -21,7 +21,6 @@ final class SetupWizard: NSObject, ObservableObject, @unchecked Sendable {
         case checking = "Checking Python…"
         case createVenv = "Creating virtual environment…"
         case pipInstall = "Installing dependencies…"
-        case sam2Install = "Installing SAM2…"
         case verifying = "Verifying…"
         case done = "Ready"
         case failed = "Setup failed"
@@ -117,7 +116,7 @@ final class SetupWizard: NSObject, ObservableObject, @unchecked Sendable {
     private func performSteps() {
         setStage(.checking)
 
-        // 1. Find Python 3.10+
+        // 1. Find a Python version covered by the hash lock.
         guard let python = findPython() else {
             abort(missingPythonMessage())
             return
@@ -151,19 +150,11 @@ final class SetupWizard: NSObject, ObservableObject, @unchecked Sendable {
         let pip = venvDir.appendingPathComponent("bin/pip").path
         if !runTask(label: "pip install requirements",
                     executable: URL(fileURLWithPath: pip),
-                    arguments: ["install", "-r", requirementsURL.path]) {
+                    arguments: ["install", "--require-hashes", "-r", requirementsURL.path]) {
             return
         }
 
-        // 4. Install SAM2
-        setStage(.sam2Install)
-        if !runTask(label: "pip install sam2",
-                    executable: URL(fileURLWithPath: pip),
-                    arguments: ["install", "sam2"]) {
-            return
-        }
-
-        // 5. Verify imports
+        // 4. Verify imports
         setStage(.verifying)
         let verifyScript = """
         import torch, sam2
@@ -176,7 +167,7 @@ final class SetupWizard: NSObject, ObservableObject, @unchecked Sendable {
             return
         }
 
-        // 6. Persist marker
+        // 5. Persist marker
         do {
             try FileManager.default.createDirectory(at: Self.appSupportURL(),
                                                     withIntermediateDirectories: true)
@@ -233,7 +224,7 @@ final class SetupWizard: NSObject, ObservableObject, @unchecked Sendable {
             guard components.count >= 2 else { return false }
             let major = components[0]
             let minor = components[1]
-            return major > 3 || (major == 3 && minor >= 10)
+            return major == 3 && (10...12).contains(minor)
         } catch {
             return false
         }
@@ -244,7 +235,7 @@ final class SetupWizard: NSObject, ObservableObject, @unchecked Sendable {
             || FileManager.default.isExecutableFile(atPath: "/usr/local/bin/brew")
         if brewInstalled {
             return """
-            RealPet needs Python 3.10+ to run the AI pipeline.
+            RealPet needs Python 3.10–3.12 to run the AI pipeline.
             Open Terminal and paste (no sudo needed on Apple Silicon):
 
               brew install python@3.12
@@ -253,7 +244,7 @@ final class SetupWizard: NSObject, ObservableObject, @unchecked Sendable {
             """
         } else {
             return """
-            RealPet needs Python 3.10+ to run the AI pipeline.
+            RealPet needs Python 3.10–3.12 to run the AI pipeline.
             Homebrew was not detected. Install it first:
 
               /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"

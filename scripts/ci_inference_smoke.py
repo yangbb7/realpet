@@ -13,11 +13,16 @@ It exits 0 on success and 1 on failure.
 import os
 import sys
 import time
+from pathlib import Path
 
 import torch
 import torchvision
 from PIL import Image
 from transformers import AutoModelForImageSegmentation
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from pipeline.model_paths import birefnet_checkpoint, weights_dir  # noqa: E402
 
 
 def _device():
@@ -32,9 +37,12 @@ def _device():
 
 
 def smoke_birefnet(device):
-    print("Loading BiRefNet-matting...")
+    checkpoint = Path(birefnet_checkpoint(PROJECT_ROOT))
+    if not checkpoint.is_dir():
+        raise FileNotFoundError(f"Pinned BiRefNet checkpoint missing: {checkpoint}")
+    print(f"Loading BiRefNet-matting from {checkpoint}...")
     model = AutoModelForImageSegmentation.from_pretrained(
-        "ZhengPeng7/BiRefNet-matting", trust_remote_code=True
+        checkpoint, trust_remote_code=True
     )
     model.to(device)
     model.eval()
@@ -60,7 +68,11 @@ def smoke_birefnet(device):
 
 
 def smoke_faster_rcnn(device):
-    print("Loading Faster R-CNN...")
+    checkpoint = (Path(weights_dir(PROJECT_ROOT)) / "torch" / "hub" / "checkpoints"
+                  / "fasterrcnn_resnet50_fpn_v2_coco-dd69338a.pth")
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Pinned Faster R-CNN checkpoint missing: {checkpoint}")
+    print(f"Loading Faster R-CNN from {checkpoint}...")
     model = torchvision.models.detection.fasterrcnn_resnet50_fpn_v2(
         weights=torchvision.models.detection.FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
     )

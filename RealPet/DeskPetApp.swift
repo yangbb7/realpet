@@ -6,10 +6,8 @@ import SwiftUI
 struct RealPetMain {
     static func main() {
         if provisionImageServiceCredentialFromStandardInput() { return }
-        if provisionAgnesServiceCredentialFromStandardInput() { return }
+        if rejectDeprecatedAgnesCredentialCommands() { return }
         if provisionMiniMaxServiceCredentialFromStandardInput() { return }
-        if provisionMotionServiceCredentialFromStandardInput() { return }
-        if configureAgnesMotionServiceFromCommandLine() { return }
         if configureMiniMaxMotionServiceFromCommandLine() { return }
         if exportOriginalRigAtlasFromCommandLine() { return }
         if exportOriginalRigTorsoFromCommandLine() { return }
@@ -42,46 +40,17 @@ struct RealPetMain {
         return true
     }
 
-    private static func provisionMotionServiceCredentialFromStandardInput() -> Bool {
-        guard CommandLine.arguments.contains(
-            "--provision-motion-service-credential") else { return false }
-        guard let input = readLine(strippingNewline: true) else {
-            fputs("RealPet: missing motion service credential on stdin\n", stderr)
-            exit(EXIT_FAILURE)
+    private static func rejectDeprecatedAgnesCredentialCommands() -> Bool {
+        let deprecatedFlags: Set<String> = [
+            "--provision-motion-service-credential",
+            "--provision-agnes-service-credential",
+            "--configure-agnes-motion-service",
+        ]
+        guard CommandLine.arguments.contains(where: deprecatedFlags.contains) else {
+            return false
         }
-        let key = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else {
-            fputs("RealPet: motion service credential is empty\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        do {
-            try OpenAIAPIKeyStore.saveMotionService(key)
-        } catch {
-            fputs("RealPet: failed to provision motion service credential\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        return true
-    }
-
-    private static func provisionAgnesServiceCredentialFromStandardInput() -> Bool {
-        guard CommandLine.arguments.contains(
-            "--provision-agnes-service-credential") else { return false }
-        guard let input = readLine(strippingNewline: true) else {
-            fputs("RealPet: missing Agnes service credential on stdin\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        let key = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else {
-            fputs("RealPet: Agnes service credential is empty\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        do {
-            try OpenAIAPIKeyStore.saveAgnesMotionService(key)
-        } catch {
-            fputs("RealPet: failed to provision Agnes service credential\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        return true
+        fputs("RealPet: Agnes credential and endpoint are bundled at build time\n", stderr)
+        exit(EXIT_FAILURE)
     }
 
     private static func provisionMiniMaxServiceCredentialFromStandardInput() -> Bool {
@@ -105,50 +74,42 @@ struct RealPetMain {
         return true
     }
 
-    private static func configureAgnesMotionServiceFromCommandLine() -> Bool {
-        guard let flagIndex = CommandLine.arguments.firstIndex(
-            of: "--configure-agnes-motion-service") else { return false }
-        let values = Array(CommandLine.arguments.dropFirst(flagIndex + 1))
-        guard values.count == 4, let seconds = Int(values[2]) else {
-            fputs(
-                "RealPet: expected Agnes Base URL, image model, seconds, and size\n",
-                stderr)
-            exit(EXIT_FAILURE)
-        }
-        let current = MotionServiceConfigurationStore.load()
-        do {
-            let configuration = try MotionServiceConfiguration(
-                agnesBaseURLString: values[0],
-                imageModel: values[1],
-                miniMaxBaseURLString: current.resolvedMiniMaxBaseURLString,
-                videoModel: current.videoModel,
-                seconds: seconds,
-                size: values[3]).validated()
-            MotionServiceConfigurationStore.save(configuration)
-        } catch {
-            fputs("RealPet: invalid Agnes motion service configuration\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        return true
-    }
-
     private static func configureMiniMaxMotionServiceFromCommandLine() -> Bool {
         guard let flagIndex = CommandLine.arguments.firstIndex(
             of: "--configure-minimax-motion-service") else { return false }
         let values = Array(CommandLine.arguments.dropFirst(flagIndex + 1))
-        guard values.count == 3, let seconds = Int(values[2]) else {
+        let miniMaxBaseURL: String
+        let seconds: Int
+        switch values.count {
+        case 2:
+            miniMaxBaseURL = values[0]
+            guard let parsedSeconds = Int(values[1]) else {
+                fputs("RealPet: invalid MiniMax motion duration\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+            seconds = parsedSeconds
+        case 3:
+            // Compatibility with the former Base URL, model, seconds syntax.
+            miniMaxBaseURL = values[0]
+            guard values[1] == MotionVideoProvider.miniMaxH3.modelName,
+                  let parsedSeconds = Int(values[2]) else {
+                fputs("RealPet: invalid MiniMax motion configuration\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+            seconds = parsedSeconds
+        default:
             fputs(
-                "RealPet: expected MiniMax Base URL, video model, and seconds\n",
+                "RealPet: expected MiniMax Base URL and seconds\n",
                 stderr)
             exit(EXIT_FAILURE)
         }
-        let current = MotionServiceConfigurationStore.load()
         do {
+            let current = MotionServiceConfigurationStore.load()
             let configuration = try MotionServiceConfiguration(
+                provider: .miniMaxH3,
                 agnesBaseURLString: current.resolvedAgnesBaseURLString,
-                imageModel: current.imageModel,
-                miniMaxBaseURLString: values[0],
-                videoModel: values[1],
+                miniMaxBaseURLString: miniMaxBaseURL,
+                videoModel: MotionVideoProvider.miniMaxH3.modelName,
                 seconds: seconds,
                 size: current.size).validated()
             MotionServiceConfigurationStore.save(configuration)
@@ -246,12 +207,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // 创建主窗口
         let contentView = NSHostingController(
-            rootView: MainPanelView(bridge: vm.pythonBridge)
+            rootView: RealPetRootView(bridge: vm.pythonBridge)
                 .environmentObject(vm)
         )
 
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 320, height: 460),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 540),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -264,8 +225,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.contentViewController = contentView
-        window.contentMinSize = NSSize(width: 320, height: 260)
-        window.setContentSize(NSSize(width: 320, height: 300))
+        window.contentMinSize = NSSize(width: 560, height: 360)
+        window.setContentSize(NSSize(width: 560, height: 540))
         window.title = "RealPet"
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -282,35 +243,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             button.target = self
         }
 
-        // Size the window for each interactive state. The ScrollView remains as
-        // a fallback on smaller screens or when many pets are listed.
+        // The four-column action grid fits in a compact default window. A
+        // processing state gets a little extra vertical space for its status.
         vm.pythonBridge.$isProcessing
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] isProcessing in
-                guard let self = self else { return }
-                let visibleHeight = self.window.screen?.visibleFrame.height
-                    ?? NSScreen.main?.visibleFrame.height ?? 730
-                let size = MainWindowLayout.contentSize(
-                    hasClipSelection: false,
-                    hasDetection: false,
-                    isProcessing: isProcessing,
-                    visibleHeight: visibleHeight)
-                self.window.setContentSize(size)
-                self.window.center()  // re-center after resize
+            .sink { [weak self] _ in
+                self?.resizeActionConsole()
             }
             .store(in: &cancellables)
+        vm.$pets
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.resizeActionConsole() }
+            .store(in: &cancellables)
+        vm.$motionComposerPet
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.resizeActionConsole() }
+            .store(in: &cancellables)
+        SupabaseGoogleLoginCoordinator.shared.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.resizeActionConsole() }
+            .store(in: &cancellables)
+        resizeActionConsole()
 
         #if DEBUG
         if ProcessInfo.processInfo.environment["REALPET_UI_TEST_VLM_SETUP"] == "1" {
             DispatchQueue.main.async { [weak self] in
                 self?.vm.showVisionModelSetup = true
-            }
-        }
-        if ProcessInfo.processInfo.environment[
-            "REALPET_UI_TEST_PERSONALITY_SETUP"] == "1",
-           let pet = vm.pets.first {
-            DispatchQueue.main.async { [weak self] in
-                self?.vm.presentPersonalityEditor(for: pet)
             }
         }
         if ProcessInfo.processInfo.environment["REALPET_UI_TEST_SHOW_FIRST_PET"] == "1",
@@ -322,9 +280,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if ProcessInfo.processInfo.environment["REALPET_UI_TEST_MOTION_STUDIO"] == "1",
            let pet = vm.pets.first {
             DispatchQueue.main.async { [weak self] in
-                // Screenshot automation exercises the sheet layout without
-                // issuing a network request or changing owner data.
-                self?.vm.motionStudioPet = pet
+                // Screenshot automation exercises the inline action composer
+                // without issuing a network request or changing owner data.
+                self?.vm.presentMotionComposer(for: pet)
             }
         }
         if let screenshotPath = ProcessInfo.processInfo.environment[
@@ -356,6 +314,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         #endif
+    }
+
+    @MainActor
+    private func resizeActionConsole() {
+        guard let window, let vm else { return }
+        // Pet visibility and scale updates publish through `vm.$pets`. Keep
+        // the console where the owner put it while its content height changes.
+        let origin = window.frame.origin
+        let visibleHeight = window.screen?.visibleFrame.height
+            ?? NSScreen.main?.visibleFrame.height ?? 820
+        let desiredHeight: CGFloat
+        if !SupabaseGoogleLoginCoordinator.shared.state.isSignedIn {
+            desiredHeight = 360
+        } else if vm.motionComposerPet != nil {
+            desiredHeight = 720
+        } else if vm.pet != nil {
+            desiredHeight = vm.pythonBridge.isProcessing ? 600 : 540
+        } else {
+            desiredHeight = vm.pythonBridge.isProcessing ? 460 : 390
+        }
+        let height = min(desiredHeight, max(360, visibleHeight - 80))
+        window.setContentSize(NSSize(width: 560, height: height))
+        window.setFrameOrigin(origin)
     }
 
     @MainActor

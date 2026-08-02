@@ -10,10 +10,77 @@ import numpy as np
 from PIL import Image
 
 
-GAZE_KINDS = {"gaze_left", "gaze_right", "gaze_up", "gaze_down"}
+GAZE_KINDS = {
+    "gaze_left", "gaze_right", "gaze_up", "gaze_down", "gaze_orbit",
+}
 IDENTITY_SAMPLE_COUNT = 10
 IDENTITY_HISTOGRAM_BINS = (12, 8)
 IDENTITY_MIN_SIMILARITY = 0.52
+
+
+def _fixed_action_evidence(kind, metrics, generic_reaction):
+    """Check the visible signal expected from each supported fixed action.
+
+    These are deliberately evidence gates, not a claim that pixels alone can
+    prove an animal's intent. Owner preview remains mandatory before install.
+    """
+    head_motion = max(
+        metrics["head_horizontal_span"], metrics["head_vertical_span"])
+    upper_activity = (
+        metrics["median_upper_change"] >= 0.009
+        or metrics["active_upper_ratio"] >= 0.24
+        or metrics["median_upper_rgb"] >= 0.007
+    )
+    lower_activity = (
+        metrics["median_lower_change"] >= 0.009
+        or metrics["active_lower_ratio"] >= 0.24
+        or metrics["median_lower_rgb"] >= 0.007
+    )
+    body_repositioned = (
+        metrics["vertical_centroid_span"] >= 0.028
+        or metrics["foreground_area_span"] >= 0.055
+        or metrics["median_full_change"] >= 0.014
+    )
+
+    if kind == "lie_down":
+        passed = generic_reaction and body_repositioned and lower_activity
+        return passed, "lie_down_motion_evidence", (
+            "未检测到从站立到躺倒的躯干和四肢变化")
+    if kind == "paw":
+        passed = generic_reaction and lower_activity
+        return passed, "paw_motion_evidence", "未检测到前肢扒拉的连续运动"
+    if kind == "eat":
+        passed = generic_reaction and (head_motion >= 0.012 or upper_activity)
+        return passed, "eat_motion_evidence", "未检测到头部或嘴部区域的进食运动"
+    if kind == "cry":
+        passed = generic_reaction and (head_motion >= 0.012 or upper_activity)
+        return passed, "cry_motion_evidence", "未检测到哭泣时的头部或上半身反应"
+    if kind == "angry_stomp":
+        passed = generic_reaction and lower_activity and metrics["active_lower_ratio"] >= 0.28
+        return passed, "stomp_motion_evidence", "未检测到连续跺脚的下肢运动"
+    if kind == "roll":
+        passed = generic_reaction and body_repositioned
+        return passed, "roll_motion_evidence", "未检测到翻滚引起的明显躯干姿态变化"
+    if kind == "stretch":
+        passed = generic_reaction and (body_repositioned or lower_activity)
+        return passed, "stretch_motion_evidence", "未检测到伸展引起的躯干或四肢变化"
+    if kind == "sleep_snore":
+        subtle_breathing = (
+            metrics["peak_full_change"] >= 0.005
+            and metrics["active_full_ratio"] >= 0.12
+        )
+        passed = subtle_breathing
+        return passed, "sleep_motion_evidence", "未检测到连续呼吸或轻微睡眠动作"
+    if kind == "wave":
+        passed = generic_reaction and (upper_activity or lower_activity)
+        return passed, "wave_motion_evidence", "未检测到抬爪招手的肢体运动"
+    if kind == "jump_cheer":
+        passed = generic_reaction and metrics["vertical_centroid_span"] >= 0.040
+        return passed, "jump_motion_evidence", "未检测到跳跃带来的垂直位移"
+    if kind == "cuddle":
+        passed = generic_reaction and (head_motion >= 0.010 or upper_activity)
+        return passed, "cuddle_motion_evidence", "未检测到撒娇贴贴的头部或上半身反应"
+    return None
 
 
 def _frame_paths(frames_dir, max_frames=60):
@@ -105,9 +172,12 @@ def analyze_action_frames(
 
     lower_changes = []
     lower_rgb_motion = []
+    upper_changes = []
+    upper_rgb_motion = []
     full_changes = []
     centroids = []
     lower_centroids = []
+    foreground_areas = []
     relative_head_x = []
     relative_head_y = []
     kernel = np.ones((3, 3), np.uint8)
@@ -117,6 +187,7 @@ def analyze_action_frames(
             float(coords[1].mean()) if len(coords[1]) else 0.0,
             float(coords[0].mean()) if len(coords[0]) else 0.0,
         ))
+        foreground_areas.append(float(len(coords[0])))
         lower_centroids.append(_lower_body_centroid(mask))
         upper = _upper_body_centroid(mask)
         relative_head_x.append(upper[0] - lower_centroids[-1][0])
@@ -143,6 +214,8 @@ def analyze_action_frames(
             full_changes.append(0.0)
             lower_changes.append(0.0)
             lower_rgb_motion.append(0.0)
+            upper_changes.append(0.0)
+            upper_rgb_motion.append(0.0)
             continue
         px0, px1 = int(pair_xs.min()), int(pair_xs.max()) + 1
         py0, py1 = int(pair_ys.min()), int(pair_ys.max()) + 1
@@ -170,9 +243,30 @@ def analyze_action_frames(
             np.logical_and(interior, color_delta > 18).sum()
             / max(1, interior.sum())))
 
+        upper_y = py0 + int((py1 - py0) * 0.50)
+        previous_upper = previous_full[py0:upper_y, px0:px1]
+        current_upper = current_aligned[py0:upper_y, px0:px1]
+        upper_changed = np.logical_xor(previous_upper, current_upper).sum()
+        upper_occupied = np.logical_or(previous_upper, current_upper).sum()
+        upper_changes.append(float(upper_changed / max(1, upper_occupied)))
+        upper_interior = cv2.erode(
+            np.logical_and(previous_upper, current_upper).astype(np.uint8),
+            kernel, iterations=1).astype(bool)
+        previous_upper_rgb = frames[index - 1][0][py0:upper_y, px0:px1]
+        current_upper_rgb = current_rgb_aligned[py0:upper_y, px0:px1]
+        upper_color_delta = np.abs(
+            current_upper_rgb.astype(np.int16)
+            - previous_upper_rgb.astype(np.int16)).mean(axis=2)
+        upper_rgb_motion.append(float(
+            np.logical_and(upper_interior, upper_color_delta > 18).sum()
+            / max(1, upper_interior.sum())))
+
     median_lower_change = float(np.median(lower_changes))
     active_lower_ratio = float(np.mean(np.array(lower_changes) >= 0.012))
     median_lower_rgb = float(np.median(lower_rgb_motion))
+    median_upper_change = float(np.median(upper_changes))
+    active_upper_ratio = float(np.mean(np.array(upper_changes) >= 0.012))
+    median_upper_rgb = float(np.median(upper_rgb_motion))
     median_full_change = float(np.median(full_changes))
     active_full_ratio = float(np.mean(np.array(full_changes) >= 0.008))
     peak_full_change = float(np.max(full_changes))
@@ -183,6 +277,12 @@ def analyze_action_frames(
     centroid_span = float(
         (max(point[0] for point in centroids)
          - min(point[0] for point in centroids)) / bbox_width)
+    vertical_centroid_span = float(
+        (max(point[1] for point in centroids)
+         - min(point[1] for point in centroids)) / bbox_width)
+    foreground_area_span = float(
+        (max(foreground_areas) - min(foreground_areas))
+        / max(1.0, max(foreground_areas)))
     head_horizontal_span = float(
         (max(relative_head_x) - min(relative_head_x)) / bbox_width)
     head_vertical_span = float(
@@ -243,6 +343,31 @@ def analyze_action_frames(
             message = ("动作验证通过" if passed else
                        "未检测到躯干或四肢参与，请使用玩耍动作明显的视频")
             reason = None if passed else "no_play_evidence"
+        elif kind in {
+                "lie_down", "paw", "eat", "cry", "angry_stomp", "roll",
+                "stretch", "sleep_snore", "wave", "jump_cheer", "cuddle"}:
+            passed, evidence_reason, failure_message = _fixed_action_evidence(
+                kind,
+                {
+                    "median_lower_change": median_lower_change,
+                    "active_lower_ratio": active_lower_ratio,
+                    "median_lower_rgb": median_lower_rgb,
+                    "median_upper_change": median_upper_change,
+                    "active_upper_ratio": active_upper_ratio,
+                    "median_upper_rgb": median_upper_rgb,
+                    "median_full_change": median_full_change,
+                    "active_full_ratio": active_full_ratio,
+                    "peak_full_change": peak_full_change,
+                    "vertical_centroid_span": vertical_centroid_span,
+                    "foreground_area_span": foreground_area_span,
+                    "head_horizontal_span": head_horizontal_span,
+                    "head_vertical_span": head_vertical_span,
+                },
+                generic_reaction)
+            message = (
+                "检测到该动作的可观测运动证据，请在预览中确认语义"
+                if passed else failure_message)
+            reason = None if passed else evidence_reason
         else:
             passed = generic_reaction
             message = ("动作验证通过" if passed else
@@ -259,6 +384,9 @@ def analyze_action_frames(
             "median_lower_change": median_lower_change,
             "active_lower_ratio": active_lower_ratio,
             "median_lower_rgb": median_lower_rgb,
+            "median_upper_change": median_upper_change,
+            "active_upper_ratio": active_upper_ratio,
+            "median_upper_rgb": median_upper_rgb,
             "median_full_change": median_full_change,
             "active_full_ratio": active_full_ratio,
             "peak_full_change": peak_full_change,
@@ -266,6 +394,8 @@ def analyze_action_frames(
             "active_third_mean": active_third_mean,
             "burst_contrast": burst_contrast,
             "centroid_span": centroid_span,
+            "vertical_centroid_span": vertical_centroid_span,
+            "foreground_area_span": foreground_area_span,
             "head_horizontal_span": head_horizontal_span,
             "head_vertical_span": head_vertical_span,
             "head_direction_reversals": head_direction_reversals,
@@ -358,11 +488,12 @@ def validate_response_candidate(
     result = analyze_action_frames(frames_dir, kind, max_frames=max_frames)
     identity = compare_foreground_identity(reference_frames_dir, frames_dir)
     result["identity"] = identity
+    result["semantic_review_required"] = True
     result.setdefault("metrics", {})["identity_similarity"] = identity["similarity"]
     if not identity["passed"]:
         result["passed"] = False
         result["reason"] = identity["reason"]
         result["message"] = "素材外观与待机宠物差异过大，请确认使用同一只宠物的视频"
     elif result["passed"]:
-        result["message"] = "动作与实拍外观连续性验证通过，请在预览中确认"
+        result["message"] = "动作运动证据与实拍外观连续性通过，请在预览中确认动作语义"
     return result

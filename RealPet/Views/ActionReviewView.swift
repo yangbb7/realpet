@@ -10,10 +10,13 @@ struct ActionReviewView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(review.origin == .generated ? "确认生成动作" : "确认实拍响应")
+                Text(review.origin == .generated ? "确认生成动作" : "确认自定义动作")
                     .font(.title3.weight(.semibold))
-                Text(review.kind.displayName)
+                Text(review.displayName)
                     .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Text("确认预览中的宠物动作确实为「\(review.displayName)」后再安装")
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             }
 
@@ -36,7 +39,7 @@ struct ActionReviewView: View {
             HStack {
                 Button("丢弃", role: .cancel, action: onDiscard)
                 Spacer()
-                Button("安装动作", action: onAccept)
+                Button("确认语义并安装", action: onAccept)
                     .keyboardShortcut(.defaultAction)
             }
         }

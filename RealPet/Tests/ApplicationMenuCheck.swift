@@ -19,16 +19,7 @@ struct ApplicationMenuCheck {
         assertCommand(in: editMenu, title: "粘贴", key: "v", action: #selector(NSText.paste(_:)))
         assertCommand(in: editMenu, title: "全选", key: "a", action: #selector(NSText.selectAll(_:)))
 
-        let pasteboard = NSPasteboard.withUniqueName()
-        defer { pasteboard.releaseGlobally() }
-        pasteboard.clearContents()
-        pasteboard.setString("  relay-api-token\n", forType: .string)
-        precondition(
-            ClipboardTextReader.trimmedString(from: pasteboard) == "relay-api-token")
-
-        pasteboard.clearContents()
-        precondition(ClipboardTextReader.trimmedString(from: pasteboard) == nil)
-        print("Application menu and clipboard checks passed")
+        print("Application menu checks passed")
     }
 
     private static func assertCommand(

@@ -38,7 +38,7 @@ struct SourceFrameSequence: Equatable {
             return SourceFrameSequence(
                 root: root,
                 frames: pngs.map { Frame(rgbURL: $0, alphaURL: nil) },
-                fps: max(1, min(60, fps)),
+                fps: max(1, fps),
                 loop: true)
         }
 
@@ -58,7 +58,7 @@ struct SourceFrameSequence: Equatable {
         }
         guard !frames.isEmpty else { throw FrameSequenceRuntimeError.noFrames(root) }
         return SourceFrameSequence(
-            root: root, frames: frames, fps: max(1, min(60, fps)), loop: true)
+            root: root, frames: frames, fps: max(1, fps), loop: true)
     }
 
     func with(loop: Bool) -> SourceFrameSequence {
@@ -66,16 +66,80 @@ struct SourceFrameSequence: Equatable {
     }
 }
 
-/// Maps a pointer angle to a stable frame inside a generated 360-degree orbit.
-/// The opening and closing holds are excluded so both resolve to the same
-/// front-facing frame instead of being mistaken for intermediate viewpoints.
-enum OrbitFrameSelector {
+/// A stable rendered frame together with the sequence that owns it. Keeping
+/// both values is essential when a separate playback sequence changes.
+struct SourceFrameHold: Equatable {
+    let sequence: SourceFrameSequence
+    let index: Int
+
+    init(sequence: SourceFrameSequence, index: Int) {
+        self.sequence = sequence
+        self.index = min(max(0, index), sequence.frames.count - 1)
+    }
+
+    var frame: SourceFrameSequence.Frame {
+        sequence.frames[index]
+    }
+}
+
+/// Anchors a drag in global screen coordinates. Window-local coordinates are
+/// invalid after the window itself moves and cause the desktop pet to bounce
+/// back toward its starting point on successive drag events.
+struct PetWindowDragAnchor: Equatable {
+    let pointerAtStart: NSPoint
+    let windowOriginAtStart: NSPoint
+
+    func windowOrigin(for pointer: NSPoint) -> NSPoint {
+        NSPoint(
+            x: windowOriginAtStart.x + pointer.x - pointerAtStart.x,
+            y: windowOriginAtStart.y + pointer.y - pointerAtStart.y)
+    }
+
+    func isTap(at pointer: NSPoint, threshold: CGFloat = 4) -> Bool {
+        hypot(pointer.x - pointerAtStart.x, pointer.y - pointerAtStart.y) < threshold
+    }
+}
+
+enum FrameSequencePresentationGate {
+    static func allowsFrameOrPointerUpdate(
+        paused: Bool,
+        isDragging: Bool,
+        awaitingImageDecode: Bool = false
+    ) -> Bool {
+        !paused && !isDragging && !awaitingImageDecode
+    }
+}
+
+enum PetWindowPlacement {
+    static func origin(
+        preferred: CGPoint?,
+        size: NSSize,
+        visibleFrame: NSRect
+    ) -> NSPoint {
+        guard let preferred else {
+            return NSPoint(
+                x: visibleFrame.midX - size.width / 2,
+                y: visibleFrame.midY - size.height / 2)
+        }
+        let maxX = max(visibleFrame.minX, visibleFrame.maxX - size.width)
+        let maxY = max(visibleFrame.minY, visibleFrame.maxY - size.height)
+        return NSPoint(
+            x: min(max(visibleFrame.minX, preferred.x), maxX),
+            y: min(max(visibleFrame.minY, preferred.y), maxY))
+    }
+}
+
+/// Maps a pointer angle to a stable frame inside a generated head-gaze sweep.
+/// Every generated frame remains reachable; no leading or trailing portion is
+/// discarded at playback time.
+enum GazeSweepFrameSelector {
     static func index(
         frameCount: Int,
         horizontalOffset: Double,
         verticalOffset: Double,
         deadZone: Double = 0.16,
-        edgeHoldFraction: Double = 0.12
+        leadingHoldFraction: Double = 0,
+        trailingHoldFraction: Double = 0
     ) -> Int? {
         guard frameCount > 0,
               hypot(horizontalOffset, verticalOffset) >= deadZone else { return nil }
@@ -85,12 +149,35 @@ enum OrbitFrameSelector {
         let maxIndex = frameCount - 1
         let firstOrbitIndex = min(
             maxIndex,
-            max(0, Int((Double(maxIndex) * edgeHoldFraction).rounded())))
+            max(0, Int((Double(maxIndex) * leadingHoldFraction).rounded())))
         let lastOrbitIndex = max(
             firstOrbitIndex,
-            min(maxIndex, maxIndex - firstOrbitIndex))
+            min(maxIndex, maxIndex - Int((Double(maxIndex) * trailingHoldFraction).rounded())))
         return Int((Double(firstOrbitIndex)
             + Double(lastOrbitIndex - firstOrbitIndex) * progress).rounded())
+    }
+}
+
+/// Converts a behavioral spatial target back into the same local coordinate
+/// system used by raw desktop pointer sampling.
+enum FrameSequenceGazeTargetMapper {
+    static func offset(
+        for target: SpatialContext,
+        windowFrame: NSRect,
+        visibleFrame: NSRect
+    ) -> CGPoint? {
+        switch target.space {
+        case .petLocalNormalized:
+            return CGPoint(x: (target.x - 0.5) * 2, y: (target.y - 0.5) * 2)
+        case .screenNormalized:
+            return CGPoint(
+                x: ((target.x * visibleFrame.width + visibleFrame.minX)
+                    - windowFrame.midX) / max(180, windowFrame.width * 1.2),
+                y: ((target.y * visibleFrame.height + visibleFrame.minY)
+                    - windowFrame.midY) / max(180, windowFrame.height * 1.2))
+        case .cameraNormalized:
+            return nil
+        }
     }
 }
 
@@ -102,18 +189,59 @@ enum SourceFrameActionResolver {
     ) -> SourceFrameSequence? {
         guard let cue,
               let manifest = PetActionManifest.load(
-                framesDirectory: framesDirectory.path) else { return nil }
-        let kind: PetActionManifest.Action.Kind
-        switch cue {
-        case .react: kind = .react
-        case .shakeHead: kind = .shakeHead
-        case .play: kind = .play
-        case .lieDown: kind = .lieDown
-        case .paw: kind = .paw
-        case .eat: kind = .eat
-        }
+                framesDirectory: framesDirectory.path),
+              let kind = kind(for: cue) else { return nil }
         return sequence(
             for: kind, manifest: manifest, framesDirectory: framesDirectory,
+            fallbackFPS: fallbackFPS)
+    }
+
+    static func fallbackReactionCue(framesDirectory: URL) -> PetAnimationCue? {
+        guard let manifest = PetActionManifest.load(
+            framesDirectory: framesDirectory.path) else { return nil }
+        return PetInteractionBinding.fallbackReactionPriority.first { cue in
+            guard let kind = kind(for: cue) else { return false }
+            return sequence(
+                for: kind, manifest: manifest, framesDirectory: framesDirectory,
+                fallbackFPS: 1) != nil
+        }
+    }
+
+    private static func kind(for cue: PetAnimationCue) -> PetActionManifest.Action.Kind? {
+        switch cue {
+        case .cry: return .cry
+        case .angryStomp: return .angryStomp
+        case .roll: return .roll
+        case .stretch: return .stretch
+        case .sleepSnore: return .sleepSnore
+        case .wave: return .wave
+        case .jumpCheer: return .jumpCheer
+        case .puzzledTilt: return .puzzledTilt
+        case .cuddle: return .cuddle
+        case .startledRetreat: return .startledRetreat
+        case .patrolRun: return .patrolRun
+        case .react: return nil
+        case .shakeHead: return .shakeHead
+        case .play: return .play
+        case .lieDown: return .lieDown
+        case .paw: return .paw
+        case .eat: return .eat
+        }
+    }
+
+    static func defaultSequence(
+        framesDirectory: URL,
+        fallbackFPS: Int
+    ) -> SourceFrameSequence? {
+        guard let manifest = PetActionManifest.load(
+            framesDirectory: framesDirectory.path),
+              let action = manifest.actions.first(where: {
+                  $0.id == manifest.defaultAction
+              }) else {
+            return try? SourceFrameSequence.load(at: framesDirectory, fps: fallbackFPS)
+        }
+        return sequence(
+            for: action.kind, manifest: manifest, framesDirectory: framesDirectory,
             fallbackFPS: fallbackFPS)
     }
 
@@ -129,15 +257,51 @@ enum SourceFrameActionResolver {
             fallbackFPS: fallbackFPS)
     }
 
+    static func sequence(
+        forActionID actionID: String,
+        framesDirectory: URL,
+        fallbackFPS: Int
+    ) -> SourceFrameSequence? {
+        guard let manifest = PetActionManifest.load(
+            framesDirectory: framesDirectory.path),
+              let action = manifest.actions.first(where: { $0.id == actionID }) else {
+            return nil
+        }
+        return sequence(
+            for: action, framesDirectory: framesDirectory,
+            fallbackFPS: fallbackFPS)
+    }
+
     private static func sequence(
         for kind: PetActionManifest.Action.Kind,
         manifest: PetActionManifest,
         framesDirectory: URL,
         fallbackFPS: Int
     ) -> SourceFrameSequence? {
+        if kind == .gazeOrbit,
+           !manifest.actions.contains(where: { $0.kind == .gazeOrbit }),
+           PetActionManifest.Action.Kind.gazeCapture.allSatisfy({ legacyKind in
+               manifest.actions.contains {
+                   $0.kind == legacyKind && $0.effectiveOrigin == .captured
+               }
+           }) {
+            return try? SourceFrameSequence.load(at: framesDirectory, fps: fallbackFPS)
+                .with(loop: false)
+        }
         guard let action = manifest.actions.first(where: { $0.kind == kind }),
-              let actionRoot = safeActionDirectory(
-                action.framesDirectory, beneath: framesDirectory) else { return nil }
+              let sequence = sequence(
+                for: action, framesDirectory: framesDirectory,
+                fallbackFPS: fallbackFPS) else { return nil }
+        return sequence
+    }
+
+    private static func sequence(
+        for action: PetActionManifest.Action,
+        framesDirectory: URL,
+        fallbackFPS: Int
+    ) -> SourceFrameSequence? {
+        guard let actionRoot = safeActionDirectory(
+            action.framesDirectory, beneath: framesDirectory) else { return nil }
         let fps = action.fps > 0 ? action.fps : fallbackFPS
         return try? SourceFrameSequence.load(at: actionRoot, fps: fps)
             .with(loop: action.loop)
@@ -173,10 +337,12 @@ enum PetFeatureHitTester {
     }
 }
 
-@MainActor
 private final class SourceFrameImageCache {
     private let cache = NSCache<NSString, NSImage>()
-    private let context = CIContext(options: [.cacheIntermediates: false])
+    private let decodeQueue = DispatchQueue(
+        label: "com.realpet.frame-image-decoder", qos: .userInitiated)
+    private let lock = NSLock()
+    private var pendingCallbacks: [String: [(NSImage?) -> Void]] = [:]
 
     init(limit: Int = 24) {
         cache.countLimit = max(1, limit)
@@ -184,18 +350,55 @@ private final class SourceFrameImageCache {
 
     func image(for frame: SourceFrameSequence.Frame) -> NSImage? {
         let key = frame.rgbURL.path as NSString
-        if let cached = cache.object(forKey: key) { return cached }
-        let image: NSImage?
-        if let alphaURL = frame.alphaURL {
-            image = compositedImage(rgbURL: frame.rgbURL, alphaURL: alphaURL)
-        } else {
-            image = NSImage(contentsOf: frame.rgbURL)
-        }
-        if let image { cache.setObject(image, forKey: key) }
-        return image
+        return cache.object(forKey: key)
     }
 
-    private func compositedImage(rgbURL: URL, alphaURL: URL) -> NSImage? {
+    func request(
+        _ frame: SourceFrameSequence.Frame,
+        completion: @escaping (NSImage?) -> Void
+    ) {
+        let key = frame.rgbURL.path
+        if let cached = cache.object(forKey: key as NSString) {
+            DispatchQueue.main.async { completion(cached) }
+            return
+        }
+        lock.lock()
+        let alreadyDecoding = pendingCallbacks[key] != nil
+        pendingCallbacks[key, default: []].append(completion)
+        lock.unlock()
+        guard !alreadyDecoding else { return }
+        decodeQueue.async { [weak self] in
+            let image = Self.decodedImage(for: frame)
+            DispatchQueue.main.async {
+                self?.completeDecode(key: key, image: image)
+            }
+        }
+    }
+
+    func prefetch(_ frames: some Sequence<SourceFrameSequence.Frame>) {
+        for frame in frames {
+            request(frame) { _ in }
+        }
+    }
+
+    private func completeDecode(key: String, image: NSImage?) {
+        if let image { cache.setObject(image, forKey: key as NSString) }
+        lock.lock()
+        let callbacks = pendingCallbacks.removeValue(forKey: key) ?? []
+        lock.unlock()
+        callbacks.forEach { $0(image) }
+    }
+
+    private static func decodedImage(for frame: SourceFrameSequence.Frame) -> NSImage? {
+        autoreleasepool {
+            if let alphaURL = frame.alphaURL {
+                return compositedImage(rgbURL: frame.rgbURL, alphaURL: alphaURL)
+            }
+            return NSImage(contentsOf: frame.rgbURL)
+        }
+    }
+
+    private static func compositedImage(rgbURL: URL, alphaURL: URL) -> NSImage? {
         guard let rgb = CIImage(contentsOf: rgbURL),
               let alpha = CIImage(contentsOf: alphaURL),
               let filter = CIFilter(name: "CIBlendWithAlphaMask") else { return nil }
@@ -204,7 +407,8 @@ private final class SourceFrameImageCache {
         filter.setValue(transparent, forKey: kCIInputBackgroundImageKey)
         filter.setValue(alpha, forKey: kCIInputMaskImageKey)
         guard let output = filter.outputImage,
-              let cgImage = context.createCGImage(output, from: rgb.extent) else {
+              let cgImage = CIContext(options: [.cacheIntermediates: false])
+                .createCGImage(output, from: rgb.extent) else {
             return nil
         }
         return NSImage(cgImage: cgImage, size: NSSize(
@@ -219,8 +423,7 @@ private final class SourceFramePetView: NSView {
     var onPointer: ((String, CGPoint) -> Void)?
     var onFileDrop: ((Bool, CGPoint) -> Void)?
 
-    private var mouseDownPoint: NSPoint?
-    private var windowOrigin: NSPoint?
+    private var dragAnchor: PetWindowDragAnchor?
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -253,30 +456,27 @@ private final class SourceFramePetView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        mouseDownPoint = point
-        windowOrigin = window?.frame.origin
+        if let origin = window?.frame.origin {
+            dragAnchor = PetWindowDragAnchor(
+                pointerAtStart: NSEvent.mouseLocation,
+                windowOriginAtStart: origin)
+        }
         onPointer?(InteractionKind.dragStarted, normalized(point))
     }
 
-    override func mouseDragged(with event: NSEvent) {
-        guard let start = mouseDownPoint,
-              let origin = windowOrigin else { return }
-        let point = convert(event.locationInWindow, from: nil)
-        window?.setFrameOrigin(NSPoint(
-            x: origin.x + point.x - start.x,
-            y: origin.y + point.y - start.y))
-        onPointer?("pointer.move", normalized(point))
+    override func mouseDragged(with _: NSEvent) {
+        guard let dragAnchor else { return }
+        window?.setFrameOrigin(dragAnchor.windowOrigin(for: NSEvent.mouseLocation))
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard let start = mouseDownPoint else { return }
+        guard let dragAnchor else { return }
         let point = convert(event.locationInWindow, from: nil)
         onPointer?(InteractionKind.dragEnded, normalized(point))
-        if hypot(point.x - start.x, point.y - start.y) < 4 {
+        if dragAnchor.isTap(at: NSEvent.mouseLocation) {
             onPointer?(InteractionKind.petTapped, normalized(point))
         }
-        mouseDownPoint = nil
-        windowOrigin = nil
+        self.dragAnchor = nil
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -316,6 +516,7 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
     var onObservation: ((InteractionObservation) -> Void)?
     var onTermination: (() -> Void)?
     private(set) var isRunning = false
+    var windowOrigin: CGPoint? { window?.frame.origin }
     private var isPresentationActive: Bool
 
     private let framesDirectory: URL
@@ -330,42 +531,53 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
     private var petView: SourceFramePetView?
     private var cache = SourceFrameImageCache()
     private var paused = false
+    private var isDragging = false
     private var terminated = false
     private var actionEndsAt: TimeInterval?
     private var activeGazeAction: PetActionManifest.Action.Kind?
-    private var heldFrameIndex: Int?
+    private var heldFrame: SourceFrameHold?
+    private var pendingDisplayFrame: SourceFrameSequence.Frame?
+    private var imageRequestGeneration = 0
     private var features: PetFeatureManifest?
+    private var hasGazeSupport = false
     private var pointerWasNear = false
     private var lastNearEmission = 0.0
+    private var displayScale: Double
+    private let initialWindowOrigin: CGPoint?
 
     init(
         petId: UUID,
         framesDirectory: URL,
         fps: Int,
+        displayScale: Double = 1.0,
+        initialWindowOrigin: CGPoint? = nil,
         startHidden: Bool = false
     ) {
         self.petId = petId
         self.framesDirectory = framesDirectory.standardizedFileURL
-        fallbackFPS = max(1, min(60, fps))
+        fallbackFPS = max(1, fps)
+        self.displayScale = Self.clampedDisplayScale(displayScale)
+        self.initialWindowOrigin = initialWindowOrigin
         isPresentationActive = !startHidden
     }
 
     func start() throws {
-        let sequence = try SourceFrameSequence.load(
-            at: framesDirectory, fps: fallbackFPS)
+        let sequence = try SourceFrameActionResolver.defaultSequence(
+            framesDirectory: framesDirectory, fallbackFPS: fallbackFPS)
+            ?? SourceFrameSequence.load(at: framesDirectory, fps: fallbackFPS)
         features = PetFeatureManifest.load(framesDirectory: framesDirectory)
+        hasGazeSupport = SourceFrameActionResolver.capabilities(
+            framesDirectory: framesDirectory).orientation
         baseSequence = sequence
         activeSequence = sequence
-        let firstImage = cache.image(for: sequence.frames[0])
-        let aspect = firstImage.map { $0.size.width / max(1, $0.size.height) } ?? 0.8
-        let height = min(560, max(260, NSScreen.main?.visibleFrame.height ?? 420))
-        let width = min(520, max(180, height * aspect))
+        let aspect = 0.8
         let visible = NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let size = windowSize(aspect: aspect, visibleFrame: visible)
+        let origin = PetWindowPlacement.origin(
+            preferred: initialWindowOrigin, size: size, visibleFrame: visible)
         let panel = NSPanel(
-            contentRect: NSRect(
-                x: visible.midX - width / 2, y: visible.midY - height / 2,
-                width: width, height: height),
+            contentRect: NSRect(origin: origin, size: size),
             styleMask: .borderless,
             backing: .buffered,
             defer: false)
@@ -375,11 +587,13 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
+        Self.keepVisibleWhenAppDeactivates(panel)
         panel.acceptsMouseMovedEvents = true
         panel.delegate = self
 
         let view = SourceFramePetView(frame: NSRect(origin: .zero, size: panel.frame.size))
-        view.image = firstImage
+        view.autoresizingMask = [.width, .height]
+        present(sequence.frames[0], in: view)
         view.headRegion = features?.head
         view.onPointer = { [weak self] kind, point in
             self?.handlePointer(kind: kind, point: point)
@@ -393,6 +607,7 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         isRunning = true
         terminated = false
         frameIndex = 0
+        prefetch(sequence: sequence, from: 0)
         startTimers(fps: sequence.fps)
         if isPresentationActive {
             panel.orderFrontRegardless()
@@ -405,6 +620,18 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         ])
     }
 
+    func setDisplayScale(_ scale: Double) {
+        displayScale = Self.clampedDisplayScale(scale)
+        guard let panel = window else { return }
+        let aspect = petView?.image.map {
+            $0.size.width / max(1, $0.size.height)
+        } ?? panel.frame.width / max(1, panel.frame.height)
+        resize(panel: panel, to: windowSize(
+            aspect: aspect,
+            visibleFrame: panel.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+                ?? NSRect(x: 0, y: 0, width: 1440, height: 900)))
+    }
+
     func send(_ command: PetCommand) {
         guard isRunning,
               command.petId == petId,
@@ -412,6 +639,10 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
               command.expiresAt >= Date().timeIntervalSince1970 else { return }
         switch command.action {
         case .faceToward:
+            guard !isDragging else {
+                emitCommand(command, applied: true)
+                return
+            }
             guard let target = command.target else {
                 emitCommand(command, applied: false, reason: "missing_target")
                 return
@@ -419,8 +650,10 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
             updateGaze(for: target, intensity: command.intensity)
             emitCommand(command, applied: true)
         case .react:
-            let cue = command.animation ?? .react
-            if play(cue: cue) {
+            let cue = command.animation
+                ?? SourceFrameActionResolver.fallbackReactionCue(
+                    framesDirectory: framesDirectory)
+            if let cue, play(cue: cue) {
                 emitCommand(command, applied: true)
             } else {
                 emitCommand(
@@ -452,7 +685,10 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         petView = nil
         activeSequence = nil
         baseSequence = nil
-        heldFrameIndex = nil
+        heldFrame = nil
+        pendingDisplayFrame = nil
+        imageRequestGeneration &+= 1
+        isDragging = false
         onTermination?()
     }
 
@@ -460,9 +696,33 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
 
     func windowWillClose(_ notification: Notification) { terminate() }
 
+    private static func clampedDisplayScale(_ scale: Double) -> Double {
+        min(1.75, max(0.55, scale))
+    }
+
+    /// Desktop pets remain visible while the owner works in another app.
+    static func keepVisibleWhenAppDeactivates(_ panel: NSPanel) {
+        panel.hidesOnDeactivate = false
+    }
+
+    private func windowSize(aspect: CGFloat, visibleFrame: NSRect) -> NSSize {
+        let height = min(
+            460,
+            max(145, min(visibleFrame.height - 80, 260 * displayScale)))
+        return NSSize(width: max(110, height * aspect), height: height)
+    }
+
+    private func resize(panel: NSPanel, to size: NSSize) {
+        let visible = panel.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let origin = PetWindowPlacement.origin(
+            preferred: panel.frame.origin, size: size, visibleFrame: visible)
+        panel.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
+    }
+
     private func startTimers(fps: Int) {
         startFrameTimer(fps: fps)
-        let pointerTimer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+        let pointerTimer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.observePointer() }
         }
         RunLoop.main.add(pointerTimer, forMode: .common)
@@ -470,58 +730,68 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
     }
 
     private func startFrameTimer(fps: Int) {
-        let boundedFPS = max(1, min(60, fps))
-        guard activePlaybackFPS != boundedFPS || frameTimer == nil else { return }
+        let playbackFPS = max(1, fps)
+        guard activePlaybackFPS != playbackFPS || frameTimer == nil else { return }
         frameTimer?.invalidate()
         let frameTimer = Timer(
-            timeInterval: 1.0 / Double(boundedFPS), repeats: true
+            timeInterval: 1.0 / Double(playbackFPS), repeats: true
         ) { [weak self] _ in
             Task { @MainActor [weak self] in self?.advanceFrame() }
         }
         RunLoop.main.add(frameTimer, forMode: .common)
         self.frameTimer = frameTimer
-        activePlaybackFPS = boundedFPS
+        activePlaybackFPS = playbackFPS
     }
 
     private func activate(sequence: SourceFrameSequence) {
         activeSequence = sequence
-        heldFrameIndex = nil
+        heldFrame = nil
+        pendingDisplayFrame = nil
+        imageRequestGeneration &+= 1
         frameIndex = 0
+        prefetch(sequence: sequence, from: 0)
         startFrameTimer(fps: sequence.fps)
     }
 
     private func advanceFrame() {
-        guard isRunning, !paused,
+        guard isRunning,
+              FrameSequencePresentationGate.allowsFrameOrPointerUpdate(
+                paused: paused, isDragging: isDragging,
+                awaitingImageDecode: pendingDisplayFrame != nil),
               let sequence = activeSequence,
               let view = petView else { return }
         let now = Date().timeIntervalSince1970
         if let endsAt = actionEndsAt, now >= endsAt {
             actionEndsAt = nil
             activeGazeAction = nil
-            if let baseSequence {
-                activate(sequence: baseSequence)
+            if hasGazeSupport {
+                observePointer()
+            } else {
+                restoreCenteredGaze()
             }
             advanceFrame()
             return
         }
-        if let heldFrameIndex {
-            let displayIndex = min(max(0, heldFrameIndex), sequence.frames.count - 1)
-            view.image = cache.image(for: sequence.frames[displayIndex])
-            view.needsDisplay = true
+        if let heldFrame {
+            render(heldFrame)
             return
         }
         let displayIndex = sequence.loop
             ? frameIndex % sequence.frames.count
             : min(frameIndex, sequence.frames.count - 1)
-        view.image = cache.image(for: sequence.frames[displayIndex])
+        let frame = sequence.frames[displayIndex]
+        guard present(frame, in: view) else { return }
         frameIndex = sequence.loop
             ? (frameIndex + 1) % sequence.frames.count
             : min(frameIndex + 1, sequence.frames.count - 1)
-        view.needsDisplay = true
+        prefetch(sequence: sequence, from: frameIndex)
     }
 
     private func observePointer() {
-        guard isRunning, isPresentationActive, let window, petView != nil else { return }
+        guard isRunning, isPresentationActive,
+              FrameSequencePresentationGate.allowsFrameOrPointerUpdate(
+                paused: paused, isDragging: isDragging),
+              let window, petView != nil else { return }
         let pointer = NSEvent.mouseLocation
         let frame = window.frame
         let dx = (pointer.x - frame.midX) / max(180, frame.width * 1.2)
@@ -546,6 +816,15 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
 
     private func handlePointer(kind: String, point: CGPoint) {
         guard kind != "pointer.move" else { return }
+        switch kind {
+        case InteractionKind.dragStarted:
+            isDragging = true
+        case InteractionKind.dragEnded:
+            isDragging = false
+            pointerWasNear = false
+        default:
+            break
+        }
         emit(
             kind: kind,
             spatial: SpatialContext(
@@ -560,75 +839,114 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
             attributes: ["fileHandling": "none"])
     }
 
-    private func updateGaze(for target: SpatialContext, intensity: Double) {
+    private func updateGaze(for target: SpatialContext, intensity _: Double) {
         guard let window else { return }
-        let point: CGPoint
-        switch target.space {
-        case .petLocalNormalized:
-            point = CGPoint(x: (target.x - 0.5) * 2, y: (target.y - 0.5) * 2)
-        case .screenNormalized:
-            guard let screen = window.screen ?? NSScreen.main else { return }
-            let visible = screen.visibleFrame
-            point = CGPoint(
-                x: ((target.x * visible.width + visible.minX) - window.frame.midX)
-                    / max(180, window.frame.width * 1.2),
-                y: ((target.y * visible.height + visible.minY) - window.frame.midY)
-                    / max(180, window.frame.height * 1.2))
-        case .cameraNormalized:
-            return
-        }
-        let gain = min(1, max(0, intensity))
+        let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame ?? window.frame
+        guard let point = FrameSequenceGazeTargetMapper.offset(
+            for: target, windowFrame: window.frame, visibleFrame: visibleFrame) else { return }
+        // A semantic command's intensity must not scale a spatial target for a
+        // frame-sequence pet. Near the desktop pet, a low-intensity
+        // `pointerNear` command used to shrink the same mouse coordinate into
+        // the center dead-zone. The 60 Hz raw pointer update then restored the
+        // real coordinate, producing a recurring first-frame flash.
         updateCapturedGaze(
-            horizontalOffset: point.x * gain,
-            verticalOffset: point.y * gain)
+            horizontalOffset: point.x,
+            verticalOffset: point.y)
     }
 
     private func updateCapturedGaze(
         horizontalOffset: CGFloat,
         verticalOffset: CGFloat
     ) {
-        guard actionEndsAt == nil else { return }
+        guard actionEndsAt == nil, hasGazeSupport else { return }
         if let orbitSequence = SourceFrameActionResolver.sequence(
             for: .gazeOrbit, framesDirectory: framesDirectory, fallbackFPS: fallbackFPS) {
-            guard let selectedFrameIndex = OrbitFrameSelector.index(
+            // Keep the center dead-zone in the same generated gaze video.
+            // The idle action is often a separately extracted still, so
+            // switching to it while the pointer crosses the center produces
+            // a visible flash between its first frame and the held gaze frame.
+            let selectedFrameIndex = GazeSweepFrameSelector.index(
                 frameCount: orbitSequence.frames.count,
                 horizontalOffset: Double(horizontalOffset),
-                verticalOffset: Double(verticalOffset)) else {
-                guard activeGazeAction != nil else { return }
-                activeGazeAction = nil
-                heldFrameIndex = nil
-                if let baseSequence {
-                    activate(sequence: baseSequence)
-                }
-                return
-            }
-            if activeSequence?.root != orbitSequence.root {
-                activate(sequence: orbitSequence)
-            }
+                verticalOffset: Double(verticalOffset)) ?? 0
             activeGazeAction = .gazeOrbit
-            heldFrameIndex = selectedFrameIndex
-            if let view = petView {
-                view.image = cache.image(for: orbitSequence.frames[selectedFrameIndex])
-                view.needsDisplay = true
-            }
+            hold(frameAt: selectedFrameIndex, in: orbitSequence)
             return
         }
         let requested = PetActionManifest.Action.Kind.gazeAction(
             horizontalOffset: Double(horizontalOffset),
             verticalOffset: Double(verticalOffset))
-        guard requested != activeGazeAction else { return }
+        if let requested, requested == activeGazeAction { return }
         guard let requested,
               let sequence = SourceFrameActionResolver.sequence(
                 for: requested, framesDirectory: framesDirectory,
                 fallbackFPS: fallbackFPS) else {
-            activeGazeAction = nil
-            if let baseSequence {
-                activate(sequence: baseSequence)
-            }
+            restoreCenteredGaze()
             return
         }
         activeGazeAction = requested
-        activate(sequence: sequence)
+        hold(frameAt: sequence.frames.count - 1, in: sequence)
+    }
+
+    private func restoreCenteredGaze() {
+        activeGazeAction = nil
+        guard let baseSequence else { return }
+        if activeSequence?.root != baseSequence.root {
+            activate(sequence: baseSequence)
+        }
+        hold(frameAt: 0, in: baseSequence)
+    }
+
+    private func hold(frameAt index: Int, in sequence: SourceFrameSequence) {
+        if let heldFrame,
+           heldFrame.sequence.root == sequence.root,
+           heldFrame.index == min(max(0, index), sequence.frames.count - 1) {
+            return
+        }
+        let next = SourceFrameHold(sequence: sequence, index: index)
+        heldFrame = next
+        render(next)
+    }
+
+    private func render(_ heldFrame: SourceFrameHold) {
+        guard let view = petView else { return }
+        _ = present(heldFrame.frame, in: view)
+    }
+
+    @discardableResult
+    private func present(
+        _ frame: SourceFrameSequence.Frame,
+        in view: SourceFramePetView
+    ) -> Bool {
+        if let image = cache.image(for: frame) {
+            view.image = image
+            view.needsDisplay = true
+            return true
+        }
+        let generation = imageRequestGeneration
+        pendingDisplayFrame = frame
+        cache.request(frame) { [weak self, weak view] image in
+            guard let self,
+                  self.imageRequestGeneration == generation,
+                  self.pendingDisplayFrame == frame else { return }
+            self.pendingDisplayFrame = nil
+            guard let image, let view else { return }
+            view.image = image
+            view.needsDisplay = true
+        }
+        return false
+    }
+
+    private func prefetch(sequence: SourceFrameSequence, from index: Int) {
+        guard !sequence.frames.isEmpty else { return }
+        let count = min(18, sequence.frames.count)
+        let frames = (0..<count).map { offset -> SourceFrameSequence.Frame in
+            let next = sequence.loop
+                ? (index + offset) % sequence.frames.count
+                : min(sequence.frames.count - 1, index + offset)
+            return sequence.frames[next]
+        }
+        cache.prefetch(frames)
     }
 
     private func play(cue: PetAnimationCue) -> Bool {
@@ -641,6 +959,20 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         }
         return false
     }
+
+    @discardableResult
+    func playCustomAction(id: String) -> Bool {
+        guard actionEndsAt == nil,
+              let sequence = SourceFrameActionResolver.sequence(
+                forActionID: id,
+                framesDirectory: framesDirectory,
+                fallbackFPS: fallbackFPS) else { return false }
+        activate(sequence: sequence)
+        actionEndsAt = Date().timeIntervalSince1970
+            + Double(sequence.frames.count) / Double(sequence.fps)
+        return true
+    }
+
 
     private func emit(
         kind: String,

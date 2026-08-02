@@ -1,14 +1,4 @@
-torch>=2.0
-torchvision>=0.15
-transformers
-numpy
-Pillow
-opencv-python-headless
-requests
-safetensors
-# BiRefNet (HuggingFace trust_remote_code) runtime deps — discovered via
-# CI on a clean macos-14 runner: ImportError without these when loading
-# ZhengPeng7/BiRefNet-matting. Pin major versions to avoid surprise breakage.
-einops
-kornia
-timm
+# Runtime lock entry point. Every package and artifact hash lives in
+# requirements.lock; install with pip --require-hashes -r requirements.txt.
+--require-hashes
+-r requirements.lock

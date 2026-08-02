@@ -5,7 +5,6 @@ struct CubismRuntimeContractCheck {
     static func main() throws {
         try testManifestRuntimeGateAndPathResolution()
         try testRuntimeResourceDiscovery()
-        try testTemplateResourceDiscovery()
         try testResourcePathContainment()
         testParameterMapping()
         testWindowMotionPlanner()
@@ -97,76 +96,6 @@ struct CubismRuntimeContractCheck {
         precondition(!decodedLegacy.isRuntimeReady)
         precondition(!decodedLegacy.capabilities.locomotion)
         precondition(!decodedLegacy.capabilities.reaction)
-    }
-
-    private static func testTemplateResourceDiscovery() throws {
-        let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let template = root.appendingPathComponent("template", isDirectory: true)
-        let textures = template.appendingPathComponent("textures", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: textures, withIntermediateDirectories: true)
-        precondition(CubismTemplateResources.discover(
-            profile: .cat, environment: [:], bundleResources: nil,
-            projectRoot: nil) == nil)
-        try Data("moc".utf8).write(to: template.appendingPathComponent("pet.moc3"))
-        try Data("png".utf8).write(to: textures.appendingPathComponent("pet.png"))
-        try Data("""
-        {"Version":3,"FileReferences":{"Moc":"pet.moc3","Textures":["textures/pet.png"]}}
-        """.utf8).write(to: template.appendingPathComponent("pet.model3.json"))
-        let parts = [
-            "head", "muzzle", "nose", "mouth", "tongue", "eye_left", "eye_right",
-            "ear_left", "ear_right", "torso", "chest", "tail", "front_leg_left",
-            "front_paw_left", "front_leg_right", "front_paw_right",
-            "hind_leg_left", "hind_paw_left", "hind_leg_right", "hind_paw_right",
-        ]
-        let parameters = [
-            "ParamAngleX", "ParamAngleY", "ParamAngleZ", "ParamBodyAngleX",
-            "ParamEyeBallX", "ParamEyeBallY", "ParamEyeLOpen", "ParamEyeROpen",
-            "ParamMouthOpenY", "ParamBreath", "ParamBodyAngleY", "ParamBodyAngleZ",
-            "ParamBodyY", "ParamTail", "ParamLegFrontL", "ParamPawFrontL",
-            "ParamLegFrontR", "ParamPawFrontR", "ParamLegHindL", "ParamPawHindL",
-            "ParamLegHindR", "ParamPawHindR", "ParamEarL", "ParamEarR",
-        ]
-        let descriptor: [String: Any] = [
-            "version": 2, "id": "cat-v1", "profile": "cat-v1",
-            "contract": "quadruped-v2", "model": "pet.model3.json",
-            "texture": "textures/pet.png",
-            "textureSize": [2000, 1600],
-            "slots": Dictionary(uniqueKeysWithValues: parts.enumerated().map {
-                ($0.element, ["rect": [$0.offset, 0, 1, 1]])
-            }),
-            "partDrawables": Dictionary(uniqueKeysWithValues: parts.map {
-                ($0, "Drawable_\($0)")
-            }),
-            "capabilities": [
-                "headPose": true, "eyeGaze": true, "breathing": true,
-                "locomotion": true, "reaction": true,
-            ],
-            "parameters": parameters,
-        ]
-        try JSONSerialization.data(withJSONObject: descriptor).write(
-            to: template.appendingPathComponent("realpet-template.json"))
-        let provenance: [String: Any] = [
-            "schemaVersion": 1, "profile": "cat-v1",
-            "status": "exported-and-verified", "owner": "RealPet",
-            "originalWork": true, "thirdPartyCharacterAssets": [],
-            "sourceProject": [
-                "path": "artifacts/cat-v1.cmo3",
-                "sha256": String(repeating: "0", count: 64),
-            ],
-        ]
-        try JSONSerialization.data(withJSONObject: provenance).write(
-            to: template.appendingPathComponent("realpet-provenance.json"))
-        let found = CubismTemplateResources.discover(
-            profile: .cat,
-            environment: ["REALPET_CUBISM_TEMPLATE": template.path],
-            bundleResources: nil, projectRoot: nil)
-        precondition(found?.root == template.standardizedFileURL)
-        precondition(CubismTemplateResources.discover(
-            profile: .dogLongSnout,
-            environment: ["REALPET_CUBISM_TEMPLATE": template.path],
-            bundleResources: nil, projectRoot: nil) == nil)
     }
 
     private static func testRuntimeResourceDiscovery() throws {

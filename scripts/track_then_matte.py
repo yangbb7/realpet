@@ -456,6 +456,34 @@ def _get_video_duration(video_path):
         return 0
 
 
+def _get_video_frame_rate(video_path):
+    """Return the source stream's average frame rate without resampling it."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True, timeout=5)
+        numerator, denominator = result.stdout.strip().split("/", 1)
+        rate = float(numerator) / float(denominator)
+        return rate if rate > 0 else 10.0
+    except Exception:
+        return 10.0
+
+
+def _is_interlaced_video(video_path):
+    """Only deinterlace sources that actually declare interlaced fields."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=field_order",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True, timeout=5)
+        return result.stdout.strip().lower() in {"tt", "tb", "bt", "bb"}
+    except Exception:
+        return False
+
+
 # === HDR (HLG / PQ, BT.2020) → SDR extraction ===
 #
 # iPhone "HDR video" is HLG (transfer arib-std-b67) or Dolby-Vision PQ
@@ -527,7 +555,32 @@ def _tonemap_bt2020_to_srgb(rgb16, transfer):
     return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
 
-def _extract_frames_core(video_path, output_dir, fps, ss=None, dur=None):
+def _run_frame_extraction(command):
+    """Run FFmpeg without allowing timestamp sync to discard decoded frames."""
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "unknown ffmpeg error"
+        raise RuntimeError(f"frame extraction failed: {detail}")
+
+
+def _verify_output_frame_sequence(directory, expected_count):
+    """Fail closed when any processed source frame is missing or unreadable."""
+    paths = sorted(glob.glob(os.path.join(directory, "frame_*.png")))
+    expected_names = [f"frame_{index:04d}.png" for index in range(expected_count)]
+    actual_names = [os.path.basename(path) for path in paths]
+    if actual_names != expected_names:
+        raise RuntimeError(
+            "frame preservation check failed: "
+            f"expected {expected_count} contiguous frames, found {len(paths)}")
+    unreadable = [path for path in paths if cv2.imread(path, cv2.IMREAD_UNCHANGED) is None]
+    if unreadable:
+        raise RuntimeError(
+            "frame preservation check failed: unreadable output frame "
+            f"{os.path.basename(unreadable[0])}")
+    return paths
+
+
+def _extract_frames_core(video_path, output_dir, fps=None, ss=None, dur=None):
     """Shared extraction. SDR → fast JPEG path; HDR → 16-bit + numpy tone-map.
 
     Returns sorted list of frame_*.jpg paths.
@@ -543,15 +596,25 @@ def _extract_frames_core(video_path, output_dir, fps, ss=None, dur=None):
     if dur is not None:
         pre += ["-t", str(dur)]
 
+    # Most user and MiniMax clips are progressive. Applying yadif to those
+    # sources is unnecessary and makes frame preservation harder to reason
+    # about. For an interlaced source, send_frame keeps a one-to-one frame
+    # mapping instead of creating double-rate output.
+    filters = ["yadif=mode=send_frame"] if _is_interlaced_video(video_path) else []
+    if fps is not None and fps > 0:
+        filters.append(f"fps={fps}")
+    output_options = ["-map", "0:v:0", "-vsync", "0"]
+    if filters:
+        output_options += ["-vf", ",".join(filters)]
+
     transfer, primaries = _probe_color(video_path)
     if _is_hdr(transfer, primaries):
         # 16-bit BT.2020 PNG intermediate, then tone-map each frame in numpy.
         tmp = tempfile.mkdtemp(prefix="hdr_")
         try:
-            subprocess.run(
-                pre + ["-vf", f"yadif,fps={fps}", "-pix_fmt", "rgb48be",
-                       os.path.join(tmp, "f_%04d.png")],
-                capture_output=True)
+            _run_frame_extraction(
+                pre + output_options + ["-pix_fmt", "rgb48be",
+                                        os.path.join(tmp, "f_%04d.png")])
             for i, p in enumerate(sorted(glob.glob(os.path.join(tmp, "f_*.png"))), 1):
                 rgb16 = cv2.cvtColor(cv2.imread(p, cv2.IMREAD_UNCHANGED),
                                      cv2.COLOR_BGR2RGB)
@@ -561,21 +624,20 @@ def _extract_frames_core(video_path, output_dir, fps, ss=None, dur=None):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     else:
-        subprocess.run(
-            pre + ["-vf", f"yadif,fps={fps}", "-q:v", "2",
-                   os.path.join(output_dir, "frame_%04d.jpg")],
-            capture_output=True)
+        _run_frame_extraction(
+            pre + output_options + ["-q:v", "2",
+                                    os.path.join(output_dir, "frame_%04d.jpg")])
 
     return sorted(glob.glob(os.path.join(output_dir, "frame_*.jpg")))
 
 
-def extract_frames_range(video_path, output_dir, start_time, duration, fps=10):
+def extract_frames_range(video_path, output_dir, start_time, duration, fps=None):
     """Extract frames from a specific time range (HDR-aware)."""
     return _extract_frames_core(video_path, output_dir, fps,
                                 ss=start_time, dur=duration)
 
 
-def extract_frames(video_path, output_dir, fps=10):
+def extract_frames(video_path, output_dir, fps=None):
     """Extract frames from the whole video (HDR-aware)."""
     return _extract_frames_core(video_path, output_dir, fps)
 
@@ -1940,7 +2002,9 @@ def main():
     )
     parser.add_argument("--video", required=True, help="Input video path")
     parser.add_argument("--output-dir", required=True, help="Output directory")
-    parser.add_argument("--fps", type=int, default=10, help="Frame extraction FPS")
+    parser.add_argument(
+        "--fps", type=int, default=0,
+        help="Optional extraction FPS. Omit or pass 0 to preserve every source frame.")
     parser.add_argument("--click", type=str, default=None,
                         help="Pet click point as 'x,y' (auto-detect if not set)")
     parser.add_argument("--bbox", type=str, default=None,
@@ -2025,8 +2089,8 @@ def main():
         except Exception as e:
             emit({"type": "progress", "phase": "analyze",
                   "detail": f"auto-select failed: {e}, keeping first {args.max_seconds}s"})
-            frames = extract_frames(args.video, extract_dir, fps=args.fps)
-            frames = frames[:int(args.max_seconds * args.fps)]
+            frames = extract_frames_range(
+                args.video, extract_dir, 0, args.max_seconds, args.fps)
 
     if not frames:
         emit({"type": "error", "message": "No frames extracted"})
@@ -2084,7 +2148,9 @@ def main():
               "detail": f"{name} ({conf:.0%}) at ({cx}, {cy})"})
 
     # Step 4: SAM2 tracking (single pass, collect logits)
-    preview_limit = int(args.preview_seconds * args.fps)
+    output_fps = float(args.fps) if args.fps > 0 else _get_video_frame_rate(args.video)
+    output_fps = max(1.0, output_fps)
+    preview_limit = max(1, int(round(args.preview_seconds * output_fps)))
 
     def sam2_progress(phase, current, total, detail):
         emit({"type": "progress", "phase": phase,
@@ -2105,14 +2171,19 @@ def main():
         pass2_birefnet(frames[:preview_limit], all_logits, final_dir,
                        birefnet_progress)
         processed = min(preview_limit, len(frames))
+        _verify_output_frame_sequence(final_dir, processed)
         emit({"type": "complete",
               "frames": processed,
               "frames_dir": os.path.abspath(final_dir),
               "segmented_dir": os.path.abspath(final_dir),
-              "frame_count": processed})
+              "frame_count": processed,
+              "source_frame_count": processed,
+              "output_frame_count": processed,
+              "fps": int(round(output_fps))})
         return
 
     pass2_birefnet(frames, all_logits, final_dir, birefnet_progress)
+    _verify_output_frame_sequence(final_dir, len(frames))
 
     # Swift can now restart its eager detector daemon without overlapping the
     # SAM2/BiRefNet model allocations. This keeps the next import warm.
@@ -2146,11 +2217,10 @@ def main():
         emit({"type": "progress", "phase": "deflicker",
               "detail": f"stabilized {len(flash_frames)} flash frame(s): {flash_frames}"})
 
-    # Repair per-frame opacity flashes (body renders translucent for one
-    # frame — different failure from coverage spikes, so the deflicker above
-    # is blind to it). Operates on the saved RGBA files: holds the nearest
-    # good neighbour over each flagged frame.
-    opacity_flashes = repair_opacity_flashes(final_dir, len(frames), emit_fn=emit)  # noqa: F841  # report count (see emit log)
+    # Do not replace a weak frame with a neighboring frame. It can hide a
+    # one-frame alpha flicker, but it also destroys the original motion frame.
+    # The product contract keeps every decoded source frame available to the
+    # desktop renderer, so temporal repair is limited to alpha refinement.
 
     # Part B #1 (tech/PET_STABILIZATION_PARTB.md §2): rigid-translate each RGBA
     # cutout so the alpha centroid tracks a smoothed trajectory. Kills the
@@ -2179,6 +2249,11 @@ def main():
         except Exception as e:
             emit({"type": "progress", "phase": "stabilize_output",
                   "detail": f"failed ({type(e).__name__}: {e}), continuing"})
+
+    # Deflicker and stabilization are allowed to repair pixels in a frame, but
+    # never to remove, merge, or skip frames. Re-assert that invariant just
+    # before installation metadata is emitted to Swift.
+    _verify_output_frame_sequence(final_dir, len(frames))
 
     # Downstream quality_summary and make_video read metrics/files, so an
     # optional position-stabilization pass needs no in-memory alpha refresh.
@@ -2217,6 +2292,9 @@ def main():
           "frames_dir": os.path.abspath(final_dir),
           "segmented_dir": os.path.abspath(final_dir),
           "frame_count": len(frames),
+          "source_frame_count": len(frames),
+          "output_frame_count": len(frames),
+          "fps": int(round(output_fps)),
           "quality": {"green": green, "yellow": yellow, "red": red}})
 
 

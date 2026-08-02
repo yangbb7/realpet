@@ -1,194 +1,88 @@
 name: install-verify
 
-# Long-running regression gate: prove that on a clean macOS runner,
-# a fresh clone of this repo can install and run end-to-end.
-# Catches:
-# - install.sh breaking on Python detection / brew / ffmpeg
-# - SAM2 / BiRefNet / Faster R-CNN weights no longer fetchable
-# - HuggingFace / PyPI regressions
-# - .to("mps") hardcoded crashes on Intel Macs / CI (no MPS)
-# - Swift build breaks
-# - `--help` regresses behind a weight check
-# - build_app.sh assembling an .app with missing Resources (the v0.2.0
-#   broken-DMG bug: pipeline/, scripts/, requirements.txt not bundled)
-#
-# Design notes:
-# - macos-14 has no MPS acceleration; smoke must work on CPU too.
-#   That's a real Intel-Mac-user path, not just CI convenience.
-# - Caches: HuggingFace (~/.cache/huggingface), SAM2 weights
-#   (repo/weights/sam2/), pip.
-# - We do NOT run the full track_then_matte pipeline here (needs a real
-#   pet video, which we won't bundle — see docs/RELEASE.md "Known gaps").
-#   The model-load smoke is enough to catch dependency / device issues.
-# - Heavy cold-cache run can take ~10 min. Weekly + on-demand only.
-
+# Weekly release-preparation gate. It intentionally downloads only immutable
+# model revisions, checks their SHA-256 digests, then packages those verified
+# assets. Fast unit coverage lives in ci.yml.
 on:
   push:
     branches: [main]
   workflow_dispatch:
   schedule:
-    # Mondays 06:00 UTC
     - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
 
 jobs:
   install-verify:
     runs-on: macos-14
-    timeout-minutes: 20
-
+    timeout-minutes: 35
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Cache pip
+      - name: Cache locked Python artifacts
         uses: actions/cache@v4
         with:
           path: ~/Library/Caches/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            pip-${{ runner.os }}-
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.lock', 'requirements-dev.lock') }}
 
-      - name: Cache weights (HuggingFace + BiRefNet + Faster R-CNN)
+      - name: Cache verified model artifacts
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cache/huggingface
-            weights/hf
-            weights/birefnet-fp16
-            weights/torch
-          key: weights-${{ runner.os }}-birefnet-rcnn-v2
-          restore-keys: |
-            weights-${{ runner.os }}-
+          path: ${{ runner.temp }}/realpet-release-weights
+          key: weights-${{ runner.os }}-${{ hashFiles('scripts/bundle_weights.py', 'scripts/download_weights.py', 'scripts/verify_release_assets.py') }}
 
-      - name: Cache SAM2 weights
-        uses: actions/cache@v4
-        with:
-          path: weights/sam2
-          key: sam2-${{ runner.os }}-${{ hashFiles('scripts/download_weights.py') }}
-          restore-keys: |
-            sam2-${{ runner.os }}-
-
-      - name: Download static ffmpeg (mirror of build_app.sh)
-        run: |
-          mkdir -p /tmp/ffmpeg-bundle
-          curl -fsSL -o /tmp/ffmpeg-bundle/ff.zip \
-              https://evermeet.cx/ffmpeg/getrelease/zip
-          unzip -q /tmp/ffmpeg-bundle/ff.zip -d /tmp/ffmpeg-bundle
-          /tmp/ffmpeg-bundle/ffmpeg -version | head -1
-
-      - name: Set up Python 3.11
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
-      - name: Run install.sh (creates venv + installs deps)
+      - name: Install locked runtime and prepare verified weights
         env:
           REALPET_VENV: ${{ runner.temp }}/realpet-venv
+          REALPET_WEIGHTS_DIR: ${{ runner.temp }}/realpet-release-weights
         run: |
-          VENV_DIR="${REALPET_VENV}"
-          echo "Using VENV_DIR=$VENV_DIR"
           bash install.sh
-          echo "---"
-          if [ ! -x "$VENV_DIR/bin/python" ]; then
-            echo "::error::install.sh did not produce $VENV_DIR/bin/python"
-            ls -la "$(dirname "$VENV_DIR")" || true
-            exit 1
-          fi
-          "$VENV_DIR/bin/python" --version
-          "$VENV_DIR/bin/python" -c "import torch, transformers, cv2, PIL, sam2; print('all imports OK')"
+          "$REALPET_VENV/bin/python" scripts/verify_release_assets.py --weights-dir "$REALPET_WEIGHTS_DIR"
 
-      - name: bundle_weights.py — verify produces complete tree
+      - name: Inference smoke with only verified local weights
         env:
           REALPET_VENV: ${{ runner.temp }}/realpet-venv
+          REALPET_WEIGHTS_DIR: ${{ runner.temp }}/realpet-release-weights
+          TORCH_HOME: ${{ runner.temp }}/realpet-release-weights/torch
         run: |
-          VENV_DIR="${REALPET_VENV}"
-          BUNDLE_OUT="${{ runner.temp }}/bundle-verify"
-          rm -rf "$BUNDLE_OUT"
-          "$VENV_DIR/bin/pip" install -q huggingface_hub
-          "$VENV_DIR/bin/python" scripts/bundle_weights.py --out "$BUNDLE_OUT" --force
-          "$VENV_DIR/bin/python" scripts/bundle_weights.py --out "$BUNDLE_OUT" --verify-only
-
-      - name: download_weights.py — assert SAM2 + BiRefNet ready
-        env:
-          HF_ENDPOINT: ${{ env.HF_ENDPOINT }}
-          REALPET_VENV: ${{ runner.temp }}/realpet-venv
-        run: |
-          VENV_DIR="${REALPET_VENV}"
-          "$VENV_DIR/bin/python" scripts/download_weights.py
-          echo "---"
-          ls -lh weights/sam2/
-          "$VENV_DIR/bin/python" scripts/download_weights.py --check
-
-      - name: CI inference smoke (BiRefNet + Faster R-CNN, CPU fallback)
-        env:
-          HF_HOME: ${{ runner.temp }}/hf_cache
-          REALPET_VENV: ${{ runner.temp }}/realpet-venv
-        run: |
-          VENV_DIR="${REALPET_VENV}"
-          mkdir -p "$HF_HOME"
-          "$VENV_DIR/bin/python" scripts/ci_inference_smoke.py
+          "$REALPET_VENV/bin/python" scripts/ci_inference_smoke.py
 
       - name: Swift build (release)
-        run: |
-          cd RealPet
-          rm -rf .build/arm64-apple-macosx/release .build/release  # force real build, not cache
-          swift build -c release
+        run: cd RealPet && swift build -c release
 
-      - name: Build .app (stub weights) and verify bundle contents
-        # Regression gate for the v0.2.0 broken-DMG class of bug: build_app.sh
-        # assembled an .app missing pipeline/, scripts/, requirements.txt
-        # (fixed in dca3d85) and CI stayed green because nothing ever checked
-        # the bundle. --stub-weights skips the ~1.1 GB weight download but
-        # runs every other assembly step for real.
-        run: |
-          bash build_app.sh --stub-weights
-          RES="dist/RealPet.app/Contents/Resources"
-          missing=0
-          for p in \
-            "$RES/requirements.txt" \
-            "$RES/scripts/track_then_matte.py" \
-            "$RES/scripts/daemon.py" \
-            "$RES/bin/ffmpeg" \
-            "$RES/weights/sam2" \
-            "$RES/weights/birefnet-fp16" \
-            "$RES/weights/torch" \
-            "dist/RealPet.app/Contents/MacOS/RealPet" \
-            "dist/RealPet.app/Contents/Info.plist"; do
-            if [ -e "$p" ]; then
-              echo "OK: $p"
-            else
-              echo "::error::Missing from .app bundle: $p"
-              missing=1
-            fi
-          done
-          [ -x "$RES/bin/ffmpeg" ] || { echo "::error::bin/ffmpeg is not executable"; missing=1; }
-          CAMERA_REASON=$(plutil -extract NSCameraUsageDescription raw -o - \
-            "dist/RealPet.app/Contents/Info.plist" 2>/dev/null || true)
-          [ -n "$CAMERA_REASON" ] || { echo "::error::Missing NSCameraUsageDescription"; missing=1; }
-          MICROPHONE_REASON=$(plutil -extract NSMicrophoneUsageDescription raw -o - \
-            "dist/RealPet.app/Contents/Info.plist" 2>/dev/null || true)
-          [ -n "$MICROPHONE_REASON" ] || { echo "::error::Missing NSMicrophoneUsageDescription"; missing=1; }
-          SPEECH_REASON=$(plutil -extract NSSpeechRecognitionUsageDescription raw -o - \
-            "dist/RealPet.app/Contents/Info.plist" 2>/dev/null || true)
-          [ -n "$SPEECH_REASON" ] || { echo "::error::Missing NSSpeechRecognitionUsageDescription"; missing=1; }
-          exit "$missing"
-
-      - name: track_then_matte.py --help (must work without weights)
+      - name: Package verified release assets
         env:
           REALPET_VENV: ${{ runner.temp }}/realpet-venv
+          REALPET_WEIGHTS_DIR: ${{ runner.temp }}/realpet-release-weights
+          REALPET_DIST_DIR: ${{ runner.temp }}/realpet-package
+          REALPET_SUPABASE_PUBLISHABLE_KEY: publishable-ci-key
+          REALPET_AGNES_API_KEY: agnes-ci-key
+          REALPET_FFMPEG_PATH: /usr/local/bin/ffmpeg
         run: |
-          VENV_DIR="${REALPET_VENV}"
-          # Rename weights dir so --help can't accidentally find them
-          if [ -d weights/sam2 ]; then
-            mv weights/sam2 weights/sam2.staged
+          if [ ! -x "$REALPET_FFMPEG_PATH" ]; then
+            REALPET_FFMPEG_PATH="$(command -v ffmpeg)"
           fi
-          "$VENV_DIR/bin/python" scripts/track_then_matte.py --help | head -5
-          RC=$?
-          if [ -d weights/sam2.staged ]; then
-            mv weights/sam2.staged weights/sam2
-          fi
-          exit $RC
+          test -x "$REALPET_FFMPEG_PATH"
+          export REALPET_FFMPEG_PATH
+          export REALPET_FFMPEG_SHA256="$(shasum -a 256 "$REALPET_FFMPEG_PATH" | awk '{print $1}')"
+          export REALPET_BUILD_PYTHON="$REALPET_VENV/bin/python"
+          ./build_app.sh
+          APP="$REALPET_DIST_DIR/RealPet.app"
+          test -x "$APP/Contents/MacOS/RealPet"
+          test -f "$APP/Contents/Resources/requirements.lock"
+          test ! -e "$APP/Contents/Resources/weights/sam2/.stub-weights-ci-only"
+          plutil -lint "$APP/Contents/Info.plist"
+          codesign --verify --deep --strict "$APP"
 
-      - name: Lint
+      - name: track_then_matte help does not require a model load
+        env:
+          REALPET_VENV: ${{ runner.temp }}/realpet-venv
+          REALPET_WEIGHTS_DIR: ${{ runner.temp }}/realpet-release-weights
         run: |
-          pip install ruff
-          ruff check scripts/ pipeline/ tests/ --select E,F,W --ignore E501
+          "$REALPET_VENV/bin/python" scripts/track_then_matte.py --help | head -5

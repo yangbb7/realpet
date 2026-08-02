@@ -195,14 +195,16 @@ class PythonBridge: ObservableObject {
         process.environment = Self.subprocessEnvironment()
         process.currentDirectoryURL = Self.projectRoot
         let output = Pipe()
+        let errorOutput = Pipe()
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errorOutput
 
         DispatchQueue.global(qos: .userInitiated).async {
             var result: [String: Any]?
             do {
                 try process.run()
                 let data = output.fileHandleForReading.readDataToEndOfFile()
+                let errorData = errorOutput.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
                 let text = String(data: data, encoding: .utf8) ?? ""
                 for line in text.split(separator: "\n").reversed() {
@@ -215,8 +217,31 @@ class PythonBridge: ObservableObject {
                     result = json
                     break
                 }
+                if result == nil {
+                    let stderr = String(data: errorData, encoding: .utf8) ?? ""
+                    let detail = stderr
+                        .split(separator: "\n")
+                        .last
+                        .flatMap { line -> String? in
+                            let value = String(line)
+                            return value.isEmpty ? nil : value
+                        }
+                    let message: String
+                    if let detail {
+                        message = "脚本校验失败：\(detail.prefix(240))"
+                    } else {
+                        message = "脚本校验失败（退出码 \(process.terminationStatus)）"
+                    }
+                    Self.log("\(scriptName) failed exit=\(process.terminationStatus) stderr=\(stderr)")
+                    result = ["type": responseType, "passed": false, "message": message]
+                }
             } catch {
-                result = nil
+                Self.log("\(scriptName) threw: \(error)")
+                result = [
+                    "type": responseType,
+                    "passed": false,
+                    "message": "无法启动校验脚本：\(error.localizedDescription)",
+                ]
             }
             DispatchQueue.main.async { completion(result) }
         }
@@ -235,8 +260,8 @@ class PythonBridge: ObservableObject {
             completion: completion)
     }
 
-    /// Validate action semantics before the sequence can unlock movement or
-    /// reaction capabilities in the desktop runtime.
+    /// Validate frame integrity, motion evidence, and appearance continuity.
+    /// The owner then confirms action semantics in the required preview.
     func validateAction(
         framesDirectory: String,
         kind: String,
@@ -272,29 +297,6 @@ class PythonBridge: ObservableObject {
             "--fps", "\(fps)",
             ],
             responseType: "action_prepared",
-            completion: completion)
-    }
-
-    func prepareRigAtlas(
-        atlasPath: String,
-        outputDirectory: String,
-        profile: PetTemplateProfile,
-        completion: @escaping ([String: Any]?) -> Void
-    ) {
-        guard let template = CubismTemplateResources.discover(
-            profile: profile, projectRoot: Self.projectRoot) else {
-            completion([
-                "type": "rig_assets_prepared",
-                "prepared": false,
-                "message": "应用缺少内置\(profile.displayName) Live2D 模板",
-            ])
-            return
-        }
-        runJSONScript(
-            "prepare_rig_atlas.py",
-            arguments: ["--atlas", atlasPath, "--output-dir", outputDirectory,
-                        "--template-dir", template.root.path],
-            responseType: "rig_assets_prepared",
             completion: completion)
     }
 
@@ -479,50 +481,23 @@ class PythonBridge: ObservableObject {
     @MainActor
     func startWithClick(videoPath: String, outputDir: String, clickX: Int, clickY: Int,
                         bbox: [Double]? = nil,
-                        startTime: Double = -1, duration: Double = -1) {
+                        startTime: Double = -1, duration: Double = -1,
+                        skipQualityCheck: Bool = false) {
         guard !isProcessing, let python = Self.findTrackMattePython() else { return }
 
         let script = Self.projectRoot.appendingPathComponent("scripts/track_then_matte.py")
         let proc = Process()
         proc.executableURL = python
-        var procArgs = [
-            script.path,
-            "--video", videoPath,
-            "--output-dir", outputDir,
-            "--fps", "10",
-            "--preview-seconds", "5",
-            "--max-seconds", "15",
-            "--click", "\(clickX),\(clickY)"
-        ]
-        if let bbox, bbox.count == 4 {
-            procArgs += ["--bbox", bbox.map { String($0) }.joined(separator: ",")]
-        }
-        // User picked a specific segment → process from there (skip auto-select).
-        if startTime >= 0 {
-            procArgs += ["--start", "\(startTime)"]
-            if duration > 0 { procArgs += ["--duration", "\(duration)"] }
-        }
-        proc.arguments = procArgs
-        proc.environment = Self.subprocessEnvironment()
-
-        startProcess(proc)
-    }
-
-    @MainActor
-    private func startTrackMatte(python: URL, videoPath: String, outputDir: String) {
-        let script = Self.projectRoot.appendingPathComponent("scripts/track_then_matte.py")
-        fputs("DEBUG: track-matte python=\(python.path) script=\(script.path)\n", stderr)
-
-        let proc = Process()
-        proc.executableURL = python
-        proc.arguments = [
-            script.path,
-            "--video", videoPath,
-            "--output-dir", outputDir,
-            "--fps", "10",
-            "--preview-seconds", "5",
-            "--max-seconds", "15"
-        ]
+        proc.arguments = TrackMatteCommand.arguments(
+            scriptPath: script.path,
+            videoPath: videoPath,
+            outputDir: outputDir,
+            clickX: clickX,
+            clickY: clickY,
+            bbox: bbox,
+            startTime: startTime,
+            duration: duration,
+            skipsQualityCheck: skipQualityCheck)
         proc.environment = Self.subprocessEnvironment()
 
         startProcess(proc)

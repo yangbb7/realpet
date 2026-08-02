@@ -2,10 +2,10 @@
 
 ## Product boundary
 
-RealPet turns a locally imported pet video into a desktop companion. Its
-primary visual contract is source fidelity: the default renderer presents
-pixels extracted from the owner's footage, rather than redrawing the pet with
-a template, a text-to-image model, or a generic breed model.
+RealPet turns owner-imported pet photos or video into one desktop companion.
+The runtime renders processed RGB/alpha frames rather than a generic breed
+template. Its active action library is a closed 12-slot kit: one head-follow
+video plus eleven independently generated click actions.
 
 A single ordinary video cannot contain enough information to reconstruct an
 arbitrary pet as an indistinguishable, fully poseable 3D animal. In
@@ -19,18 +19,22 @@ the owner supplies short action clips.
 
 ### Functional
 
-- Import a local pet video and isolate one detected pet.
+- Require a Google/Supabase session before mounting the console, and persist
+  one local pet catalog per authenticated user.
+- Upload one to four pet photos into the user's private cloud gallery; import
+  videos locally and isolate one detected pet.
 - Render the resulting alpha frames in a transparent, always-on-top macOS
   desktop window.
-- Track the cursor by selecting a captured `gaze_left`, `gaze_right`,
-  `gaze_up`, or `gaze_down` source loop; the idle loop is the centre gaze.
-- On a click, play a captured `lie_down` action.
-- On a file drop over the body, play captured `paw`; on the head region, play
-  captured `eat`.
-- When a response asset is missing, preserve the idle source loop and expose
-  the capture requirement; never deform the full pet image as a substitute.
-- Keep all source video and derived assets in local application support
-  storage. Do not require a cloud image-generation service to show a pet.
+- Track the cursor by selecting a retained frame from the all-direction
+  `gaze_orbit` sequence. Agnes uses a signed Supabase URL for the first cloud
+  gallery photo; MiniMax receives all one to four cloud-gallery photos as
+  direct references.
+- On a click, play the next installed action video, then return to the current
+  head-follow pose.
+- Submit exactly one selected-provider task for each action slot and install it
+  at `actions/<kind>/` only after processing and validation.
+- Preserve the exact input/output frame count throughout generated-action
+  processing and retain source frames locally.
 
 ### Non-functional
 
@@ -39,27 +43,34 @@ the owner supplies short action clips.
 - Frame cache: bounded to 24 decoded frames.
 - Import: the expensive detection/matting work is off the main thread and is
   cancellable.
-- Privacy: video, alpha frames, and features never leave the Mac in the
-  default path.
+- Privacy: original reference photos are stored in the authenticated user's
+  private Supabase gallery and sent to the selected video provider only for
+  generation. Video, alpha frames, and features remain on the Mac.
 - Recovery: persisted in-flight work becomes retryable after restart.
 
 ## Runtime topology
 
 ```text
-Local video
+Owner photos (1-4) / custom video
+    |
+    +--> Google OAuth -> private Supabase gallery -> signed URL -> Agnes Video V2.0
+    |                         ^
+    |                         | first gallery photo
+    |
+    +--> MiniMax: all original photos -> MiniMax H3 reference_image inputs
     |
     v
-QC -> pet detection -> track + matting -> normalized RGB/alpha frames
-                                          |
-                                          +--> actions.json (idle + captured response pack)
-                                          |
-                                          +--> pet-features.json (Vision head/eye/paw anchors)
-                                          |
-                                          v
-SwiftUI library -> PetLauncher -> FrameSequencePetRuntime -> transparent NSPanel
-                                      |                         |
-                                      v                         +--> mouse/file-drop observations
-                               InteractionHub <--- PetBehaviorDirector
+QC/detection -> track + matting -> normalized RGB/alpha action frames
+                                      |
+                                      +--> actions.json (12 fixed slots)
+                                      |
+                                      +--> pet-features.json (Vision anchors)
+                                      |
+                                      v
+SwiftUI singleton -> PetLauncher -> FrameSequencePetRuntime -> transparent NSPanel
+                                           |                         |
+                                           v                         +--> cursor/tap observations
+                                    InteractionHub <--- PetBehaviorDirector
 ```
 
 The Python pipeline owns asset preparation only. The macOS app owns windows,
@@ -70,35 +81,30 @@ There is no Python GUI process in the target runtime.
 
 | Tier | Asset source | Behaviour quality | Product status |
 | --- | --- | --- | --- |
-| Source loop | Matched RGB/alpha frame pairs from the imported video | Real captured movement | Default |
-| Captured response pack | Gaze plus separately captured, validated action clips of the same pet | Real gaze, lie-down, paw, and eating movement | Fidelity mode |
-| Incomplete capture pack | Source loop only | Shows the real pet but declares missing response coverage | Default after one idle import |
-| Generated action | Quality-gated image/video output derived from approved owner references | May add an experimental non-fidelity action, subject to identity drift risk | Never used by fidelity mode |
+| Head-follow | One selected-provider video conditioned on original owner photos | Retained frame-based cursor gaze | Required first action |
+| Fixed action video | One quality-gated provider video per named slot | Plays in full, then returns to head following | Opt-in per slot |
+| Source loop | Matched RGB/alpha frame pairs from an imported video | Real captured movement | Video import baseline |
+| Incomplete fixed kit | Head-follow plus any subset of 11 click actions | Only installed actions can play | Expected during setup |
 | Generative/rigged model | A new image, rig, or inferred mesh | Novel pose only, visual identity can drift | Not a supported default |
 
 ## Data contracts
 
-`Pet` persists the source location, prepared frame directory, frame rate, and
-the chosen renderer. `actions.json` is an allow-listed action manifest rooted
-under the prepared frame directory. Runtime commands remain versioned and
-expiring. File drops publish semantic observations; the renderer never opens,
-executes, or persists a dropped file.
+`PetStorage` persists one newest active `Pet` record, while preserving older
+asset directories. `actions.json` is an allow-listed manifest rooted under the
+prepared frame directory. Every fixed action owns exactly one `actions/<kind>/`
+frame sequence. Runtime commands remain versioned and expiring; cursor and tap
+handling never open, execute, or persist a dropped file.
 
 ## Rollout plan
 
-1. Make the native frame renderer the import default and retain Live2D only as
-   a legacy fallback. This is implemented in the current refactor.
-2. Add a guided action-capture flow for gaze directions plus short `lie_down`,
-   `paw`, and `eat` clips, with automatic validation against the base pet
-   identity. The implemented local workbench shows 7-slot coverage, reuses the
-   matte pipeline's quality gates, compares foreground appearance to the idle
-   frames, and requires owner preview/acceptance before atomic installation.
-3. Extract animal-pose/landmark confidence to define head and eye regions. This
-   is implemented with Vision and falls back to geometry when unavailable.
-4. Integrate a server-side image/video action-generation service only after it
-   meets measured identity similarity, temporal consistency, retention, billing,
-   and explicit-consent requirements. Generated clips must be marked in the
-   manifest and cannot replace the source loop.
+1. Use the native source-frame renderer for every prepared action and retain
+   Live2D only as legacy compatibility.
+2. Require a 12-slot fixed action manifest and a one-to-one mapping from a
+   selected slot to one Agnes Video V2.0 or MiniMax H3 task.
+3. Preserve all generated frames through extraction, matting, validation, and
+   installation; reject frame-count mismatches.
+4. Measure identity and temporal quality on generated output before raising
+   product claims beyond this implementation contract.
 
 ## Failure modes
 
@@ -106,7 +112,8 @@ executes, or persists a dropped file.
 | --- | --- | --- |
 | No pet or multiple ambiguous pets | Wrong subject could be extracted | Stop import and require a better clip/selection flow |
 | Matting quality fails | Visual artifacts | Reject the output before it is shown |
-| Missing response clip | Requested gaze or action is not captured | Keep source idle and request the corresponding capture; never substitute a generic animal |
+| Missing action slot | User clicks before that named video is installed | Skip unavailable slots and keep cursor head following |
+| Provider task failure | The selected Agnes action cannot be created or completed | Leave current action directories unchanged and show the provider error |
 | Corrupt frame directory | Blank or unsafe runtime | Validate paths and fail launch with a retryable error |
 | Slow storage/large clip | Stutter or memory pressure | Bounded decoded-frame cache and frame dropping |
 

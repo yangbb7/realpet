@@ -96,21 +96,13 @@ struct OpenAIImageAPIConfiguration: Equatable, Sendable {
         baseURL.appendingPathComponent("videos", isDirectory: false)
     }
 
-    func videoURL(id: String) -> URL {
-        videosURL.appendingPathComponent(id, isDirectory: false)
-    }
-
-    func videoContentURL(id: String) -> URL {
-        videoURL(id: id).appendingPathComponent("content", isDirectory: false)
-    }
-
     var agnesVideoResultURL: URL {
         baseURL.deletingLastPathComponent().appendingPathComponent(
             "agnesapi", isDirectory: false)
     }
 
     var isAgnesAPI: Bool {
-        baseURL.host?.lowercased() == "apihub.agnes-ai.com"
+        baseURL.host?.lowercased() == "api.agnes-ai.cn"
     }
 
     var normalizedBaseURLString: String {

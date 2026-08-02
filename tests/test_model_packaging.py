@@ -9,6 +9,7 @@ from scripts.prepare_birefnet_fp16 import (
     RUNTIME_FILES,
     convert_snapshot,
 )
+from scripts import verify_release_assets
 
 
 def _write_snapshot(path):
@@ -56,3 +57,15 @@ def test_explicit_birefnet_checkpoint_wins(tmp_path, monkeypatch):
     explicit = tmp_path / "custom-model"
     monkeypatch.setenv("REALPET_BIREFNET_CHECKPOINT", str(explicit))
     assert birefnet_checkpoint() == str(explicit)
+
+
+def test_release_asset_verifier_rejects_unexpected_content(tmp_path, monkeypatch):
+    asset = tmp_path / "model.bin"
+    asset.write_bytes(b"not a verified model")
+    monkeypatch.setattr(
+        verify_release_assets,
+        "ASSETS",
+        (("fixture", "model.bin", "0" * 64),),
+    )
+
+    assert not verify_release_assets.verify_release_assets(tmp_path)

@@ -1,54 +1,61 @@
 #!/usr/bin/env python3
-"""Bundle ALL model weights for the v0.2.0 double-click DMG.
+"""Fetch and verify every immutable model artifact used in a release bundle."""
 
-Layout (under --out):
-  weights/sam2/sam2.1_hiera_tiny.pt
-  weights/hf/models--ZhengPeng7--BiRefNet-matting/snapshots/<sha>/
-  weights/birefnet-fp16/  (MPS-equivalent release checkpoint)
-  weights/torch/hub/checkpoints/fasterrcnn_resnet50_fpn_v2_coco32689bffd.pth
-
-Idempotent + --verify-only + honors HF_ENDPOINT (auto via huggingface_hub).
-"""
 import argparse
+import hashlib
 import os
-import sys
 import urllib.request
+from pathlib import Path
+
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_OUT = os.environ.get(
     "REALPET_WEIGHTS_DIR", os.path.join(PROJECT_ROOT, "weights"))
 
 BIREFNET_REPO = "ZhengPeng7/BiRefNet-matting"
-BIREFNET_FP16_EXPECTED_SIZE = 420_000_000
+BIREFNET_REVISION = "57f9f68b43ba337c75762b14cf3075d659007268"
+BIREFNET_SOURCE_SHA256 = "a9875de5b1e6c8eb5fdaa8c727a82927ce442cdc87ba3abee6a77e6fa46c25bb"
 RCNN_URL = ("https://download.pytorch.org/models/"
             "fasterrcnn_resnet50_fpn_v2_coco-dd69338a.pth")
-RCNN_EXPECTED_SIZE = 167_000_000
+RCNN_SHA256 = "dd69338a24b8d7381807e247652bdc356325bcbaf1cd3e092e00e0a1a58706bf"
 
 
-def _ensure_env(out_dir):
-    """download_weights.py reads REALPET_WEIGHTS_DIR at import time."""
-    os.environ.setdefault("REALPET_WEIGHTS_DIR", out_dir)
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def download_birefnet(out_dir, force=False):
+def _birefnet_source_path(out_dir: str | Path) -> Path:
+    return (Path(out_dir) / "hf" / "models--ZhengPeng7--BiRefNet-matting"
+            / "snapshots" / BIREFNET_REVISION / "model.safetensors")
+
+
+def download_birefnet(out_dir: str, force: bool = False) -> None:
     from huggingface_hub import snapshot_download
-    dest = os.path.join(out_dir, "hf")
-    repo_dir = os.path.join(
-        dest, "models--ZhengPeng7--BiRefNet-matting")
-    if not force and os.path.isdir(repo_dir):
-        print("BiRefNet already present")
+
+    source = _birefnet_source_path(out_dir)
+    if not force and source.is_file() and sha256_file(source) == BIREFNET_SOURCE_SHA256:
+        print("BiRefNet source checkpoint verified")
         return
-    print(f"Downloading BiRefNet-matting to {dest} ...")
+
+    dest = os.path.join(out_dir, "hf")
+    print(f"Downloading BiRefNet-matting revision {BIREFNET_REVISION} to {dest} ...")
     snapshot_download(
         repo_id=BIREFNET_REPO,
+        revision=BIREFNET_REVISION,
         cache_dir=dest,
         # Runtime-only snapshot. Prefer safetensors so a future duplicate .bin
         # checkpoint cannot silently double the app size.
         allow_patterns=["*.json", "*.py", "*.safetensors", "*.txt"],
     )
+    if not source.is_file() or sha256_file(source) != BIREFNET_SOURCE_SHA256:
+        raise RuntimeError("BiRefNet source checkpoint does not match the pinned SHA-256")
 
 
-def prepare_birefnet_fp16(out_dir, force=False):
+def prepare_birefnet_fp16(out_dir: str, force: bool = False) -> None:
     """Materialize the exact half-precision checkpoint used on MPS."""
     from prepare_birefnet_fp16 import convert_snapshot, find_snapshot
 
@@ -57,122 +64,75 @@ def prepare_birefnet_fp16(out_dir, force=False):
     convert_snapshot(source, output, force=force)
 
 
-def download_faster_rcnn(out_dir, force=False):
-    dest_dir = os.path.join(out_dir, "torch", "hub", "checkpoints")
-    os.makedirs(dest_dir, exist_ok=True)
-    dest = os.path.join(dest_dir, os.path.basename(RCNN_URL))
-    if os.path.exists(dest) and not force:
-        size = os.path.getsize(dest)
-        if size >= RCNN_EXPECTED_SIZE * 0.9:
-            print(f"Faster R-CNN already present: {dest} ({size:,} bytes)")
+def download_faster_rcnn(out_dir: str, force: bool = False) -> None:
+    dest_dir = Path(out_dir) / "torch" / "hub" / "checkpoints"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / os.path.basename(RCNN_URL)
+    if dest.is_file() and not force:
+        if sha256_file(dest) == RCNN_SHA256:
+            print(f"Faster R-CNN checkpoint verified: {dest}")
             return
-        print(f"Existing Faster R-CNN too small ({size:,} bytes), "
+        print("Existing Faster R-CNN checkpoint does not match the pinned SHA-256, "
               "re-downloading...")
-        os.remove(dest)
+        dest.unlink()
 
     print(f"Downloading Faster R-CNN to {dest} ...")
-    req = urllib.request.Request(
+    request = urllib.request.Request(
         RCNN_URL,
-        headers={
-            "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/125.0.0.0 Safari/537.36")
-        },
+        headers={"User-Agent": "RealPet release preparation"},
     )
-
-    block_size = 1024 * 1024
-    with urllib.request.urlopen(req) as response, open(dest, "wb") as out:
-        total = int(response.headers.get("Content-Length", 0))
-        downloaded = 0
-        while True:
-            chunk = response.read(block_size)
-            if not chunk:
-                break
-            out.write(chunk)
-            downloaded += len(chunk)
-            if total > 0:
-                pct = min(100, downloaded * 100 // total)
-                mb = downloaded / (1024 * 1024)
-                total_mb = total / (1024 * 1024)
-                print(f"\r  {pct}% ({mb:.1f}/{total_mb:.1f} MB)", end="",
-                      flush=True)
-        print()
-    size = os.path.getsize(dest)
-    print(f"Done. ({size:,} bytes)")
+    temporary = dest.with_suffix(f"{dest.suffix}.download")
+    if temporary.exists():
+        temporary.unlink()
+    try:
+        with urllib.request.urlopen(request) as response, temporary.open("wb") as output:
+            while chunk := response.read(1024 * 1024):
+                output.write(chunk)
+        if sha256_file(temporary) != RCNN_SHA256:
+            raise RuntimeError("Faster R-CNN checkpoint does not match the pinned SHA-256")
+        temporary.replace(dest)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    print(f"Faster R-CNN checkpoint verified: {dest}")
 
 
-def verify(out_dir):
-    """Exit 0 if all three weights are present and sized, 1 otherwise."""
-    _ensure_env(out_dir)
-    from download_weights import SAM2_EXPECTED_SIZE
+def verify(out_dir: str) -> bool:
+    """Return whether all source and generated release assets match hashes."""
+    from verify_release_assets import verify_release_assets
 
-    sam2_path = os.path.join(out_dir, "sam2", "sam2.1_hiera_tiny.pt")
-    checks = [
-        ("SAM2", sam2_path, SAM2_EXPECTED_SIZE, "file"),
-        ("BiRefNet FP16", os.path.join(out_dir, "birefnet-fp16"),
-         BIREFNET_FP16_EXPECTED_SIZE, "dir"),
-        ("Faster R-CNN", os.path.join(out_dir, "torch", "hub", "checkpoints",
-                                      os.path.basename(RCNN_URL)),
-         RCNN_EXPECTED_SIZE, "file"),
-    ]
-    ok = True
-    for label, path, floor, kind in checks:
-        if not os.path.exists(path):
-            print(f"  !! {label}: missing at {path}")
-            ok = False
-            continue
-        if kind == "file":
-            size = os.path.getsize(path)
-        else:
-            # Hugging Face snapshots symlink into blobs. Do not follow those
-            # links or the report double-counts the same 885 MB checkpoint.
-            size = sum(
-                os.path.getsize(file_path)
-                for root, _, files in os.walk(path)
-                for f in files
-                if not os.path.islink(file_path := os.path.join(root, f))
-            )
-        marker = "ok" if size >= floor * 0.9 else "!!"
-        if marker == "!!":
-            ok = False
-        print(f"  {marker} {label}: {size / 1024 / 1024:,.0f} MB")
-    sys.exit(0 if ok else 1)
+    return verify_release_assets(Path(out_dir))
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Bundle all model weights for the RealPet double-click DMG.")
-    parser.add_argument(
-        "--out", default=DEFAULT_OUT,
-        help="Output directory for weights (default: weights/ or "
-             "REALPET_WEIGHTS_DIR).")
+        description="Bundle pinned model weights for the RealPet release app.")
+    parser.add_argument("--out", default=DEFAULT_OUT,
+                        help="Output directory (default: weights/ or REALPET_WEIGHTS_DIR).")
     parser.add_argument("--force", action="store_true",
-                        help="Force re-download even if files exist.")
+                        help="Re-fetch the pinned source artifacts.")
     parser.add_argument("--verify-only", action="store_true",
-                        help="Verify existing weights and exit.")
+                        help="Validate existing artifacts without downloading.")
     args = parser.parse_args()
 
-    os.makedirs(args.out, exist_ok=True)
-    _ensure_env(args.out)
+    Path(args.out).mkdir(parents=True, exist_ok=True)
+    os.environ["REALPET_WEIGHTS_DIR"] = args.out
 
     if args.verify_only:
-        verify(args.out)
-        return
+        return 0 if verify(args.out) else 1
 
     from download_weights import download_sam2
 
-    print("Bundling SAM2...")
-    download_sam2(force=args.force)
-    print()
-    print("Bundling BiRefNet...")
+    print("Preparing SAM2...")
+    if not download_sam2(force=args.force):
+        return 1
+    print("Preparing BiRefNet...")
     download_birefnet(args.out, force=args.force)
     prepare_birefnet_fp16(args.out, force=args.force)
-    print()
-    print("Bundling Faster R-CNN...")
+    print("Preparing Faster R-CNN...")
     download_faster_rcnn(args.out, force=args.force)
-    print()
-    verify(args.out)
+    return 0 if verify(args.out) else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -23,7 +23,7 @@ enum MiniMaxH3VideoGenerationError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .invalidAPIKey: return "MiniMax API Key 无效"
-        case .invalidReferenceImage: return "Agnes Image 没有返回可用于 MiniMax H3 的公开参考图"
+        case .invalidReferenceImage: return "MiniMax H3 需要 1 到 4 张可读取的宠物原图"
         case .invalidResponse: return "MiniMax H3 没有返回有效任务"
         case .failed(let message): return "MiniMax H3 视频生成失败：\(message)"
         case .requestFailed(let status, let message):
@@ -47,16 +47,19 @@ struct MiniMaxH3VideoGenerationClient {
         }
     }
 
+    /// MiniMax H3 receives only the one to four original user photos as
+    /// reference images. It never combines a generated first frame or a
+    /// built-in pose image with those references.
     func create(
         prompt: String,
-        firstFrameURL: URL,
+        referenceImages: [PetReferenceImageData],
         apiKey: String,
         configuration: MiniMaxVideoAPIConfiguration,
         seconds: Int
     ) async throws -> MiniMaxH3VideoGenerationJob {
-        try await sendJobRequest(Self.makeCreateRequest(
+        try await sendJobRequest(Self.makeReferenceCreateRequest(
             prompt: prompt,
-            firstFrameURL: firstFrameURL,
+            referenceImages: referenceImages,
             apiKey: apiKey,
             configuration: configuration,
             seconds: seconds), isCreate: true)
@@ -89,31 +92,31 @@ struct MiniMaxH3VideoGenerationClient {
         return data
     }
 
-    static func makeCreateRequest(
+    static func makeReferenceCreateRequest(
         prompt: String,
-        firstFrameURL: URL,
+        referenceImages: [PetReferenceImageData],
         apiKey: String,
         configuration: MiniMaxVideoAPIConfiguration,
         seconds: Int
     ) throws -> URLRequest {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty,
-              firstFrameURL.scheme?.lowercased() == "https" else {
+              (1...PetImageLibraryPolicy.maximumImageCount).contains(referenceImages.count),
+              referenceImages.allSatisfy({ !$0.data.isEmpty && !$0.mimeType.isEmpty }),
+              (4...15).contains(seconds) else {
             throw MiniMaxH3VideoGenerationError.invalidReferenceImage
         }
-        guard (4...15).contains(seconds) else {
-            throw MiniMaxH3VideoGenerationError.invalidResponse
-        }
+        var content: [[String: Any]] = [["type": "text", "text": trimmedPrompt]]
+        content.append(contentsOf: referenceImages.map { image in
+            [
+                "type": "image_url",
+                "image_url": ["url": image.dataURI],
+                "role": "reference_image",
+            ]
+        })
         let payload: [String: Any] = [
             "model": "MiniMax-H3",
-            "content": [
-                ["type": "text", "text": trimmedPrompt],
-                [
-                    "type": "image_url",
-                    "image_url": ["url": firstFrameURL.absoluteString],
-                    "role": "first_frame",
-                ],
-            ],
+            "content": content,
             "resolution": "2K",
             "duration": seconds,
             "ratio": "adaptive",

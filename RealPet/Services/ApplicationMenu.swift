@@ -63,14 +63,3 @@ enum ApplicationMenu {
         application.mainMenu = mainMenu
     }
 }
-
-enum ClipboardTextReader {
-    static func trimmedString(from pasteboard: NSPasteboard = .general) -> String? {
-        guard let value = pasteboard.string(forType: .string)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !value.isEmpty else {
-            return nil
-        }
-        return value
-    }
-}

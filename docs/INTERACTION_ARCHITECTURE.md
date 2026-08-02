@@ -11,10 +11,11 @@ versioned manifests beside the frames:
 - `actions.json`: idle plus any captured or generated action clips.
 - `pet-features.json`: Vision-derived head, eye, nose, and front-paw anchors.
 
-Pointer observation, personality decisions, semantic capability gates, local
-camera/speech/VLM adapters, bounded ephemeral evidence, and session-only
-behavior memory remain implemented. Raw camera frames, microphone audio, and
-transcripts are not persisted by these adapters.
+Pointer observation, deterministic action bindings, semantic capability gates,
+and local camera/speech/VLM adapters remain implemented. The desktop runtime
+does not run autonomous movement, per-pet personality tuning, or a local
+behavior planner. Raw camera frames, microphone audio, and transcripts are not
+persisted by these adapters.
 
 ## Runtime Flow
 
@@ -107,14 +108,9 @@ behind a server-side job API and must not ship in the macOS app.
 Capabilities describe what a pet has real assets for: locomotion, reactions, and
 orientation. Commands are schema-checked, pet-ID scoped, expiry-checked, and
 capability-gated before the runtime receives them. Unknown action names and
-out-of-bounds coordinates are rejected. Dragging and pausing suppress ordinary
-autonomous commands but retain bounded semantic state.
-
-The optional local behavior planner may advise only `none`, `react`, or
-`wander`; deterministic Swift code remains authoritative. It receives no raw
-frames, paths, runtime handles, or microphone content. Camera, speech, and local
-VLM adapters similarly emit allow-listed semantics, apply backpressure, and
-discard late or expired results.
+out-of-bounds coordinates are rejected. Dragging temporarily pauses only the
+current direct interaction. Camera, speech, and local VLM adapters emit
+allow-listed semantics, apply backpressure, and discard late or expired results.
 
 ## Legacy Cubism
 

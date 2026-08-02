@@ -5,8 +5,6 @@ import SwiftUI
 @MainActor
 class PetListViewModel: ObservableObject {
     @Published var pets: [Pet] = []
-    @Published var showFilePicker = false
-    @Published var showPhotoPicker = false
     @Published private(set) var activeActionImport: ActiveActionImport?
     @Published private(set) var actionLibraryRevision = 0
     @Published private(set) var validatingActionPetId: UUID?
@@ -18,18 +16,21 @@ class PetListViewModel: ObservableObject {
     @Published var showVisionModelSetup = false
     @Published private(set) var localVLMConfiguration: LocalVLMConfiguration
     @Published private(set) var localVLMRuntimeState: LocalVLMRuntimeState
-    @Published private(set) var localBehaviorPlannerConfiguration:
-        LocalBehaviorPlannerConfiguration
-    @Published private(set) var localBehaviorPlannerRuntimeState:
-        LocalBehaviorPlannerRuntimeState
-    @Published private(set) var behaviorSnapshots: [UUID: PetBehaviorSnapshot] = [:]
-    @Published var personalitySetupPet: Pet?
-    @Published private(set) var rigGenerationPetId: UUID?
-    @Published private(set) var rigGenerationStage: String?
+    @Published var showPetImageManager = false
     @Published private(set) var pendingActionReview: PendingActionReview?
-    @Published var motionStudioPet: Pet?
+    /// The pet whose action composer is currently expanded in the main console.
+    @Published var motionComposerPet: Pet?
+    @Published private(set) var selectedMotionAction: FixedPetAction = .headFollow
+    @Published private(set) var generatingMotionAction: FixedPetAction?
     @Published private(set) var motionWorkflowState: MotionWorkflowState = .idle
     @Published private(set) var motionServiceConfiguration: MotionServiceConfiguration
+    @Published private(set) var recoverableMotionJobs: [MotionGenerationJob] = []
+    /// Preview files are expendable cache entries. Owner photos themselves
+    /// live only in the signed-in user's private cloud gallery.
+    @Published private(set) var cloudReferencePreviewURLs: [UUID: URL] = [:]
+    @Published private(set) var isSynchronizingCloudGallery = false
+    @Published private(set) var cloudAccountIsReady = false
+    @Published private(set) var cloudGalleryError: String?
 
     let pythonBridge = PythonBridge()
     let petLauncher = PetLauncher()
@@ -37,19 +38,23 @@ class PetListViewModel: ObservableObject {
 
     private var generatedInitialPetId: UUID?
     private var motionGenerationTask: Task<Void, Never>?
-    private var generatedMotionInstallQueue: [StagedGeneratedMotionVideo] = []
+    private var activeMotionJobID: UUID?
+    private let motionJobStore = MotionGenerationJobStore.shared
+    private var activeCloudOwnerID: UUID?
     private var cameraInteractionAdapter: CameraInteractionAdapter?
     private var vlmInteractionAdapter: VLMInteractionAdapter?
     private var speechInteractionAdapter: SpeechInteractionAdapter?
-    private var behaviorSnapshotsCancellable: AnyCancellable?
-    private var behaviorPlanningCoordinator: BehaviorPlanningCoordinator?
-    private let templateClassifier = PetTemplateClassifier()
+
+    var pet: Pet? { pets.first }
 
     struct ActiveActionImport: Equatable {
         let petId: UUID
         let kind: PetActionManifest.Action.Kind
+        let actionID: String
+        let displayNameOverride: String?
         let rootFramesDirectory: String
         let workDirectory: String
+        let sourceVideoPath: String?
         let origin: PetActionManifest.Action.Origin
     }
 
@@ -57,6 +62,8 @@ class PetListViewModel: ObservableObject {
         let id: UUID
         let petId: UUID
         let kind: PetActionManifest.Action.Kind
+        let actionID: String
+        let displayName: String
         let framesDirectory: String
         let frameCount: Int
         let fps: Int
@@ -72,6 +79,12 @@ class PetListViewModel: ObservableObject {
         let videoURL: URL
     }
 
+    private struct GeneratedRemoteMotionVideo {
+        let remoteJobID: String
+        let localJobID: UUID
+        let data: Data
+    }
+
     struct ClipChoice {
         let start: Double
         let duration: Double
@@ -81,22 +94,48 @@ class PetListViewModel: ObservableObject {
 
     init() {
         let vlmConfiguration = LocalVLMConfigurationStore.load()
-        let plannerConfiguration = LocalBehaviorPlannerConfigurationStore.load()
         motionServiceConfiguration = MotionServiceConfigurationStore.load()
         localVLMConfiguration = vlmConfiguration
         localVLMRuntimeState = Self.restingVLMState(for: vlmConfiguration)
-        localBehaviorPlannerConfiguration = plannerConfiguration
-        localBehaviorPlannerRuntimeState = Self.restingPlannerState(
-            for: plannerConfiguration)
-        let recovery = Pet.recoveringAfterLaunch(PetStorage.shared.load())
-        pets = recovery.pets
-        if recovery.changed {
-            PetStorage.shared.save(pets)
+        let storedPets: [Pet]
+        do {
+            storedPets = try PetStorage.shared.load()
+        } catch {
+            storedPets = []
+            pythonBridge.error = error.localizedDescription
         }
-        behaviorSnapshotsCancellable = petLauncher.$behaviorSnapshots
-            .sink { [weak self] snapshots in
-                self?.behaviorSnapshots = snapshots
+        let recovery = Pet.recoveringAfterLaunch(storedPets)
+        var recoveredPets = recovery.pets
+        var referenceImagesChanged = false
+        for index in recoveredPets.indices {
+            let localReferences = recoveredPets[index].referenceImages
+            let limitedLocalReferences = Array(localReferences.prefix(
+                PetImageLibraryPolicy.maximumImageCount))
+            let cloudReferences = recoveredPets[index].cloudReferences
+            let limitedCloudReferences = Array(cloudReferences.prefix(
+                PetImageLibraryPolicy.maximumImageCount))
+            if limitedLocalReferences.count != localReferences.count {
+                recoveredPets[index].referenceImagePaths = limitedLocalReferences
+                referenceImagesChanged = true
             }
+            if limitedCloudReferences.count != cloudReferences.count {
+                recoveredPets[index].cloudReferenceImages = limitedCloudReferences
+                referenceImagesChanged = true
+            }
+        }
+        pets = recoveredPets
+        if recovery.changed || referenceImagesChanged {
+            persistPets()
+        }
+        for pet in pets {
+            guard let framesDir = pet.framesDir else { continue }
+            do {
+                try PetActionLibrary.recoverInterruptedInstall(
+                    rootFramesDirectory: URL(fileURLWithPath: framesDir))
+            } catch {
+                pythonBridge.error = "无法恢复动作安装：\(error.localizedDescription)"
+            }
+        }
         NotificationCenter.default.addObserver(
             self, selector: #selector(onProcessingComplete(_:)),
             name: .processingComplete, object: nil
@@ -113,16 +152,147 @@ class PetListViewModel: ObservableObject {
             self, selector: #selector(onProcessingFailed(_:)),
             name: .processingFailed, object: nil
         )
+        loadRecoverableMotionJobs()
+    }
+
+    private func loadRecoverableMotionJobs() {
         do {
-            try configureBehaviorPlanner()
+            recoverableMotionJobs = try motionJobStore.load()
         } catch {
-            localBehaviorPlannerRuntimeState = .failed(error.localizedDescription)
+            recoverableMotionJobs = []
+            motionWorkflowState = .failed("无法恢复未完成的视频任务：\(error.localizedDescription)")
         }
     }
 
+    @discardableResult
+    private func persistMotionJob(_ job: MotionGenerationJob) throws -> MotionGenerationJob {
+        var updated = job
+        updated.updatedAt = Date()
+        try motionJobStore.upsert(updated)
+        if let index = recoverableMotionJobs.firstIndex(where: { $0.id == updated.id }) {
+            recoverableMotionJobs[index] = updated
+        } else {
+            recoverableMotionJobs.append(updated)
+        }
+        return updated
+    }
+
+    private func removeMotionJob(_ id: UUID) {
+        do {
+            try motionJobStore.remove(id: id)
+            recoverableMotionJobs.removeAll { $0.id == id }
+        } catch {
+            motionWorkflowState = .failed("视频已生成，但无法清理任务记录：\(error.localizedDescription)")
+        }
+    }
+
+    private func markMotionJob(
+        _ id: UUID,
+        state: MotionGenerationJob.State,
+        failureMessage: String? = nil
+    ) {
+        guard let existing = recoverableMotionJobs.first(where: { $0.id == id }) else { return }
+        var updated = existing
+        updated.state = state
+        updated.failureMessage = failureMessage
+        _ = try? persistMotionJob(updated)
+    }
+
+    private func cancelPersistedMotionJob(_ id: UUID) {
+        guard let job = recoverableMotionJobs.first(where: { $0.id == id }) else { return }
+        // A task without a provider ID was never submitted, so retaining it
+        // cannot produce a recoverable result after relaunch.
+        guard job.remoteJobID != nil else {
+            removeMotionJob(id)
+            return
+        }
+        markMotionJob(id, state: .cancelledLocally)
+    }
+
+    private func resumeMotionGeneration(_ job: MotionGenerationJob) async {
+        guard !motionWorkflowState.isBusy,
+              let pet = pets.first(where: { $0.id == job.petID }),
+              let remoteJobID = job.remoteJobID else { return }
+        selectedMotionAction = job.action
+        generatingMotionAction = job.action
+        activeMotionJobID = job.id
+        motionWorkflowState = .waitingForVideo(provider: job.provider, progress: nil)
+        do {
+            let data: Data
+            switch job.provider {
+            case .agnes:
+                let key = try BundledAgnesVideoService.apiKey()
+                let configuration = try motionServiceConfiguration.validatedAgnesAPIConfiguration()
+                let client = AgnesVideoGenerationClient()
+                var remote = try await client.retrieve(
+                    id: remoteJobID, apiKey: key, configuration: configuration)
+                while remote.status == .queued || remote.status == .processing {
+                    try await Task.sleep(for: .seconds(5))
+                    remote = try await client.retrieve(
+                        id: remoteJobID, apiKey: key, configuration: configuration)
+                }
+                guard remote.status == .completed else {
+                    throw AgnesVideoGenerationError.failed("恢复的 Agnes Video 任务未成功完成")
+                }
+                markMotionJob(job.id, state: .downloading)
+                data = try await client.downloadContent(job: remote)
+            case .miniMaxH3:
+                guard let key = OpenAIAPIKeyStore.loadMiniMaxMotionService() else {
+                    throw MiniMaxH3VideoGenerationError.invalidAPIKey
+                }
+                let configuration = try MiniMaxVideoAPIConfiguration(
+                    baseURLString: motionServiceConfiguration.resolvedMiniMaxBaseURLString)
+                let client = MiniMaxH3VideoGenerationClient()
+                var remote = try await client.retrieve(
+                    id: remoteJobID, apiKey: key, configuration: configuration)
+                while remote.status == .queued || remote.status == .processing {
+                    try await Task.sleep(for: .seconds(5))
+                    remote = try await client.retrieve(
+                        id: remoteJobID, apiKey: key, configuration: configuration)
+                }
+                guard remote.status == .completed else {
+                    throw MiniMaxH3VideoGenerationError.failed("恢复的 MiniMax 任务未成功完成")
+                }
+                markMotionJob(job.id, state: .downloading)
+                data = try await client.downloadContent(job: remote)
+            }
+            let staged = try stageGeneratedMotionVideo(
+                data: data, for: pet, kind: job.action.kind, jobID: remoteJobID)
+            try startGeneratedActionImport(staged)
+            removeMotionJob(job.id)
+            activeMotionJobID = nil
+        } catch {
+            markMotionJob(job.id, state: .failed, failureMessage: error.localizedDescription)
+            activeMotionJobID = nil
+            generatingMotionAction = nil
+            motionWorkflowState = .failed("恢复视频任务失败：\(error.localizedDescription)")
+        }
+    }
+
+    func recoverableMotionJob(for pet: Pet) -> MotionGenerationJob? {
+        recoverableMotionJobs
+            .filter { $0.petID == pet.id && $0.remoteJobID != nil }
+            .sorted { $0.updatedAt > $1.updatedAt }
+            .first
+    }
+
+    func resumeMotionGenerationJob(_ job: MotionGenerationJob) {
+        guard !motionWorkflowState.isBusy,
+              job.remoteJobID != nil,
+              job.state != .failed else { return }
+        markMotionJob(job.id, state: .submitted)
+        Task { [weak self] in
+            await self?.resumeMotionGeneration(job)
+        }
+    }
+
+    func discardMotionGenerationJob(_ job: MotionGenerationJob) {
+        guard !motionWorkflowState.isBusy else { return }
+        removeMotionJob(job.id)
+    }
+
     var hasActiveWorkflow: Bool {
-        rigGenerationPetId != nil
-            || motionWorkflowState.isBusy
+        motionWorkflowState.isBusy
             || activeActionImport != nil
             || pythonBridge.isProcessing
             || pets.contains {
@@ -132,9 +302,37 @@ class PetListViewModel: ObservableObject {
             }
     }
 
-    func importVideo(url: URL) {
+    /// A pet record is required for every motion task. If an old task is left
+    /// behind after its pet was removed, it must not permanently disable the
+    /// two import entry points on the empty start screen.
+    var canImportPetMedia: Bool {
+        guard pets.isEmpty else {
+            return !hasActiveWorkflow && !isSynchronizingCloudGallery
+        }
+        return activeActionImport == nil
+            && !pythonBridge.isProcessing
+            && !isSynchronizingCloudGallery
+    }
+
+    private func clearOrphanedMotionWorkflowBeforeImport() {
+        guard pets.isEmpty, motionWorkflowState.isBusy else { return }
+        cancelMotionGeneration()
+    }
+
+    func importCustomActionVideo(url: URL, named name: String) {
         guard !hasActiveWorkflow else {
             pythonBridge.error = "当前有其他任务正在处理"
+            return
+        }
+        guard let currentPet = pet,
+              let rootFramesDirectory = currentPet.framesDir else {
+            pythonBridge.error = "请先完成头部跟随，再导入自定义动作"
+            return
+        }
+        let displayName = String(name.trimmingCharacters(
+            in: .whitespacesAndNewlines).prefix(40))
+        guard !displayName.isEmpty else {
+            pythonBridge.error = "请填写自定义动作名称"
             return
         }
         let hasSecurityScopedAccess = url.startAccessingSecurityScopedResource()
@@ -144,138 +342,420 @@ class PetListViewModel: ObservableObject {
             }
         }
 
-        let id = UUID()
-        let petDir = PetStorage.shared.petDirectory(for: id)
-        try? FileManager.default.createDirectory(at: petDir, withIntermediateDirectories: true)
-
-        let destPath = petDir.appendingPathComponent(url.lastPathComponent).path
+        let actionID = "custom-\(UUID().uuidString.lowercased())"
+        let workDirectory = PetStorage.shared.petDirectory(for: currentPet.id)
+            .appendingPathComponent("custom-action-imports")
+            .appendingPathComponent(actionID)
+        try? FileManager.default.createDirectory(
+            at: workDirectory, withIntermediateDirectories: true)
+        let extensionName = url.pathExtension.isEmpty
+            ? "mp4" : url.pathExtension.lowercased()
+        let sourceVideo = workDirectory.appendingPathComponent("source.\(extensionName)")
         do {
-            try FileManager.default.copyItem(atPath: url.path, toPath: destPath)
+            try FileManager.default.copyItem(at: url, to: sourceVideo)
         } catch {
-            pythonBridge.error = "Failed to copy video: \(error.localizedDescription)"
+            try? FileManager.default.removeItem(at: workDirectory)
+            pythonBridge.error = "自定义动作视频导入失败：\(error.localizedDescription)"
             return
         }
 
-        let name = url.deletingPathExtension().lastPathComponent
-        let pet = Pet(
-            id: id,
-            name: name,
-            sourcePath: destPath,
-            framesDir: nil,
-            frameCount: 0,
-            fps: 10,
-            createdAt: Date(),
-            status: .detecting
-        )
-        pets.append(pet)
-        PetStorage.shared.save(pets)
-
-        beginPreparation(petId: id, videoPath: destPath, outputDir: petDir.path)
+        activeActionImport = ActiveActionImport(
+            petId: currentPet.id,
+            kind: .custom,
+            actionID: actionID,
+            displayNameOverride: displayName,
+            rootFramesDirectory: rootFramesDirectory,
+            workDirectory: workDirectory.path,
+            sourceVideoPath: sourceVideo.path,
+            origin: .captured)
+        beginPreparation(
+            petId: currentPet.id,
+            videoPath: sourceVideo.path,
+            outputDir: workDirectory.path)
     }
 
-    func importPhotos(urls: [URL]) {
+    func presentPetImageManager() {
+        clearOrphanedMotionWorkflowBeforeImport()
         guard !hasActiveWorkflow else {
             pythonBridge.error = "当前有其他任务正在处理"
             return
         }
-        guard !urls.isEmpty else { return }
-        guard urls.count <= 6 else {
-            pythonBridge.error = "一次最多导入 6 张宠物照片"
-            return
-        }
+        showPetImageManager = true
+    }
 
-        let id = UUID()
-        let petDirectory = PetStorage.shared.petDirectory(for: id)
-        let referencesDirectory = petDirectory.appendingPathComponent("references")
-        do {
-            try FileManager.default.createDirectory(
-                at: referencesDirectory, withIntermediateDirectories: true)
-            var copiedPaths: [String] = []
-            for (index, sourceURL) in urls.enumerated() {
-                let hasSecurityScopedAccess = sourceURL.startAccessingSecurityScopedResource()
-                defer {
-                    if hasSecurityScopedAccess {
-                        sourceURL.stopAccessingSecurityScopedResource()
-                    }
-                }
-                let extensionName = sourceURL.pathExtension.isEmpty
-                    ? "jpg" : sourceURL.pathExtension.lowercased()
-                let destination = referencesDirectory.appendingPathComponent(
-                    String(format: "reference-%02d.%@", index + 1, extensionName))
-                try FileManager.default.copyItem(at: sourceURL, to: destination)
-                copiedPaths.append(destination.path)
-            }
-            let pet = Pet(
-                id: id,
-                name: urls[0].deletingPathExtension().lastPathComponent,
-                sourcePath: nil,
-                framesDir: nil,
-                referenceImagePaths: copiedPaths,
-                frameCount: 0,
-                fps: 10,
-                createdAt: Date(),
-                status: .draft)
-            pets.append(pet)
-            PetStorage.shared.save(pets)
-            pythonBridge.error = nil
-            motionStudioPet = pet
-        } catch {
-            try? FileManager.default.removeItem(at: petDirectory)
-            pythonBridge.error = "照片导入失败：\(error.localizedDescription)"
+    func dismissPetImageManager() {
+        guard !hasActiveWorkflow else { return }
+        showPetImageManager = false
+    }
+
+    func cloudReferenceImages(for pet: Pet) -> [PetCloudReference] {
+        Array(pet.cloudReferences.prefix(PetImageLibraryPolicy.maximumImageCount))
+    }
+
+    func cloudReferencePreview(for reference: PetCloudReference) -> URL? {
+        guard let url = cloudReferencePreviewURLs[reference.id],
+              FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return url
+    }
+
+    func managedPetImages() -> [URL] {
+        guard let pet else { return [] }
+        return cloudReferenceImages(for: pet).compactMap(cloudReferencePreview)
+    }
+
+    /// Called after a valid Google session becomes available. Older versions
+    /// kept copies under Application Support; migrate those once, then remove
+    /// the originals so the cloud gallery is the only persistent photo source.
+    func activateCloudGallery() {
+        cloudAccountIsReady = false
+        cloudGalleryError = nil
+        Task { [weak self] in
+            await self?.synchronizeCloudGallery()
         }
     }
 
-    func presentMotionStudio(for pet: Pet) {
-        guard !referenceImages(for: pet).isEmpty else {
-            pythonBridge.error = "找不到这只宠物的参考图"
+    func clearCloudAccountSession() {
+        cloudAccountIsReady = false
+        cloudGalleryError = nil
+        activeCloudOwnerID = nil
+        cloudReferencePreviewURLs = [:]
+    }
+
+    func addPetImages(urls: [URL]) {
+        clearOrphanedMotionWorkflowBeforeImport()
+        guard !hasActiveWorkflow, !isSynchronizingCloudGallery else {
+            pythonBridge.error = "当前有其他任务正在处理"
+            return
+        }
+        guard !urls.isEmpty else { return }
+        let existingCount = pet.map { cloudReferenceImages(for: $0).count } ?? 0
+        guard PetImageLibraryPolicy.accepts(
+            existingCount: existingCount, incomingCount: urls.count
+        ) else {
+            pythonBridge.error = "宠物图片最多保留 4 张"
+            return
+        }
+
+        isSynchronizingCloudGallery = true
+        let sourceAccess = urls.map { ($0, $0.startAccessingSecurityScopedResource()) }
+        Task { [weak self] in
+            defer {
+                for (url, accessed) in sourceAccess where accessed {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            await self?.uploadPetImagesToCloud(urls: urls)
+        }
+    }
+
+    func removePetImage(at index: Int) {
+        guard !hasActiveWorkflow, !isSynchronizingCloudGallery else {
+            pythonBridge.error = "当前有其他任务正在处理"
+            return
+        }
+        guard let currentPet = pet,
+              cloudReferenceImages(for: currentPet).indices.contains(index) else { return }
+        let reference = cloudReferenceImages(for: currentPet)[index]
+        isSynchronizingCloudGallery = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isSynchronizingCloudGallery = false }
+            do {
+                let (configuration, credentials) = try await self.cloudStorageAccess()
+                try await SupabasePetReferenceStorageClient().delete(
+                    reference, configuration: configuration, credentials: credentials)
+                guard var updated = self.pet,
+                      let storedIndex = updated.cloudReferences.firstIndex(where: {
+                          $0.id == reference.id
+                      }) else { return }
+                var references = updated.cloudReferences
+                references.remove(at: storedIndex)
+                updated.cloudReferenceImages = references
+                self.pets = [updated]
+                self.cloudReferencePreviewURLs[reference.id] = nil
+                try? FileManager.default.removeItem(at: self.previewURL(for: reference))
+                self.persistPets()
+                self.pythonBridge.error = nil
+            } catch {
+                self.pythonBridge.error = "云端图片删除失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func uploadPetImagesToCloud(urls: [URL]) async {
+        defer { isSynchronizingCloudGallery = false }
+        let id = pet?.id ?? UUID()
+        do {
+            let (configuration, credentials) = try await cloudStorageAccess()
+            let storage = SupabasePetReferenceStorageClient()
+            var uploaded: [PetCloudReference] = []
+            do {
+                for url in urls {
+                    uploaded.append(try await storage.uploadReference(
+                        from: url, petID: id, configuration: configuration,
+                        credentials: credentials))
+                }
+            } catch {
+                for reference in uploaded {
+                    try? await storage.delete(
+                        reference, configuration: configuration, credentials: credentials)
+                }
+                throw error
+            }
+
+            if var currentPet = pet {
+                let legacyPaths = currentPet.referenceImages
+                currentPet.cloudReferenceImages = currentPet.cloudReferences + uploaded
+                currentPet.referenceImagePaths = []
+                pets = [currentPet]
+                persistPets()
+                try? removeLegacyLocalReferences(for: currentPet, paths: legacyPaths)
+            } else {
+                let newPet = Pet(
+                    id: id,
+                    name: urls[0].deletingPathExtension().lastPathComponent,
+                    sourcePath: nil,
+                    framesDir: nil,
+                    referenceImagePaths: [],
+                    cloudReferenceImages: uploaded,
+                    frameCount: 0,
+                    fps: 10,
+                    createdAt: Date(),
+                    status: .draft)
+                replacePersistentPet(with: newPet)
+            }
+            if let currentPet = pet {
+                try? await cacheCloudReferencePreviews(
+                    for: currentPet, configuration: configuration, credentials: credentials)
+            }
+            pythonBridge.error = nil
+        } catch {
+            pythonBridge.error = "图片上传到云端图库失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func synchronizeCloudGallery() async {
+        guard !isSynchronizingCloudGallery else { return }
+        isSynchronizingCloudGallery = true
+        defer {
+            isSynchronizingCloudGallery = false
+            resumePendingMotionJobAfterSignIn()
+        }
+        do {
+            let (configuration, credentials) = try await cloudStorageAccess()
+            guard let ownerID = credentials.ownerID else {
+                throw SupabaseReferenceStorageError.missingAuthenticatedOwner
+            }
+            try loadCloudOwnerCatalog(ownerID: ownerID)
+            guard let currentPet = pet else {
+                pythonBridge.error = nil
+                cloudAccountIsReady = true
+                return
+            }
+            let legacyURLs = Array(currentPet.referenceImages.prefix(
+                PetImageLibraryPolicy.maximumImageCount))
+                .map(URL.init(fileURLWithPath:))
+                .filter { FileManager.default.fileExists(atPath: $0.path) }
+            if !legacyURLs.isEmpty {
+                guard PetImageLibraryPolicy.accepts(
+                    existingCount: currentPet.cloudReferences.count,
+                    incomingCount: legacyURLs.count) else {
+                    throw SupabaseReferenceStorageError.invalidObjectPath
+                }
+                let storage = SupabasePetReferenceStorageClient()
+                var uploaded: [PetCloudReference] = []
+                do {
+                    for url in legacyURLs {
+                        uploaded.append(try await storage.uploadReference(
+                            from: url, petID: currentPet.id,
+                            configuration: configuration, credentials: credentials))
+                    }
+                } catch {
+                    for reference in uploaded {
+                        try? await storage.delete(
+                            reference, configuration: configuration, credentials: credentials)
+                    }
+                    throw error
+                }
+                guard var updated = pet, updated.id == currentPet.id else { return }
+                let legacyPaths = updated.referenceImages
+                updated.cloudReferenceImages = updated.cloudReferences + uploaded
+                updated.referenceImagePaths = []
+                pets = [updated]
+                persistPets()
+                try? removeLegacyLocalReferences(for: updated, paths: legacyPaths)
+            }
+            if let updated = pet {
+                try? await cacheCloudReferencePreviews(
+                    for: updated, configuration: configuration, credentials: credentials)
+            }
+            pythonBridge.error = nil
+            cloudAccountIsReady = true
+        } catch {
+            let message = "云端图库同步失败：\(error.localizedDescription)"
+            cloudGalleryError = message
+            pythonBridge.error = message
+        }
+    }
+
+    private func cloudStorageAccess() async throws -> (
+        SupabaseReferenceStorageConfiguration, SupabaseReferenceStorageCredentials
+    ) {
+        let configuration = try BundledSupabaseReferenceStorage.configuration()
+        let credentials = try await SupabaseGoogleSessionStore.shared.credentials(
+            configuration: configuration,
+            publishableKey: try BundledSupabaseReferenceStorage.publishableKey())
+        return (configuration, credentials)
+    }
+
+    private func loadCloudOwnerCatalog(ownerID: UUID) throws {
+        guard activeCloudOwnerID != ownerID else { return }
+        let stored = try PetStorage.shared.load(ownerID: ownerID)
+        if !stored.isEmpty {
+            let recovery = Pet.recoveringAfterLaunch(stored)
+            pets = recovery.pets
+        } else {
+            // Only an unclaimed legacy record can be adopted by the first
+            // authenticated owner. A record already claimed by another owner
+            // never leaks into this account's local video/action catalog.
+            var legacy = pets.filter { $0.cloudOwnerID == nil || $0.cloudOwnerID == ownerID }
+            for index in legacy.indices {
+                legacy[index].cloudOwnerID = ownerID
+            }
+            pets = legacy
+            if !legacy.isEmpty {
+                try PetStorage.shared.save(legacy, ownerID: ownerID)
+            }
+        }
+        activeCloudOwnerID = ownerID
+        cloudReferencePreviewURLs = [:]
+    }
+
+    private func cacheCloudReferencePreviews(
+        for pet: Pet,
+        configuration: SupabaseReferenceStorageConfiguration,
+        credentials: SupabaseReferenceStorageCredentials
+    ) async throws {
+        let storage = SupabasePetReferenceStorageClient()
+        for reference in cloudReferenceImages(for: pet) {
+            let destination = previewURL(for: reference)
+            if !FileManager.default.fileExists(atPath: destination.path) {
+                let image = try await storage.download(
+                    reference, configuration: configuration, credentials: credentials)
+                try FileManager.default.createDirectory(
+                    at: destination.deletingLastPathComponent(),
+                    withIntermediateDirectories: true)
+                try image.data.write(to: destination, options: .atomic)
+            }
+            cloudReferencePreviewURLs[reference.id] = destination
+        }
+    }
+
+    private func previewURL(for reference: PetCloudReference) -> URL {
+        let base = FileManager.default.urls(
+            for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let ext: String
+        switch reference.mimeType {
+        case "image/png": ext = "png"
+        case "image/webp": ext = "webp"
+        default: ext = "jpg"
+        }
+        return base.appendingPathComponent("RealPet", isDirectory: true)
+            .appendingPathComponent("pet-reference-previews", isDirectory: true)
+            .appendingPathComponent("\(reference.id.uuidString.lowercased()).\(ext)")
+    }
+
+    private func removeLegacyLocalReferences(for pet: Pet, paths: [String]) throws {
+        let directory = PetStorage.shared.petDirectory(for: pet.id)
+            .appendingPathComponent("references").standardizedFileURL
+        for path in paths {
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            if url.deletingLastPathComponent() == directory {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
+    private func resumePendingMotionJobAfterSignIn() {
+        guard !motionWorkflowState.isBusy,
+              let job = recoverableMotionJobs
+                .sorted(by: { $0.createdAt < $1.createdAt })
+                .first(where: { $0.state == .submitted || $0.state == .downloading }) else {
+            return
+        }
+        Task { [weak self] in
+            await self?.resumeMotionGeneration(job)
+        }
+    }
+
+    func presentMotionComposer(
+        for pet: Pet,
+        action: FixedPetAction = .headFollow
+    ) {
+        guard !isSynchronizingCloudGallery else {
+            pythonBridge.error = "宠物图片正在同步到云端图库"
+            return
+        }
+        guard !cloudReferenceImages(for: pet).isEmpty else {
+            pythonBridge.error = "请先在图片管理中上传宠物图片"
             return
         }
         guard !motionWorkflowState.isBusy else {
             pythonBridge.error = "当前有动作正在生成"
             return
         }
-        motionStudioPet = pets.first(where: { $0.id == pet.id })
+        selectedMotionAction = action
+        motionComposerPet = pets.first(where: { $0.id == pet.id })
     }
 
-    func dismissMotionStudio() {
+    private func replacePersistentPet(with pet: Pet) {
+        for existing in pets where existing.id != pet.id {
+            petLauncher.stop(petId: existing.id)
+        }
+        pets = [pet]
+        motionComposerPet = nil
+        persistPets()
+    }
+
+    private func persistPets() {
+        do {
+            if let activeCloudOwnerID {
+                try PetStorage.shared.save(pets, ownerID: activeCloudOwnerID)
+            } else {
+                try PetStorage.shared.save(pets)
+            }
+        } catch {
+            pythonBridge.error = error.localizedDescription
+        }
+    }
+
+    func dismissMotionComposer() {
         guard !motionWorkflowState.isBusy else { return }
-        motionStudioPet = nil
+        motionComposerPet = nil
         if case .failed = motionWorkflowState {
             motionWorkflowState = .idle
         }
     }
 
-    var hasAgnesMotionServiceCredential: Bool {
-        guard let key = OpenAIAPIKeyStore.loadAgnesMotionService() else { return false }
-        return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    var hasMiniMaxMotionServiceCredential: Bool {
-        guard let key = OpenAIAPIKeyStore.loadMiniMaxMotionService() else { return false }
-        return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
     func saveMotionServiceConfiguration(
-        agnesBaseURLString: String,
-        imageModel: String,
+        provider: MotionVideoProvider,
         miniMaxBaseURLString: String,
-        videoModel: String,
         seconds: Int,
-        agnesAPIKey: String?,
         miniMaxAPIKey: String?
     ) throws {
         let configuration = try MotionServiceConfiguration(
-            agnesBaseURLString: agnesBaseURLString,
-            imageModel: imageModel,
+            provider: provider,
+            agnesBaseURLString: BundledAgnesVideoService.baseURLString,
             miniMaxBaseURLString: miniMaxBaseURLString,
-            videoModel: videoModel,
+            videoModel: provider.modelName,
             seconds: seconds,
-            size: motionServiceConfiguration.size).validated()
-        if let agnesAPIKey {
-            let trimmed = agnesAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                try OpenAIAPIKeyStore.saveAgnesMotionService(trimmed)
-            }
+            size: provider == .agnes
+                ? BundledAgnesVideoService.size : motionServiceConfiguration.size)
+            .migratedToSupportedProviders()
+            .validated()
+        if provider == .agnes {
+            _ = try BundledSupabaseReferenceStorage.configuration()
         }
         if let miniMaxAPIKey {
             let trimmed = miniMaxAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -287,298 +767,253 @@ class PetListViewModel: ObservableObject {
         MotionServiceConfigurationStore.save(configuration)
     }
 
-    func generateDefaultMotionScenario(
+    /// Generates exactly one independent video for the selected action.
+    /// There is deliberately no scenario queue or hidden fan-out: one action
+    /// slot maps to one provider task and one installed frame directory.
+    func generateAction(
         for pet: Pet,
-        scenario: DefaultMouseInteractionScenario
+        action: FixedPetAction
     ) {
         guard !motionWorkflowState.isBusy else { return }
-        guard pet.framesDir != nil || scenario.canCreatePetFromPhotos else {
+        guard pet.framesDir != nil || action == .headFollow else {
             motionWorkflowState = .failed("请先生成鼠标注视跟随，为桌宠创建基础帧库")
             return
         }
-        guard let agnesAPIKey = OpenAIAPIKeyStore.loadAgnesMotionService() else {
-            motionWorkflowState = .failed("请先在服务配置中填写 Agnes API Key")
-            return
-        }
-        guard let miniMaxAPIKey = OpenAIAPIKeyStore.loadMiniMaxMotionService() else {
-            motionWorkflowState = .failed("请先在服务配置中填写 MiniMax API Key")
-            return
-        }
         do {
-            let configuration = try motionServiceConfiguration.validated()
-            let agnesAPIConfiguration = try configuration.validatedAgnesAPIConfiguration()
-            let miniMaxAPIConfiguration = try configuration.validatedMiniMaxAPIConfiguration()
-            guard let imageModel = configuration.imageModel?.trimmingCharacters(
-                in: .whitespacesAndNewlines), !imageModel.isEmpty else {
-                throw MotionServiceConfigurationError.missingImageModel
-            }
-            let references = referenceImages(for: pet)
-            guard !references.isEmpty else {
-                motionWorkflowState = .failed("找不到这只宠物的参考图")
+            selectedMotionAction = action
+            let validatedConfiguration = try motionServiceConfiguration.validated()
+            guard !isSynchronizingCloudGallery else {
+                motionWorkflowState = .failed("宠物图片正在同步到云端图库")
                 return
             }
+            let cloudReferences = cloudReferenceImages(for: pet)
+            guard !cloudReferences.isEmpty else {
+                motionWorkflowState = .failed("请先在图片管理中上传宠物图片")
+                return
+            }
+            let actionPrompt = action.prompt(
+                referenceImageCount: cloudReferences.count,
+                provider: validatedConfiguration.provider)
+            generatingMotionAction = action
             motionGenerationTask?.cancel()
-            generatedMotionInstallQueue.removeAll()
+            var durableJob = MotionGenerationJob(
+                petID: pet.id,
+                action: action,
+                provider: validatedConfiguration.provider,
+                state: validatedConfiguration.provider == .agnes
+                    ? .preparingReference : .submitted)
+            do {
+                durableJob = try persistMotionJob(durableJob)
+                activeMotionJobID = durableJob.id
+            } catch {
+                generatingMotionAction = nil
+                motionWorkflowState = .failed("无法保存视频生成任务：\(error.localizedDescription)")
+                return
+            }
             motionGenerationTask = Task { [weak self] in
                 guard let self else { return }
-                var stagedVideos: [StagedGeneratedMotionVideo] = []
-                var didHandoffStagedVideos = false
+                var stagedVideo: StagedGeneratedMotionVideo?
+                var didHandoffStagedVideo = false
                 defer {
-                    if !didHandoffStagedVideos {
-                        for stagedVideo in stagedVideos {
-                            try? FileManager.default.removeItem(atPath: stagedVideo.workDirectory)
-                        }
+                    if !didHandoffStagedVideo, let stagedVideo {
+                        try? FileManager.default.removeItem(atPath: stagedVideo.workDirectory)
                     }
                 }
                 do {
-                    self.motionWorkflowState = .preparingReference
-                    let referenceImageURL = try await AgnesImageReferenceGenerator()
-                        .generateReference(
-                            referenceImageURLs: references,
-                            apiKey: agnesAPIKey,
-                            configuration: agnesAPIConfiguration,
-                            model: imageModel)
-                    let client = MiniMaxH3VideoGenerationClient()
-                    for plan in scenario.actionPlans {
-                        try Task.checkCancellation()
-                        self.motionWorkflowState = .submittingVideo
-                        var job = try await client.create(
-                            prompt: plan.prompt,
-                            firstFrameURL: referenceImageURL,
-                            apiKey: miniMaxAPIKey,
-                            configuration: miniMaxAPIConfiguration,
-                            seconds: max(
-                                configuration.seconds,
-                                scenario.minimumVideoSeconds))
-                        while !Task.isCancelled {
-                            switch job.status {
-                            case .completed:
-                                self.motionWorkflowState = .downloadingVideo
-                                let video = try await client.downloadContent(job: job)
-                                stagedVideos.append(try self.stageGeneratedMotionVideo(
-                                    data: video, for: pet, kind: plan.kind, jobID: job.id))
-                                break
-                            case .failed(let message):
-                                throw MiniMaxH3VideoGenerationError.failed(message)
-                            case .queued, .processing:
-                                self.motionWorkflowState = .waitingForVideo(progress: nil)
-                                try await Task.sleep(for: .seconds(5))
-                                try Task.checkCancellation()
-                                job = try await client.retrieve(
-                                    id: job.id,
-                                    apiKey: miniMaxAPIKey,
-                                    configuration: miniMaxAPIConfiguration)
-                                continue
-                            }
-                            break
-                        }
+                    let generatedVideo: GeneratedRemoteMotionVideo
+                    switch validatedConfiguration.provider {
+                    case .agnes:
+                        generatedVideo = try await self.generateAgnesActionVideo(
+                            action: action,
+                            primaryReference: cloudReferences[0],
+                            prompt: actionPrompt,
+                            configuration: validatedConfiguration,
+                            durableJob: durableJob)
+                    case .miniMaxH3:
+                        generatedVideo = try await self.generateMiniMaxActionVideo(
+                            cloudReferences: cloudReferences,
+                            prompt: actionPrompt,
+                            configuration: validatedConfiguration,
+                            durableJob: durableJob)
                     }
                     try Task.checkCancellation()
-                    guard let firstVideo = stagedVideos.first else {
-                        throw MiniMaxH3VideoGenerationError.invalidResponse
+                    stagedVideo = try self.stageGeneratedMotionVideo(
+                        data: generatedVideo.data,
+                        for: pet,
+                        kind: action.kind,
+                        jobID: generatedVideo.remoteJobID)
+                    guard let stagedVideo else {
+                        throw AgnesVideoGenerationError.invalidResponse
                     }
-                    self.generatedMotionInstallQueue = Array(stagedVideos.dropFirst())
-                    try self.startGeneratedActionImport(firstVideo)
-                    didHandoffStagedVideos = true
+                    try self.startGeneratedActionImport(stagedVideo)
+                    self.removeMotionJob(generatedVideo.localJobID)
+                    self.activeMotionJobID = nil
+                    didHandoffStagedVideo = true
                 } catch is CancellationError {
-                    self.clearGeneratedMotionInstallQueue()
+                    self.cancelPersistedMotionJob(durableJob.id)
+                    self.activeMotionJobID = nil
+                    self.generatingMotionAction = nil
                     self.motionWorkflowState = .idle
                 } catch {
-                    self.clearGeneratedMotionInstallQueue()
+                    self.markMotionJob(
+                        durableJob.id, state: .failed,
+                        failureMessage: error.localizedDescription)
+                    self.activeMotionJobID = nil
+                    self.generatingMotionAction = nil
                     self.motionWorkflowState = .failed(error.localizedDescription)
                 }
             }
         } catch {
+            generatingMotionAction = nil
             motionWorkflowState = .failed(error.localizedDescription)
         }
+    }
+
+    private func generateAgnesActionVideo(
+        action: FixedPetAction,
+        primaryReference: PetCloudReference,
+        prompt: String,
+        configuration: MotionServiceConfiguration,
+        durableJob: MotionGenerationJob
+    ) async throws -> GeneratedRemoteMotionVideo {
+        let agnesAPIKey = try BundledAgnesVideoService.apiKey()
+        let (storageConfiguration, storageCredentials) = try await cloudStorageAccess()
+        let agnesConfiguration = try configuration.validatedAgnesAPIConfiguration()
+        guard let videoSettings = AgnesVideoGenerationRequestSettings(
+            size: configuration.size,
+            seconds: max(configuration.seconds, action.minimumVideoSeconds)
+        ) else {
+            throw MotionServiceConfigurationError.invalidSize
+        }
+
+        let storage = SupabasePetReferenceStorageClient()
+        motionWorkflowState = .preparingReference
+        let firstFrameURL = try await storage.signedURL(
+            for: primaryReference,
+            configuration: storageConfiguration,
+            credentials: storageCredentials)
+        var persistedJob = durableJob
+        persistedJob.referenceObjectPath = primaryReference.objectPath
+        persistedJob = try persistMotionJob(persistedJob)
+        do {
+            let client = AgnesVideoGenerationClient()
+            motionWorkflowState = .submittingVideo(provider: .agnes)
+            var pendingJob = try await client.create(
+                prompt: prompt,
+                firstFrameURL: firstFrameURL,
+                apiKey: agnesAPIKey,
+                configuration: agnesConfiguration,
+                settings: videoSettings)
+            persistedJob.remoteJobID = pendingJob.id
+            persistedJob.state = .submitted
+            persistedJob = try persistMotionJob(persistedJob)
+            while !Task.isCancelled {
+                switch pendingJob.status {
+                case .completed:
+                    motionWorkflowState = .downloadingVideo
+                    persistedJob.state = .downloading
+                    persistedJob = try persistMotionJob(persistedJob)
+                    let video = try await client.downloadContent(job: pendingJob)
+                    return .init(
+                        remoteJobID: pendingJob.id,
+                        localJobID: persistedJob.id,
+                        data: video)
+                case .failed(let message):
+                    throw AgnesVideoGenerationError.failed(message)
+                case .queued, .processing:
+                    motionWorkflowState = .waitingForVideo(
+                        provider: .agnes, progress: pendingJob.progress)
+                    try await Task.sleep(for: .seconds(5))
+                    try Task.checkCancellation()
+                    pendingJob = try await client.retrieve(
+                        id: pendingJob.id,
+                        apiKey: agnesAPIKey,
+                        configuration: agnesConfiguration)
+                }
+            }
+            throw CancellationError()
+        } catch { throw error }
+    }
+
+    private func generateMiniMaxActionVideo(
+        cloudReferences: [PetCloudReference],
+        prompt: String,
+        configuration: MotionServiceConfiguration,
+        durableJob: MotionGenerationJob
+    ) async throws -> GeneratedRemoteMotionVideo {
+        guard let miniMaxAPIKey = OpenAIAPIKeyStore.loadMiniMaxMotionService() else {
+            throw MiniMaxH3VideoGenerationError.invalidAPIKey
+        }
+        let miniMaxConfiguration = try MiniMaxVideoAPIConfiguration(
+            baseURLString: configuration.resolvedMiniMaxBaseURLString)
+        let (storageConfiguration, storageCredentials) = try await cloudStorageAccess()
+        motionWorkflowState = .preparingReference
+        let storage = SupabasePetReferenceStorageClient()
+        var references: [PetReferenceImageData] = []
+        for reference in cloudReferences {
+            references.append(try await storage.download(
+                reference, configuration: storageConfiguration,
+                credentials: storageCredentials))
+        }
+        guard !references.isEmpty else {
+            throw MiniMaxH3VideoGenerationError.invalidReferenceImage
+        }
+
+        let client = MiniMaxH3VideoGenerationClient()
+        motionWorkflowState = .submittingVideo(provider: .miniMaxH3)
+        var pendingJob = try await client.create(
+            prompt: prompt,
+            referenceImages: references,
+            apiKey: miniMaxAPIKey,
+            configuration: miniMaxConfiguration,
+            seconds: configuration.seconds)
+        var persistedJob = durableJob
+        persistedJob.remoteJobID = pendingJob.id
+        persistedJob.state = .submitted
+        persistedJob = try persistMotionJob(persistedJob)
+        while !Task.isCancelled {
+            switch pendingJob.status {
+            case .completed:
+                motionWorkflowState = .downloadingVideo
+                persistedJob.state = .downloading
+                persistedJob = try persistMotionJob(persistedJob)
+                return .init(
+                    remoteJobID: pendingJob.id,
+                    localJobID: persistedJob.id,
+                    data: try await client.downloadContent(job: pendingJob))
+            case .failed(let message):
+                throw MiniMaxH3VideoGenerationError.failed(message)
+            case .queued, .processing:
+                motionWorkflowState = .waitingForVideo(
+                    provider: .miniMaxH3, progress: nil)
+                try await Task.sleep(for: .seconds(5))
+                try Task.checkCancellation()
+                pendingJob = try await client.retrieve(
+                    id: pendingJob.id,
+                    apiKey: miniMaxAPIKey,
+                    configuration: miniMaxConfiguration)
+            }
+        }
+        throw CancellationError()
     }
 
     func cancelMotionGeneration() {
         motionGenerationTask?.cancel()
         motionGenerationTask = nil
-        clearGeneratedMotionInstallQueue()
+        if let activeMotionJobID {
+            // Neither supported provider has a documented video-task
+            // cancellation endpoint. Keep the remote ID so the owner can
+            // recover a completed paid task instead of losing its result.
+            cancelPersistedMotionJob(activeMotionJobID)
+            self.activeMotionJobID = nil
+        }
+        generatingMotionAction = nil
         if activeActionImport?.origin == .generated || generatedInitialPetId != nil {
             pythonBridge.cancelProcessing()
         }
         if motionWorkflowState.isBusy {
             motionWorkflowState = .idle
         }
-    }
-
-    /// Retry an interrupted or failed import without copying the source again.
-    func retryPet(_ pet: Pet) {
-        guard pet.status == .failed || pet.status == .interrupted else { return }
-        guard !pythonBridge.isProcessing,
-              !pets.contains(where: {
-                  $0.id != pet.id && ($0.status == .detecting
-                                      || $0.status == .detected
-                                      || $0.status == .processing)
-              }) else {
-            pythonBridge.error = "另一个宠物任务正在处理中"
-            return
-        }
-        guard let sourcePath = pet.sourcePath,
-              FileManager.default.fileExists(atPath: sourcePath) else {
-            pythonBridge.error = "原视频不存在，无法重试"
-            return
-        }
-
-        let petDirectory = PetStorage.shared.petDirectory(for: pet.id)
-        let outputDir = petDirectory.path
-        let generatedVideoDirectory = petDirectory
-            .appendingPathComponent("generated-video")
-            .standardizedFileURL.path + "/"
-        if URL(fileURLWithPath: sourcePath).standardizedFileURL.path
-            .hasPrefix(generatedVideoDirectory) {
-            generatedInitialPetId = pet.id
-        }
-        beginPreparation(petId: pet.id, videoPath: sourcePath, outputDir: outputDir)
-    }
-
-    private func beginAutomaticRigGeneration(for pet: Pet) {
-        guard rigGenerationPetId == nil else {
-            failRigGeneration(
-                petId: pet.id, message: "另一个宠物正在生成 Live2D 模型")
-            return
-        }
-        guard let profile = pet.templateProfile else {
-            failRigGeneration(
-                petId: pet.id, message: "无法确定猫狗形态模板")
-            return
-        }
-        guard CubismTemplateResources.discover(
-            profile: profile, projectRoot: PythonBridge.projectRoot) != nil else {
-            failRigGeneration(
-                petId: pet.id,
-                message: "应用缺少内置\(profile.displayName) Live2D 模板")
-            return
-        }
-
-        if interactiveModel(for: pet)?.stage == .partsPrepared,
-           let manifestPath = pet.rigManifestPath {
-            let atlas = URL(fileURLWithPath: manifestPath)
-                .deletingLastPathComponent()
-                .appendingPathComponent("atlas.png")
-            if FileManager.default.fileExists(atPath: atlas.path) {
-                beginPreparedRigCompilation(
-                    pet: pet, atlas: atlas, profile: profile)
-                return
-            }
-        }
-
-        guard let apiKey = OpenAIAPIKeyStore.load()?.trimmingCharacters(
-            in: .whitespacesAndNewlines), !apiKey.isEmpty else {
-            failRigGeneration(
-                petId: pet.id, message: "图像服务凭据未配置")
-            return
-        }
-        guard let reference = representativeFrame(for: pet) else {
-            failRigGeneration(
-                petId: pet.id, message: "找不到可用于建模的宠物参考图")
-            return
-        }
-        beginRigAssetGeneration(
-            pet: pet, reference: reference, apiKey: apiKey,
-            apiConfiguration: .defaultRelay, profile: profile)
-    }
-
-    private func beginPreparedRigCompilation(
-        pet: Pet,
-        atlas: URL,
-        profile: PetTemplateProfile
-    ) {
-        let petDirectory = PetStorage.shared.petDirectory(for: pet.id)
-        let workDirectory = petDirectory
-            .appendingPathComponent("rig-compile-work")
-            .appendingPathComponent(UUID().uuidString)
-        let stagingDirectory = petDirectory
-            .appendingPathComponent("rig-next-\(UUID().uuidString)")
-        do {
-            try FileManager.default.createDirectory(
-                at: workDirectory, withIntermediateDirectories: true)
-        } catch {
-            failRigGeneration(
-                petId: pet.id, message: "无法创建 Live2D 模型工作目录")
-            return
-        }
-        rigGenerationPetId = pet.id
-        rigGenerationStage = "正在自动套用\(profile.displayName)模板…"
-        pythonBridge.error = nil
-        pythonBridge.prepareRigAtlas(
-            atlasPath: atlas.path,
-            outputDirectory: stagingDirectory.path,
-            profile: profile
-        ) { [weak self] result in
-            self?.finishRigPreparation(
-                pet: pet, workDirectory: workDirectory,
-                stagingDirectory: stagingDirectory, result: result)
-        }
-    }
-
-    private func beginRigAssetGeneration(
-        pet: Pet,
-        reference: URL,
-        apiKey: String,
-        apiConfiguration: OpenAIImageAPIConfiguration,
-        profile: PetTemplateProfile
-    ) {
-        let petDirectory = PetStorage.shared.petDirectory(for: pet.id)
-        let workDirectory = petDirectory
-            .appendingPathComponent("rig-work")
-            .appendingPathComponent(UUID().uuidString)
-        let stagingDirectory = petDirectory
-            .appendingPathComponent("rig-next-\(UUID().uuidString)")
-        do {
-            try FileManager.default.createDirectory(
-                at: workDirectory, withIntermediateDirectories: true)
-        } catch {
-            pythonBridge.error = "无法创建动态素材工作目录"
-            return
-        }
-
-        rigGenerationPetId = pet.id
-        rigGenerationStage = "正在生成宠物部件…"
-        pythonBridge.error = nil
-
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let atlas = try await GPTImage2RigAssetGenerator().generateAtlas(
-                    referenceImageURL: reference,
-                    apiKey: apiKey,
-                    configuration: apiConfiguration,
-                    profile: profile)
-                let atlasURL = workDirectory.appendingPathComponent("atlas.png")
-                try atlas.write(to: atlasURL, options: .atomic)
-                self.rigGenerationStage = "正在校验部件并套用动态模板…"
-                self.pythonBridge.prepareRigAtlas(
-                    atlasPath: atlasURL.path,
-                    outputDirectory: stagingDirectory.path,
-                    profile: profile
-                ) { [weak self] result in
-                    self?.finishRigPreparation(
-                        pet: pet,
-                        workDirectory: workDirectory,
-                        stagingDirectory: stagingDirectory,
-                        result: result)
-                }
-            } catch {
-                try? FileManager.default.removeItem(at: workDirectory)
-                try? FileManager.default.removeItem(at: stagingDirectory)
-                self.failRigGeneration(
-                    petId: pet.id, message: error.localizedDescription)
-            }
-        }
-    }
-
-    private func failRigGeneration(petId: UUID, message: String) {
-        rigGenerationPetId = nil
-        rigGenerationStage = nil
-        if let index = pets.firstIndex(where: { $0.id == petId }) {
-            pets[index].status = .failed
-            PetStorage.shared.save(pets)
-        }
-        pythonBridge.error = message
     }
 
     private func beginPreparation(petId: UUID, videoPath: String, outputDir: String) {
@@ -692,32 +1127,37 @@ class PetListViewModel: ObservableObject {
         startTime: Double,
         duration: Double
     ) {
-        updatePetStatus(id: petId, status: .processing)
+        if activeActionImport?.petId != petId {
+            updatePetStatus(id: petId, status: .processing)
+        }
         pythonBridge.statusText = "正在提取真实宠物画面…"
         if let index = pets.firstIndex(where: { $0.id == petId }) {
             pets[index].detectedAnimalClass = detectedClass
             pets[index].rendererKind = .sourceFrames
-            PetStorage.shared.save(pets)
+            persistPets()
         }
+        let skipsQualityCheck = GeneratedMotionProcessingPolicy
+            .bypassesRecordedFootageQualityGate(
+                actionOrigin: activeActionImport?.petId == petId
+                    ? activeActionImport?.origin
+                    : nil,
+                isInitialGeneratedPet: generatedInitialPetId == petId)
         pythonBridge.startWithClick(
             videoPath: videoPath, outputDir: outputDir,
             clickX: clickX, clickY: clickY, bbox: bbox,
-            startTime: startTime, duration: duration)
+            startTime: startTime, duration: duration,
+            skipQualityCheck: skipsQualityCheck)
     }
 
     private func failPreparation(petId: UUID, message: String) {
         if let actionImport = activeActionImport,
            actionImport.petId == petId {
-            let wasGeneratedDefaultMotion = actionImport.origin == .generated
             activeActionImport = nil
             pendingActionReview = nil
             preparingActionPetId = nil
             validatingActionPetId = nil
             try? FileManager.default.removeItem(
                 atPath: actionImport.workDirectory)
-            if wasGeneratedDefaultMotion {
-                clearGeneratedMotionInstallQueue()
-            }
         } else {
             updatePetStatus(id: petId, status: .failed)
         }
@@ -727,6 +1167,7 @@ class PetListViewModel: ObservableObject {
         } else if activeActionImport == nil, motionWorkflowState.isBusy {
             motionWorkflowState = .failed(message)
         }
+        generatingMotionAction = nil
         pythonBridge.error = message
     }
 
@@ -734,7 +1175,7 @@ class PetListViewModel: ObservableObject {
     private func updatePetStatus(id: UUID, status: PetStatus) {
         if let idx = pets.firstIndex(where: { $0.id == id }) {
             pets[idx].status = status
-            PetStorage.shared.save(pets)
+            persistPets()
         }
     }
 
@@ -745,25 +1186,68 @@ class PetListViewModel: ObservableObject {
         let framesDir = info["frames_dir"] as? String
             ?? info["segmented_dir"] as? String
         let frameCount = info["frame_count"] as? Int ?? info["frames"] as? Int
+        let fps = max(1, info["fps"] as? Int ?? 10)
 
         guard let framesDir = framesDir, let frameCount = frameCount else { return }
+        let reportedSourceFrameCount = info["source_frame_count"] as? Int
+        let reportedOutputFrameCount = info["output_frame_count"] as? Int
+        guard reportedSourceFrameCount == nil || reportedSourceFrameCount == frameCount,
+              reportedOutputFrameCount == nil || reportedOutputFrameCount == frameCount else {
+            let petId = activeActionImport?.petId
+                ?? pets.last(where: { $0.status == .processing })?.id
+            if let petId {
+                failPreparation(
+                    petId: petId,
+                    message: "帧完整性校验失败：处理链路报告的输入与输出帧数不一致")
+            }
+            return
+        }
+        let actualFrameCount: Int
+        do {
+            actualFrameCount = try PetActionLibrary.frameCount(
+                in: URL(fileURLWithPath: framesDir))
+        } catch {
+            let petId = activeActionImport?.petId
+                ?? pets.last(where: { $0.status == .processing })?.id
+            if let petId {
+                failPreparation(
+                    petId: petId,
+                    message: "帧完整性校验失败：\(error.localizedDescription)")
+            }
+            return
+        }
+        guard actualFrameCount == frameCount else {
+            let petId = activeActionImport?.petId
+                ?? pets.last(where: { $0.status == .processing })?.id
+            if let petId {
+                failPreparation(
+                    petId: petId,
+                    message: "帧完整性校验失败：应为 \(frameCount) 帧，实际为 \(actualFrameCount) 帧")
+            }
+            return
+        }
 
         if activeActionImport != nil {
             prepareOrValidateActionImport(
-                framesDirectory: framesDir, frameCount: frameCount)
+                framesDirectory: framesDir, frameCount: frameCount, fps: fps)
             return
         }
 
         if let idx = pets.lastIndex(where: { $0.status == .processing }) {
             pets[idx].framesDir = framesDir
             pets[idx].frameCount = frameCount
+            pets[idx].fps = fps
             pets[idx].rendererKind = .sourceFrames
             let isGeneratedInitialPet = generatedInitialPetId == pets[idx].id
             do {
                 if isGeneratedInitialPet {
-                    try installGeneratedInitialOrbit(
+                    let installedVideo = try installGeneratedInitialOrbit(
                         framesDirectory: framesDir,
-                        fps: max(1, pets[idx].fps))
+                        fps: max(1, pets[idx].fps),
+                        sourceVideoURL: pets[idx].sourcePath.map(URL.init(fileURLWithPath:)))
+                    if let installedVideo {
+                        pets[idx].sourcePath = installedVideo.path
+                    }
                 } else {
                     let idleManifest = PetActionManifest(
                         version: PetActionManifest.currentVersion,
@@ -777,12 +1261,12 @@ class PetListViewModel: ObservableObject {
             } catch {
                 failPreparation(
                     petId: pets[idx].id,
-                    message: "无法安装 360° 注视帧库：\(error.localizedDescription)")
+                    message: "无法安装头眼注视帧库：\(error.localizedDescription)")
                 return
             }
             let petId = pets[idx].id
             pets[idx].status = .processing
-            PetStorage.shared.save(pets)
+            persistPets()
             let featureDirectory = URL(fileURLWithPath: framesDir)
             Task { [weak self] in
                 let features = await Task.detached(priority: .userInitiated) {
@@ -800,19 +1284,20 @@ class PetListViewModel: ObservableObject {
         guard let index = pets.firstIndex(where: { $0.id == petId }),
               pets[index].status == .processing else { return }
         pets[index].status = .ready
-        PetStorage.shared.save(pets)
+        persistPets()
         if petLauncher.launch(pet: pets[index]) {
             pets[index].status = .showing
-            PetStorage.shared.save(pets)
+            persistPets()
             pythonBridge.error = nil
         } else {
             pets[index].status = .failed
-            PetStorage.shared.save(pets)
+            persistPets()
             pythonBridge.error = petLauncher.lastRuntimeError
                 ?? "无法启动真实宠物桌面窗口"
         }
         if generatedInitialPetId == petId {
             generatedInitialPetId = nil
+            generatingMotionAction = nil
             motionWorkflowState = .idle
         }
     }
@@ -830,7 +1315,7 @@ class PetListViewModel: ObservableObject {
         }
         guard let idx = pets.lastIndex(where: { $0.status == .processing }) else { return }
         pets[idx].status = .failed
-        PetStorage.shared.save(pets)
+        persistPets()
         if generatedInitialPetId == pets[idx].id {
             generatedInitialPetId = nil
             motionWorkflowState = .failed(
@@ -852,7 +1337,7 @@ class PetListViewModel: ObservableObject {
         guard let idx = pets.lastIndex(where: { $0.status == .processing }) else { return }
         let cancelled = notification.userInfo?["cancelled"] as? Bool ?? false
         pets[idx].status = cancelled ? .interrupted : .failed
-        PetStorage.shared.save(pets)
+        persistPets()
         if generatedInitialPetId == pets[idx].id {
             generatedInitialPetId = nil
             motionWorkflowState = .failed(
@@ -866,7 +1351,7 @@ class PetListViewModel: ObservableObject {
         if let idx = pets.firstIndex(where: { $0.id == petId }),
            pets[idx].status == .showing {
             pets[idx].status = .ready
-            PetStorage.shared.save(pets)
+            persistPets()
         }
         disableSensorsIfNoVisiblePets()
     }
@@ -885,16 +1370,36 @@ class PetListViewModel: ObservableObject {
         if let message = petLauncher.lastRuntimeError {
             pythonBridge.error = message
         }
-        PetStorage.shared.save(pets)
+        persistPets()
     }
 
     func hidePet(_ pet: Pet) {
-        petLauncher.stop(petId: pet.id)
+        let windowOrigin = petLauncher.stop(petId: pet.id)
         if let idx = pets.firstIndex(where: { $0.id == pet.id }) {
+            if let windowOrigin {
+                pets[idx].desktopPosition = PetDesktopPosition(
+                    x: windowOrigin.x, y: windowOrigin.y)
+            }
             pets[idx].status = .ready  // always reset, even if process was already dead
-            PetStorage.shared.save(pets)
+            persistPets()
         }
         disableSensorsIfNoVisiblePets()
+    }
+
+    func displayScale(for pet: Pet) -> Double {
+        pets.first(where: { $0.id == pet.id })?.resolvedDisplayScale
+            ?? pet.resolvedDisplayScale
+    }
+
+    func setDisplayScale(_ scale: Double, for pet: Pet) {
+        guard let index = pets.firstIndex(where: { $0.id == pet.id }) else { return }
+        let normalized = min(1.75, max(0.55, scale))
+        pets[index].displayScale = normalized
+        if let windowOrigin = petLauncher.setDisplayScale(petId: pet.id, scale: normalized) {
+            pets[index].desktopPosition = PetDesktopPosition(
+                x: windowOrigin.x, y: windowOrigin.y)
+        }
+        persistPets()
     }
 
     func deletePet(_ pet: Pet) {
@@ -903,31 +1408,41 @@ class PetListViewModel: ObservableObject {
             return
         }
         petLauncher.stop(petId: pet.id)
-        PetStorage.shared.deletePet(pet)
+        let cloudReferences = pet.cloudReferences
+        let previousPets = pets
         pets.removeAll { $0.id == pet.id }
-        PetStorage.shared.save(pets)
-        disableSensorsIfNoVisiblePets()
-    }
-
-    func setPersonality(_ preset: PetPersonality.Preset, for pet: Pet) {
-        setPersonality(.forPreset(preset), for: pet)
-    }
-
-    func setPersonality(_ personality: PetPersonality, for pet: Pet) {
-        guard let idx = pets.firstIndex(where: { $0.id == pet.id }) else { return }
-        pets[idx].personality = personality
-        PetStorage.shared.save(pets)
-        if petLauncher.isRunning(petId: pet.id) {
-            petLauncher.updatePersonality(petId: pet.id, personality: personality)
+        do {
+            if let activeCloudOwnerID {
+                try PetStorage.shared.save(pets, ownerID: activeCloudOwnerID)
+            } else {
+                try PetStorage.shared.save(pets)
+            }
+        } catch {
+            pets = previousPets
+            pythonBridge.error = error.localizedDescription
+            return
         }
-    }
-
-    func presentPersonalityEditor(for pet: Pet) {
-        personalitySetupPet = pets.first(where: { $0.id == pet.id })
-    }
-
-    func cancelPersonalityEditor() {
-        personalitySetupPet = nil
+        do {
+            try PetStorage.shared.deletePet(pet)
+        } catch {
+            pythonBridge.error = "宠物已从列表移除，但本地文件清理失败：\(error.localizedDescription)"
+        }
+        disableSensorsIfNoVisiblePets()
+        guard !cloudReferences.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let (configuration, credentials) = try await self.cloudStorageAccess()
+                let storage = SupabasePetReferenceStorageClient()
+                for reference in cloudReferences {
+                    try await storage.delete(
+                        reference, configuration: configuration, credentials: credentials)
+                    try? FileManager.default.removeItem(at: self.previewURL(for: reference))
+                }
+            } catch {
+                self.pythonBridge.error = "本地宠物已删除，但云端图片清理失败：\(error.localizedDescription)"
+            }
+        }
     }
 
     var hasVisiblePet: Bool {
@@ -1044,19 +1559,7 @@ class PetListViewModel: ObservableObject {
     }
 
     var localIntelligenceHelp: String {
-        let vision = localVLMHelp
-        let behavior: String
-        switch localBehaviorPlannerRuntimeState {
-        case .disabled:
-            behavior = "行为模型未启用"
-        case .ready(let model):
-            behavior = "行为模型已就绪：\(model)"
-        case .planning(let model):
-            behavior = "\(model) 正在规划下一行为"
-        case .failed(let message):
-            behavior = "行为模型调用失败：\(message)"
-        }
-        return "\(vision)；\(behavior)"
+        localVLMHelp
     }
 
     func setCameraInteractionEnabled(_ enabled: Bool) {
@@ -1144,7 +1647,7 @@ class PetListViewModel: ObservableObject {
 
     func discoverLocalModelInventory(endpoint: String) async throws
         -> OllamaModelInventory {
-        let configuration = try LocalBehaviorPlannerConfiguration(
+        let configuration = try LocalVLMConfiguration(
             isEnabled: false, endpoint: endpoint, modelName: nil)
         let catalog = try OllamaModelCatalog(baseURL: configuration.endpointURL)
         return try await catalog.inventory()
@@ -1153,63 +1656,21 @@ class PetListViewModel: ObservableObject {
     func updateLocalIntelligenceConfigurations(
         endpoint: String,
         visionEnabled: Bool,
-        visionModelName: String?,
-        behaviorEnabled: Bool,
-        behaviorModelName: String?
+        visionModelName: String?
     ) throws {
         let visionConfiguration = try LocalVLMConfiguration(
             isEnabled: visionEnabled,
             endpoint: endpoint,
             modelName: visionModelName)
-        let plannerConfiguration = try LocalBehaviorPlannerConfiguration(
-            isEnabled: behaviorEnabled,
-            endpoint: endpoint,
-            modelName: behaviorModelName)
 
         LocalVLMConfigurationStore.save(visionConfiguration)
-        LocalBehaviorPlannerConfigurationStore.save(plannerConfiguration)
         localVLMConfiguration = visionConfiguration
         localVLMRuntimeState = Self.restingVLMState(for: visionConfiguration)
-        localBehaviorPlannerConfiguration = plannerConfiguration
-        localBehaviorPlannerRuntimeState = Self.restingPlannerState(
-            for: plannerConfiguration)
-        try configureBehaviorPlanner()
 
         if cameraInteractionEnabled {
             stopCameraInteraction()
             setCameraInteractionEnabled(true)
         }
-    }
-
-    private func configureBehaviorPlanner() throws {
-        behaviorPlanningCoordinator?.cancelCurrent()
-        behaviorPlanningCoordinator = nil
-        petLauncher.setBehaviorPlanningCoordinator(nil)
-        guard localBehaviorPlannerConfiguration.isEnabled,
-              let modelName = localBehaviorPlannerConfiguration.modelName else {
-            localBehaviorPlannerRuntimeState = .disabled
-            return
-        }
-        let model = try OllamaBehaviorPlanningModel(
-            modelName: modelName,
-            baseURL: localBehaviorPlannerConfiguration.endpointURL)
-        let coordinator = BehaviorPlanningCoordinator(model: model)
-        coordinator.onActivityChange = { [weak self, weak coordinator] active in
-            guard let self,
-                  let coordinator,
-                  self.behaviorPlanningCoordinator === coordinator else { return }
-            self.localBehaviorPlannerRuntimeState = active
-                ? .planning(modelName) : .ready(modelName)
-        }
-        coordinator.onError = { [weak self, weak coordinator] message in
-            guard let self,
-                  let coordinator,
-                  self.behaviorPlanningCoordinator === coordinator else { return }
-            self.localBehaviorPlannerRuntimeState = .failed(message)
-        }
-        behaviorPlanningCoordinator = coordinator
-        petLauncher.setBehaviorPlanningCoordinator(coordinator)
-        localBehaviorPlannerRuntimeState = .ready(modelName)
     }
 
     private func attachConfiguredLocalVLM() throws {
@@ -1261,13 +1722,6 @@ class PetListViewModel: ObservableObject {
         return .ready(modelName)
     }
 
-    private static func restingPlannerState(
-        for configuration: LocalBehaviorPlannerConfiguration
-    ) -> LocalBehaviorPlannerRuntimeState {
-        guard configuration.isEnabled,
-              let modelName = configuration.modelName else { return .disabled }
-        return .ready(modelName)
-    }
 
     private func disableSensorsIfNoVisiblePets() {
         guard !hasVisiblePet else { return }
@@ -1281,18 +1735,55 @@ class PetListViewModel: ObservableObject {
         return PetActionManifest.load(framesDirectory: framesDir)
     }
 
-    func interactiveModel(for pet: Pet) -> InteractivePetModelManifest? {
-        guard let path = pet.rigManifestPath else { return nil }
-        return InteractivePetModelManifest.load(at: path)
+    func customActions(for pet: Pet) -> [PetActionManifest.Action] {
+        actionManifest(for: pet)?.actions.filter(\.isCustom) ?? []
+    }
+
+    func canImportCustomAction(for pet: Pet) -> Bool {
+        pet.framesDir != nil && !hasActiveWorkflow
+    }
+
+    func playCustomAction(_ action: PetActionManifest.Action, for pet: Pet) {
+        guard action.isCustom else { return }
+        guard !hasActiveWorkflow else {
+            pythonBridge.error = "当前有其他任务正在处理"
+            return
+        }
+        if !petLauncher.isRunning(petId: pet.id) {
+            showPet(pet)
+        }
+        guard petLauncher.playCustomAction(petId: pet.id, actionID: action.id) else {
+            pythonBridge.error = "无法播放自定义动作，请重新导入该视频"
+            return
+        }
+        pythonBridge.error = nil
+    }
+
+    func deleteCustomAction(_ action: PetActionManifest.Action, for pet: Pet) {
+        guard action.isCustom,
+              let currentPet = pets.first(where: { $0.id == pet.id }),
+              let framesDir = currentPet.framesDir else { return }
+        guard !hasActiveWorkflow else {
+            pythonBridge.error = "当前有其他任务正在处理"
+            return
+        }
+        let wasShowing = currentPet.status == .showing
+        if wasShowing { hidePet(currentPet) }
+        do {
+            _ = try PetActionLibrary.removeCustomAction(
+                id: action.id,
+                rootFramesDirectory: URL(fileURLWithPath: framesDir))
+            actionLibraryRevision += 1
+            pythonBridge.error = nil
+            if wasShowing { showPet(currentPet) }
+        } catch {
+            pythonBridge.error = "删除自定义动作失败：\(error.localizedDescription)"
+            if wasShowing { showPet(currentPet) }
+        }
     }
 
     func canShowPet(_ pet: Pet) -> Bool {
         pet.status == .showing || petLauncher.canLaunch(pet: pet)
-    }
-
-    func rigGenerationLabel(for pet: Pet) -> String? {
-        guard rigGenerationPetId == pet.id else { return nil }
-        return rigGenerationStage ?? "正在生成动态素材…"
     }
 
     private func representativeFrame(for pet: Pet) -> URL? {
@@ -1314,83 +1805,16 @@ class PetListViewModel: ObservableObject {
         return frames[frames.count / 2]
     }
 
-    private func finishRigPreparation(
-        pet: Pet,
-        workDirectory: URL,
-        stagingDirectory: URL,
-        result: [String: Any]?
-    ) {
-        defer {
-            try? FileManager.default.removeItem(at: workDirectory)
-            rigGenerationPetId = nil
-            rigGenerationStage = nil
-        }
-        guard result?["prepared"] as? Bool == true,
-              result?["compiled"] as? Bool == true else {
-            try? FileManager.default.removeItem(at: stagingDirectory)
-            failRigGeneration(
-                petId: pet.id,
-                message: result?["message"] as? String
-                    ?? "内置 Live2D 模板安装失败")
-            return
-        }
-        if let expectedProfile = pet.templateProfile,
-           result?["profile"] as? String != expectedProfile.rawValue {
-            try? FileManager.default.removeItem(at: stagingDirectory)
-            failRigGeneration(
-                petId: pet.id, message: "Live2D 模板类型与宠物分类不匹配")
-            return
-        }
-
-        let fm = FileManager.default
-        let finalDirectory = PetStorage.shared.petDirectory(for: pet.id)
-            .appendingPathComponent("rig")
-        let backupDirectory = finalDirectory
-            .deletingLastPathComponent()
-            .appendingPathComponent("rig-old-\(UUID().uuidString)")
-        do {
-            if fm.fileExists(atPath: finalDirectory.path) {
-                try fm.moveItem(at: finalDirectory, to: backupDirectory)
-            }
-            do {
-                try fm.moveItem(at: stagingDirectory, to: finalDirectory)
-            } catch {
-                if fm.fileExists(atPath: backupDirectory.path) {
-                    try? fm.moveItem(at: backupDirectory, to: finalDirectory)
-                }
-                throw error
-            }
-            try? fm.removeItem(at: backupDirectory)
-            guard let index = pets.firstIndex(where: { $0.id == pet.id }) else {
-                return
-            }
-            pets[index].rigManifestPath = finalDirectory
-                .appendingPathComponent("rig.json").path
-            guard petLauncher.launch(pet: pets[index]) else {
-                let message = petLauncher.lastRuntimeError
-                    ?? "Live2D 模型安装后无法启动"
-                failRigGeneration(petId: pet.id, message: message)
-                return
-            }
-            pets[index].status = .showing
-            PetStorage.shared.save(pets)
-            pythonBridge.error = nil
-        } catch {
-            try? fm.removeItem(at: stagingDirectory)
-            failRigGeneration(
-                petId: pet.id,
-                message: "Live2D 模型安装失败：\(error.localizedDescription)")
-        }
-    }
-
     private func prepareOrValidateActionImport(
         framesDirectory: String,
-        frameCount: Int
+        frameCount: Int,
+        fps: Int
     ) {
         guard let context = activeActionImport else { return }
-        guard [.react, .shakeHead, .play, .lieDown, .paw, .eat].contains(context.kind) else {
+        guard [.react, .shakeHead, .play, .lieDown, .paw, .eat, .custom]
+            .contains(context.kind) else {
             validateActionImport(
-                framesDirectory: framesDirectory, frameCount: frameCount)
+                framesDirectory: framesDirectory, frameCount: frameCount, fps: fps)
             return
         }
 
@@ -1401,7 +1825,7 @@ class PetListViewModel: ObservableObject {
             framesDirectory: framesDirectory,
             outputDirectory: outputDirectory,
             kind: context.kind.rawValue,
-            fps: 10) { [weak self] result in
+            fps: fps) { [weak self] result in
                 guard let self,
                       self.activeActionImport == context else { return }
                 self.preparingActionPetId = nil
@@ -1416,13 +1840,24 @@ class PetListViewModel: ObservableObject {
                             ?? "无法从素材中提取有效互动动作")
                     return
                 }
+                guard preparedFrameCount == frameCount else {
+                    self.failPreparation(
+                        petId: context.petId,
+                        message: "动作帧完整性校验失败：应为 \(frameCount) 帧，实际为 \(preparedFrameCount) 帧")
+                    return
+                }
                 self.validateActionImport(
                     framesDirectory: preparedDirectory,
-                    frameCount: preparedFrameCount)
+                    frameCount: preparedFrameCount,
+                    fps: fps)
             }
     }
 
-    private func validateActionImport(framesDirectory: String, frameCount: Int) {
+    private func validateActionImport(
+        framesDirectory: String,
+        frameCount: Int,
+        fps: Int
+    ) {
         guard let context = activeActionImport else { return }
         guard frameCount > 0 else {
             failPreparation(petId: context.petId, message: "动作处理没有生成有效帧")
@@ -1448,8 +1883,10 @@ class PetListViewModel: ObservableObject {
                     as? Double
                 self.pendingActionReview = PendingActionReview(
                     id: UUID(), petId: context.petId, kind: context.kind,
+                    actionID: context.actionID,
+                    displayName: context.displayNameOverride ?? context.kind.displayName,
                     framesDirectory: framesDirectory, frameCount: frameCount,
-                    fps: 10, identitySimilarity: identity,
+                    fps: fps, identitySimilarity: identity,
                     origin: context.origin)
             }
     }
@@ -1459,7 +1896,8 @@ class PetListViewModel: ObservableObject {
         pendingActionReview = nil
         installActionImport(
             framesDirectory: review.framesDirectory,
-            frameCount: review.frameCount)
+            frameCount: review.frameCount,
+            fps: review.fps)
     }
 
     func discardPendingActionReview() {
@@ -1468,7 +1906,6 @@ class PetListViewModel: ObservableObject {
             return
         }
         try? FileManager.default.removeItem(atPath: context.workDirectory)
-        clearGeneratedMotionInstallQueue()
         pendingActionReview = nil
         activeActionImport = nil
         preparingActionPetId = nil
@@ -1479,7 +1916,11 @@ class PetListViewModel: ObservableObject {
         pythonBridge.error = nil
     }
 
-    private func installActionImport(framesDirectory: String, frameCount: Int) {
+    private func installActionImport(
+        framesDirectory: String,
+        frameCount: Int,
+        fps: Int
+    ) {
         guard let context = activeActionImport,
               frameCount > 0 else { return }
         let fm = FileManager.default
@@ -1487,12 +1928,28 @@ class PetListViewModel: ObservableObject {
         let root = URL(fileURLWithPath: context.rootFramesDirectory)
 
         do {
+            // Keep the source video beside its extracted frames. This makes
+            // each action independently reviewable while the runtime renders
+            // the processed frame sequence.
+            if let sourceVideoPath = context.sourceVideoPath {
+                let video = URL(fileURLWithPath: sourceVideoPath)
+                guard fm.fileExists(atPath: video.path) else {
+                    throw AgnesVideoGenerationError.invalidResponse
+                }
+                let companion = source.appendingPathComponent("action.mp4")
+                if fm.fileExists(atPath: companion.path) {
+                    try fm.removeItem(at: companion)
+                }
+                try fm.copyItem(at: video, to: companion)
+            }
             try PetActionLibrary.install(
                 kind: context.kind,
                 processedFramesDirectory: source,
                 rootFramesDirectory: root,
-                fps: 10,
-                origin: context.origin)
+                fps: fps,
+                origin: context.origin,
+                actionID: context.actionID,
+                displayNameOverride: context.displayNameOverride)
             try? fm.removeItem(atPath: context.workDirectory)
             activeActionImport = nil
             pendingActionReview = nil
@@ -1510,20 +1967,16 @@ class PetListViewModel: ObservableObject {
                 }
             }
 
-            if let nextVideo = generatedMotionInstallQueue.first {
-                generatedMotionInstallQueue.removeFirst()
-                try startGeneratedActionImport(nextVideo)
-            } else {
-                motionWorkflowState = .idle
-            }
+            motionWorkflowState = .idle
+            generatingMotionAction = nil
         } catch {
             try? fm.removeItem(atPath: context.workDirectory)
             activeActionImport = nil
             pendingActionReview = nil
             preparingActionPetId = nil
             validatingActionPetId = nil
-            clearGeneratedMotionInstallQueue()
             motionWorkflowState = .failed("动作安装失败：\(error.localizedDescription)")
+            generatingMotionAction = nil
             pythonBridge.error = "动作安装失败：\(error.localizedDescription)"
         }
     }
@@ -1535,10 +1988,10 @@ class PetListViewModel: ObservableObject {
         jobID: String
     ) throws -> StagedGeneratedMotionVideo {
         guard !data.isEmpty else {
-            throw MiniMaxH3VideoGenerationError.invalidResponse
+            throw AgnesVideoGenerationError.invalidResponse
         }
         guard let currentPet = pets.first(where: { $0.id == pet.id }) else {
-            throw MiniMaxH3VideoGenerationError.failed("宠物已被删除")
+            throw AgnesVideoGenerationError.failed("宠物已被删除")
         }
         let petDirectory = PetStorage.shared.petDirectory(for: currentPet.id)
         let workDirectory = petDirectory
@@ -1558,16 +2011,18 @@ class PetListViewModel: ObservableObject {
 
     private func startGeneratedActionImport(_ stagedVideo: StagedGeneratedMotionVideo) throws {
         guard let currentPet = pets.first(where: { $0.id == stagedVideo.petID }) else {
-            throw MiniMaxH3VideoGenerationError.failed("宠物已被删除")
+            throw AgnesVideoGenerationError.failed("宠物已被删除")
         }
         motionWorkflowState = .installing
-        motionStudioPet = nil
         if let rootFramesDirectory = stagedVideo.rootFramesDirectory {
             activeActionImport = ActiveActionImport(
                 petId: stagedVideo.petID,
                 kind: stagedVideo.kind,
+                actionID: stagedVideo.kind.rawValue,
+                displayNameOverride: nil,
                 rootFramesDirectory: rootFramesDirectory,
                 workDirectory: stagedVideo.workDirectory,
+                sourceVideoPath: stagedVideo.videoURL.path,
                 origin: .generated)
             beginPreparation(
                 petId: stagedVideo.petID,
@@ -1576,14 +2031,14 @@ class PetListViewModel: ObservableObject {
             return
         }
         guard stagedVideo.kind == .gazeOrbit else {
-            throw MiniMaxH3VideoGenerationError.failed(
+            throw AgnesVideoGenerationError.failed(
                 "请先生成鼠标注视跟随，为桌宠创建基础帧库")
         }
         generatedInitialPetId = currentPet.id
         if let index = pets.firstIndex(where: { $0.id == currentPet.id }) {
             pets[index].sourcePath = stagedVideo.videoURL.path
             pets[index].status = .detecting
-            PetStorage.shared.save(pets)
+            persistPets()
         }
         beginPreparation(
             petId: currentPet.id,
@@ -1591,12 +2046,14 @@ class PetListViewModel: ObservableObject {
             outputDir: PetStorage.shared.petDirectory(for: currentPet.id).path)
     }
 
-    /// A photo-only pet uses the first stable orbit frame as its idle base and
-    /// installs the complete generated sequence as the mouse-facing frame bank.
+    /// A photo-only pet retains every generated frame in its own head-follow
+    /// action directory. A separate one-frame idle copy avoids playing the
+    /// directional sweep until the pointer actually moves.
     private func installGeneratedInitialOrbit(
         framesDirectory: String,
-        fps: Int
-    ) throws {
+        fps: Int,
+        sourceVideoURL: URL?
+    ) throws -> URL? {
         let fm = FileManager.default
         let root = URL(fileURLWithPath: framesDirectory)
         let frameEntries = try fm.contentsOfDirectory(
@@ -1620,18 +2077,28 @@ class PetListViewModel: ObservableObject {
                 try fm.copyItem(at: entry, to: staging.appendingPathComponent(
                     entry.lastPathComponent))
             }
-            let alphaName = "\(initialFrame.deletingPathExtension().lastPathComponent)_a.jpg"
-            for entry in frameEntries where entry != initialFrame
-                && entry.lastPathComponent != alphaName {
-                try? fm.removeItem(at: entry)
+            if let sourceVideoURL,
+               fm.fileExists(atPath: sourceVideoURL.path) {
+                try fm.copyItem(
+                    at: sourceVideoURL,
+                    to: staging.appendingPathComponent("action.mp4"))
             }
-
             let manifest = try PetActionLibrary.install(
                 kind: .gazeOrbit,
                 processedFramesDirectory: staging,
                 rootFramesDirectory: root,
                 fps: fps,
                 origin: .generated)
+            let idleDirectory = root.appendingPathComponent("actions/idle")
+            try fm.createDirectory(at: idleDirectory, withIntermediateDirectories: true)
+            try fm.copyItem(
+                at: initialFrame,
+                to: idleDirectory.appendingPathComponent(initialFrame.lastPathComponent))
+            let alpha = root.appendingPathComponent(
+                "\(initialFrame.deletingPathExtension().lastPathComponent)_a.jpg")
+            if fm.fileExists(atPath: alpha.path) {
+                try fm.copyItem(at: alpha, to: idleDirectory.appendingPathComponent(alpha.lastPathComponent))
+            }
             let generatedBaseManifest = PetActionManifest(
                 version: manifest.version,
                 defaultAction: manifest.defaultAction,
@@ -1640,43 +2107,32 @@ class PetListViewModel: ObservableObject {
                     return PetActionManifest.Action(
                         id: action.id,
                         kind: action.kind,
-                        framesDirectory: action.framesDirectory,
+                        framesDirectory: "actions/idle",
                         fps: action.fps,
                         loop: action.loop,
                         translatesWindow: action.translatesWindow,
                         origin: .generated)
                 })
             try generatedBaseManifest.save(framesDirectory: framesDirectory)
+            let installedVideo = root
+                .appendingPathComponent("actions")
+                .appendingPathComponent(PetActionManifest.Action.Kind.gazeOrbit.rawValue)
+                .appendingPathComponent("action.mp4")
+            if let sourceVideoURL,
+               fm.fileExists(atPath: sourceVideoURL.path),
+               fm.fileExists(atPath: installedVideo.path) {
+                try? fm.removeItem(at: sourceVideoURL)
+            }
             actionLibraryRevision += 1
+            return fm.fileExists(atPath: installedVideo.path) ? installedVideo : nil
         } catch {
             try? fm.removeItem(at: staging)
             throw error
         }
     }
 
-    private func clearGeneratedMotionInstallQueue() {
-        for stagedVideo in generatedMotionInstallQueue {
-            try? FileManager.default.removeItem(atPath: stagedVideo.workDirectory)
-        }
-        generatedMotionInstallQueue.removeAll()
-    }
-
-    private func referenceImages(for pet: Pet) -> [URL] {
-        let ownerImages = pet.referenceImages.map(URL.init(fileURLWithPath:))
-            .filter { FileManager.default.fileExists(atPath: $0.path) }
-        if !ownerImages.isEmpty { return ownerImages }
-        if let representative = representativeFrame(for: pet) {
-            return [representative]
-        }
-        return []
-    }
-
     func motionReferenceImages(for pet: Pet) -> [URL] {
-        referenceImages(for: pet)
+        cloudReferenceImages(for: pet).compactMap(cloudReferencePreview)
     }
 
-    private static func normalizedVideoProgress(_ value: Double?) -> Double? {
-        guard let value else { return nil }
-        return value > 1 ? min(1, value / 100) : min(1, max(0, value))
-    }
 }

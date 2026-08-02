@@ -10,39 +10,30 @@ enum PetBehaviorPolicy {
 
         switch observation.kind {
         case InteractionKind.petTapped:
-            return PetIntent(
-                petId: observation.petId, action: .react,
-                target: observation.spatial, emotion: "engaged", priority: 80,
-                duration: 0.7, intensity: 0.35 + personality.affection * 0.45,
-                interruptPolicy: .replace, animation: .play)
+            guard let cue = PetInteractionBinding.cue(for: observation.kind) else { return nil }
+            return interactionResponseIntent(
+                for: observation, cue: cue,
+                emotion: "affectionate", priority: 78)
 
         case InteractionKind.petDoubleTapped:
-            return PetIntent(
-                petId: observation.petId, action: .react,
-                target: observation.spatial, emotion: "excited", priority: 90,
-                duration: 1.1, intensity: 0.55 + personality.playfulness * 0.40,
-                interruptPolicy: .replace, animation: .play)
+            return nil
 
         case InteractionKind.petPetted:
             return PetIntent(
                 petId: observation.petId, action: .react,
                 target: observation.spatial, emotion: "affectionate", priority: 72,
                 duration: 1.0, intensity: 0.45 + personality.affection * 0.45,
-                interruptPolicy: .replace)
+                interruptPolicy: .replace, animation: .cuddle)
 
         case InteractionKind.fileDroppedOnBody:
-            return PetIntent(
-                petId: observation.petId, action: .react,
-                target: observation.spatial, emotion: "playful", priority: 88,
-                duration: 0.9, intensity: 0.45 + personality.playfulness * 0.45,
-                interruptPolicy: .replace, animation: .paw)
+            guard let cue = PetInteractionBinding.cue(for: observation.kind) else { return nil }
+            return interactionResponseIntent(
+                for: observation, cue: cue, emotion: "curious", priority: 82)
 
         case InteractionKind.fileDroppedOnHead:
-            return PetIntent(
-                petId: observation.petId, action: .react,
-                target: observation.spatial, emotion: "curious", priority: 92,
-                duration: 0.8, intensity: 0.5 + personality.curiosity * 0.4,
-                interruptPolicy: .replace, animation: .eat)
+            guard let cue = PetInteractionBinding.cue(for: observation.kind) else { return nil }
+            return interactionResponseIntent(
+                for: observation, cue: cue, emotion: "content", priority: 84)
 
         case InteractionKind.pointerEntered, InteractionKind.pointerNear:
             guard personality.curiosity >= 0.20 else { return nil }
@@ -53,15 +44,14 @@ enum PetBehaviorPolicy {
                 interruptPolicy: .replace)
 
         case InteractionKind.pointerApproachingFast:
-            let retreat = personality.boldness < 0.45
             return PetIntent(
                 petId: observation.petId,
-                action: retreat ? .retreat : .approach,
+                action: .orient,
                 target: observation.spatial,
-                emotion: retreat ? "startled" : "playful",
-                priority: 70,
-                duration: 1.4,
-                intensity: retreat ? 1 - personality.boldness : personality.playfulness,
+                emotion: "attentive",
+                priority: 48,
+                duration: 1.0,
+                intensity: 0.8,
                 interruptPolicy: .replace)
 
         case InteractionKind.dragStarted:
@@ -83,7 +73,7 @@ enum PetBehaviorPolicy {
                 emotion: "engaged", priority: 58,
                 duration: 1.0,
                 intensity: 0.35 + personality.playfulness * 0.5,
-                interruptPolicy: .replace, animation: .shakeHead)
+                interruptPolicy: .replace, animation: .wave)
 
         case InteractionKind.userOffersObject:
             return PetIntent(
@@ -92,7 +82,7 @@ enum PetBehaviorPolicy {
                 emotion: personality.boldness < 0.35 ? "cautious" : "curious",
                 priority: 68, duration: 1.2,
                 intensity: 0.4 + personality.curiosity * 0.45,
-                interruptPolicy: .replace)
+                interruptPolicy: .replace, animation: .paw)
 
         case InteractionKind.userLooksAtPet, InteractionKind.userAppears:
             let target = safeRuntimeTarget(observation.spatial)
@@ -106,14 +96,13 @@ enum PetBehaviorPolicy {
 
         case InteractionKind.userApproachesPet:
             let canLocateActor = safeRuntimeTarget(observation.spatial) != nil
-            let retreat = canLocateActor && personality.boldness < 0.45
             return PetIntent(
                 petId: observation.petId,
-                action: canLocateActor ? (retreat ? .retreat : .approach) : .react,
+                action: canLocateActor ? .orient : .react,
                 target: safeRuntimeTarget(observation.spatial),
-                emotion: retreat ? "startled" : "engaged",
-                priority: 72, duration: 1.3,
-                intensity: retreat ? 1 - personality.boldness : personality.playfulness,
+                emotion: "engaged",
+                priority: 58, duration: 1.0,
+                intensity: 0.6,
                 interruptPolicy: .replace)
 
         case InteractionKind.userCallsPet:
@@ -122,7 +111,7 @@ enum PetBehaviorPolicy {
                 target: nil, emotion: "attentive", priority: 64,
                 duration: 0.9,
                 intensity: 0.35 + personality.affection * 0.45,
-                interruptPolicy: .replace)
+                interruptPolicy: .replace, animation: .wave)
 
         case InteractionKind.userPraisesPet:
             return PetIntent(
@@ -130,7 +119,7 @@ enum PetBehaviorPolicy {
                 target: nil, emotion: "happy", priority: 58,
                 duration: 0.9,
                 intensity: 0.30 + personality.affection * 0.50,
-                interruptPolicy: .replace)
+                interruptPolicy: .replace, animation: .jumpCheer)
 
         case InteractionKind.userInvitesPlay:
             return PetIntent(
@@ -138,7 +127,7 @@ enum PetBehaviorPolicy {
                 target: nil, emotion: "playful", priority: 76,
                 duration: 1.2,
                 intensity: 0.45 + personality.playfulness * 0.50,
-                interruptPolicy: .replace, animation: .play)
+                interruptPolicy: .replace, animation: .jumpCheer)
 
         case InteractionKind.userRequestsPause:
             return PetIntent(
@@ -163,6 +152,19 @@ enum PetBehaviorPolicy {
         guard let spatial,
               spatial.space != .cameraNormalized else { return nil }
         return spatial
+    }
+
+    private static func interactionResponseIntent(
+        for observation: InteractionObservation,
+        cue: PetAnimationCue,
+        emotion: String,
+        priority: Int
+    ) -> PetIntent {
+        PetIntent(
+            petId: observation.petId, action: .react,
+            target: observation.spatial, emotion: emotion, priority: priority,
+            duration: 1.2, intensity: 0.8, interruptPolicy: .replace,
+            animation: cue)
     }
 
     static func autonomousWanderIntent(

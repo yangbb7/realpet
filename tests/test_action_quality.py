@@ -1,10 +1,83 @@
 from pathlib import Path
+import json
+import subprocess
+import sys
 
 from PIL import Image, ImageDraw
 
 from pipeline.action_quality import analyze_action_frames, validate_response_candidate
 from pipeline.action_prepare import prepare_reaction_sequence
 from tests.generate_action_fixture import create_fixture
+
+
+FIXED_ACTION_KINDS = (
+    "gaze_orbit",
+    "lie_down",
+    "paw",
+    "eat",
+    "cry",
+    "angry_stomp",
+    "roll",
+    "stretch",
+    "sleep_snore",
+    "wave",
+    "jump_cheer",
+    "cuddle",
+)
+
+
+def _write_head_motion_frames(idle, candidate):
+    for index in range(8):
+        idle_image = Image.new("RGBA", (180, 180), (0, 0, 0, 0))
+        idle_draw = ImageDraw.Draw(idle_image)
+        idle_draw.rounded_rectangle(
+            (50, 70, 130, 165), radius=22, fill=(145, 105, 70, 255))
+        idle_draw.ellipse((74, 30, 126, 88), fill=(165, 120, 78, 255))
+        idle_image.save(idle / f"frame_{index:04d}.png")
+
+        candidate_image = Image.new("RGBA", (180, 180), (0, 0, 0, 0))
+        candidate_draw = ImageDraw.Draw(candidate_image)
+        candidate_draw.rounded_rectangle(
+            (50, 70, 130, 165), radius=22, fill=(145, 105, 70, 255))
+        head_x = 74 + index * 4
+        candidate_draw.ellipse((head_x, 30, head_x + 52, 88), fill=(165, 120, 78, 255))
+        candidate_image.save(candidate / f"frame_{index:04d}.png")
+
+
+def test_validate_action_cli_serializes_numpy_metrics(tmp_path):
+    idle = tmp_path / "idle"
+    candidate = tmp_path / "candidate"
+    idle.mkdir()
+    candidate.mkdir()
+    _write_head_motion_frames(idle, candidate)
+
+    script = Path(__file__).parents[1] / "scripts" / "validate_action.py"
+    completed = subprocess.run(
+        [sys.executable, str(script), "--frames-dir", str(candidate),
+         "--reference-frames-dir", str(idle), "--kind", "gaze_right"],
+        check=True, capture_output=True, text=True)
+    payload = json.loads(completed.stdout)
+    assert payload["type"] == "action_validation"
+    assert isinstance(payload["identity"]["passed"], bool)
+    assert payload["semantic_review_required"] is True
+
+
+def test_validate_action_cli_accepts_every_fixed_action_kind(tmp_path):
+    idle = tmp_path / "idle"
+    candidate = tmp_path / "candidate"
+    idle.mkdir()
+    candidate.mkdir()
+    _write_head_motion_frames(idle, candidate)
+
+    script = Path(__file__).parents[1] / "scripts" / "validate_action.py"
+    for kind in FIXED_ACTION_KINDS:
+        completed = subprocess.run(
+            [sys.executable, str(script), "--frames-dir", str(candidate),
+             "--reference-frames-dir", str(idle), "--kind", kind],
+            check=True, capture_output=True, text=True)
+        payload = json.loads(completed.stdout)
+        assert payload["kind"] == kind
+        assert payload["semantic_review_required"] is True
 
 
 def test_synthetic_walk_has_locomotion_evidence(tmp_path):
@@ -101,7 +174,7 @@ def test_play_requires_visible_lower_body_participation(tmp_path):
     assert result["passed"], result
 
 
-def test_reaction_preparation_moves_short_burst_to_sequence_start(tmp_path):
+def test_reaction_preparation_preserves_every_source_frame(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "prepared"
     source.mkdir()
@@ -118,8 +191,13 @@ def test_reaction_preparation_moves_short_burst_to_sequence_start(tmp_path):
 
     prepared = prepare_reaction_sequence(source, output, fps=10)
     assert prepared["prepared"], prepared
-    assert prepared["frame_count"] == 12
-    assert 12 <= prepared["start_index"] <= 18
+    assert prepared["frame_count"] == 30
+    assert prepared["source_frame_count"] == 30
+    assert prepared["start_index"] == 0
+    assert prepared["end_index"] == 30
+    assert [path.name for path in sorted(output.glob("frame_*.png"))] == [
+        f"frame_{index:04d}.png" for index in range(30)
+    ]
     validation = analyze_action_frames(output, "react", max_frames=None)
     assert validation["passed"], validation
 

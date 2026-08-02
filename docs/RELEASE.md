@@ -9,7 +9,7 @@ End users only need `README.md`.
 
 - **All model weights bundled** in the .app: SAM2 (~156 MB) + BiRefNet-matting (~900 MB) + Faster R-CNN (~175 MB).
 - **Static ffmpeg bundled** — no `brew install ffmpeg` required.
-- **First-launch SetupWizard** auto-creates the Python venv. Users only need Python 3.10+ installed (one `brew install python@3.12`, no sudo on Apple Silicon).
+- **First-launch SetupWizard** auto-creates the Python venv. Users need Python 3.10–3.12 installed (one `brew install python@3.12`, no sudo on Apple Silicon).
 - DMG compression switched to ULFO (LZFSE) on Apple Silicon; Intel fallback remains UDZO.
 
 ### End-user install
@@ -21,7 +21,14 @@ End users only need `README.md`.
 ### Maintainer build
 
 ```bash
-./build_app.sh   # downloads weights on first run; produces dist/RealPet.app
+./install.sh     # hash-locked dependencies plus verified model artifacts
+# Set the product credentials and the SHA-256 of the independently reviewed
+# ffmpeg binary before running this command.
+REALPET_SUPABASE_PUBLISHABLE_KEY=<publishable-key> \
+REALPET_AGNES_API_KEY=<agnes-key> \
+REALPET_FFMPEG_PATH=/path/to/verified/ffmpeg \
+REALPET_FFMPEG_SHA256=<sha256> \
+REALPET_BUILD_PYTHON=.venv/bin/python ./build_app.sh
 ./build_dmg.sh   # produces dist/RealPet.dmg
 ```
 
@@ -61,7 +68,11 @@ people who don't mind right-click → Open the first time.
 ```bash
 ./install.sh              # one-time setup
 cd RealPet && swift build -c release && cd ..   # build binary
-./build_app.sh            # produces dist/RealPet.app (ad-hoc signed)
+REALPET_SUPABASE_PUBLISHABLE_KEY=<publishable-key> \
+REALPET_AGNES_API_KEY=<agnes-key> \
+REALPET_FFMPEG_PATH=/path/to/verified/ffmpeg \
+REALPET_FFMPEG_SHA256=<sha256> \
+REALPET_BUILD_PYTHON=.venv/bin/python ./build_app.sh
 ./build_dmg.sh            # produces dist/RealPet.dmg (drag-to-install)
 ```
 
@@ -73,7 +84,7 @@ End-user experience (ad-hoc):
 4. Launch from `/Applications` (or Spotlight).
 5. **First-launch Gatekeeper prompt**: right-click the .app → Open → Open
    (only needed once; macOS records the exception).
-6. **First-launch SetupWizard**: if Python 3.10+ is not found, copy the
+6. **First-launch SetupWizard**: if Python 3.10–3.12 is not found, copy the
    `brew install python@3.12` command into Terminal (no sudo on Apple Silicon),
    then click **重新检测 / Retry**. The wizard creates a venv and installs
    dependencies (~2 minutes, one-time).
@@ -215,9 +226,18 @@ A "fresh-clone verify" means:
 
 1. Wipe a test Mac (or use a throwaway VM).
 2. Install only Xcode Command Line Tools (`xcode-select --install`).
-3. Clone the repo, run `./install.sh`, then `./build_app.sh`.
+3. Clone the repo, run `./install.sh`, then build with the release credentials
+   and a reviewed FFmpeg binary plus its SHA-256 as shown above.
 4. Launch the .app, import a pet video, verify a desktop pet appears.
 5. Time each step (this is your TTHW / "time to hello world").
+
+For each candidate release, also run the opt-in frame-preservation test against
+a consented real pet clip. The clip stays outside the repository:
+
+```bash
+REALPET_E2E_PET_VIDEO=/absolute/path/to/consented-pet-video.mp4 \
+pytest tests/test_frame_preservation.py -k real_pet_video -v
+```
 
 ## 5. Known gaps (out of scope for this script)
 
@@ -233,6 +253,7 @@ public release.
 ## 6. Security checklist before publishing
 
 - [ ] `./install.sh` runs cleanly on a clean machine
+- [ ] `scripts/verify_release_assets.py --weights-dir weights` accepts every bundled model file
 - [ ] `./build_app.sh` produces a launching .app
 - [ ] `./build_dmg.sh` produces a usable DMG
 - [ ] If shipping Developer-ID-signed: `spctl --assess` accepts the .app

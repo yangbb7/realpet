@@ -31,12 +31,11 @@ native window.
 - **Smart Clip Selection**: Long videos are automatically analyzed for the best pet segments
 - **Transparent Window**: Borderless, always-on-top, click-through window with real transparency
 - **Drag & Drop**: Move your pet anywhere on the desktop
-- **Persistent Pets**: Pet source, personality, feature anchors, and action metadata are saved between launches
+- **Persistent Pets**: Pet source, feature anchors, desktop position, scale, and action metadata are saved between launches
 - **Resident Daemon**: Python daemon keeps models loaded for fast processing
-- **Personality & Interaction Core**: Versioned multimodal events, personality
-  presets plus a six-axis custom editor, click and back-and-forth petting
-  gestures, immediate affection feedback, decaying short-term mood memory,
-  multi-action playback, and capability-gated behavior
+- **Deterministic Interaction Core**: Versioned multimodal events map fixed
+  pointer, click, and file-drop inputs to installed action slots without
+  autonomous movement or per-pet personality tuning
 - **Source-Frame Runtime**: A bounded native frame cache renders processed
   RGB/alpha pairs directly; no template, breed model, or cloud generation is
   needed to display a pet
@@ -48,28 +47,25 @@ native window.
 - **Local Visual Interaction**: Optional Apple Vision processing detects when
   you appear, approach, or wave; camera frames remain in bounded memory
 - **Local Voice Interaction**: Optional on-device speech recognition maps a
-  small command vocabulary into the same personality and capability gates;
+  small command vocabulary into the same fixed action and capability gates;
   microphone audio and transcripts are not persisted
 - **Local VLM Interaction (experimental)**: Discover an installed Ollama vision
   model and let it recognize allow-listed interactions from ephemeral camera
   keyframes; models can be installed from the settings sheet with streamed
   progress and cancellation, while remote endpoints and arbitrary commands are rejected
-- **Local Behavior Planning (experimental)**: An independently selected Ollama
-  model may choose `react`, `wander`, or no action from personality, mood, and
-  recent semantic memory; capability gates and offline rules remain authoritative
 
 ## Requirements
 
 - macOS 14.0+ (Sonoma), Apple Silicon recommended
 - ~3 GB free disk space (bundled model weights + extracted frames)
-- **Python 3.10 or newer** — used to run the AI pipeline
+- **Python 3.10–3.12** — used to run the AI pipeline
 - Internet connection on first launch for Python packages and when you choose
   to use the optional prompt/video generation service
 
 ### What you need to install first
 
 The app bundles everything except a Python interpreter. On first launch, a setup
-wizard creates the Python environment for you — but you must have **Python 3.10+**
+wizard creates the Python environment for you — but you must have **Python 3.10–3.12**
 installed. macOS ships with an older Python (3.9), which is **not** sufficient.
 
 If you don't already have Python 3.10+, install it with [Homebrew](https://brew.sh)
@@ -124,34 +120,37 @@ RealPet runs real-time AI models (SAM2 tracking + BiRefNet matting + Faster R-CN
 
 ## Quick Start
 
-0. Make sure **Python 3.10+** is installed (see [What you need to install first](#what-you-need-to-install-first)). This is the only prerequisite.
+0. Make sure **Python 3.10–3.12** is installed (see [What you need to install first](#what-you-need-to-install-first)). This is the only prerequisite.
 1. Download `RealPet.dmg` from the [latest release](https://github.com/DolaAIMii/realpet/releases/latest).
 2. Double-click the DMG and drag `RealPet.app` to `/Applications`.
-3. Launch from `/Applications` (right-click → Open the first time — the app is ad-hoc signed). First run sets up Python (~2 minutes, one-time).
+3. Launch from `/Applications` (right-click → Open the first time — the app is ad-hoc signed). First run sets up Python (~2 minutes, one-time), then Google login is required before the console opens.
 
-Click **导入宠物视频** and select clear footage of the same pet. Once the base
-frames are ready, open **默认鼠标动作** from that pet's row. Choose either
-**鼠标跟随** or **点击蹦跳**. The displayed MiniMax H3 prompt is for debugging
-only: it cannot be edited and no custom action can be added.
+Use **图片管理** to add one to four clear photos of the same pet. Select an
+action slot from the pet control panel to generate its independent video;
+custom actions can also be created from an imported real-world video. Built-in
+prompts are displayed for inspection and are not editable.
 
 Each built-in prompt follows MiniMax's image-to-video structure: identify the
 first-frame subject, describe an ordered motion, keep the camera fixed, then
 state the photographic visual direction. See the [official MiniMax video prompt
 guide](https://platform.minimaxi.com/docs/guides/video-prompt).
 
-Open the gear button once to configure two independent official services. Agnes
-uses `https://apihub.agnes-ai.com/v1` and `agnes-image-2.0-flash` to make the
-identity anchor. MiniMax uses `https://api.minimaxi.com` and `MiniMax-H3` for
-the video. The two keys are stored separately in the macOS Keychain.
+Open the gear button to choose one of two official video services. Google
+login is required on every launch, and **图片管理** stores one to four original
+photos in the signed-in owner's private Supabase gallery. Agnes Video V2.0
+uses its China official gateway, `https://api.agnes-ai.cn/v1`, and receives a
+24-hour signed URL for the gallery's first photo. MiniMax H3 receives all one
+to four gallery photos in memory as `reference_image` inputs. Generation never
+uploads or deletes reference photos; videos, extracted frames, and actions
+remain local to the same Google account. Supabase configuration and Agnes Video V2.0
+credentials are bundled by the product and never exposed in the desktop UI;
+only the optional MiniMax H3 credential is entered by the owner. The desktop
+client never receives a Supabase `service_role` key.
 
-For a selected scenario, RealPet first calls Agnes Image 2.0 to make one public
-identity anchor, then submits its built-in H3 prompt and that anchor as the
-first frame. Pointer tracking creates one 360-degree multi-view clip and maps
-pointer direction to its viewpoint frames; click bounce creates one clip.
-RealPet submits
-`POST /v2/video_generation`, polls the returned `task_id`, downloads the result,
-runs local quality and identity checks, and asks for installation before each
-clip becomes available to the desktop runtime.
+Each selected slot creates exactly one provider task. RealPet polls the returned
+task, downloads the result, runs local quality and identity checks, and installs
+the complete frame sequence before the clip becomes available to the desktop
+runtime. It never generates an intermediate Agnes Image reference.
 
 For developers who prefer to build from source, see `docs/RELEASE.md`.
 
@@ -229,7 +228,9 @@ All model weights are bundled inside `RealPet.app`. No downloads are required on
 | BiRefNet-matting | ~900MB | [ZhengPeng7](https://huggingface.co/ZhengPeng7/BiRefNet-matting) |
 | Faster R-CNN | ~175MB | [PyTorch](https://pytorch.org/vision/stable/models.html) |
 
-If you are building from source, `scripts/bundle_weights.py` downloads all three into the `weights/` directory.
+For source releases, `scripts/bundle_weights.py` fetches the pinned SAM2 file,
+the pinned BiRefNet commit, and the pinned Faster R-CNN file, then rejects any
+SHA-256 mismatch before packaging.
 
 ## Configuration
 
@@ -244,17 +245,33 @@ When enabled, the app discovers installed models with the `vision` capability;
 camera evidence remains in bounded memory and is never written to disk by this
 workflow.
 
-The default mouse-action services are configured in the in-app **默认鼠标动作**
-sheet, not through an environment variable. Their two Base URLs must be HTTPS
-unless they are loopback addresses. Agnes is direct-only for the canonical
-reference (`agnes-image-2.0-flash`); MiniMax is direct-only for video
-(`MiniMax-H3`, 2K, adaptive ratio), each using a separate credential. There is
-no Prompt-relay configuration because the app uses only its read-only built-in
-scenario prompts.
+The default mouse-action services are configured in the in-app action editor,
+not through an environment variable. Their Base URLs must be HTTPS unless they
+are loopback addresses. Agnes Video V2.0 receives a Supabase signed URL for
+the first cloud-gallery pet image after Google sign-in; MiniMax H3 receives all one to four cloud-gallery
+pet images directly as references. Supabase is product-managed, each provider
+uses a separate credential, and the app has no prompt-relay configuration.
+Release automation supplies the product's public Supabase key through
+`REALPET_SUPABASE_PUBLISHABLE_KEY` and its Agnes credential through
+`REALPET_AGNES_API_KEY`; neither is collected in the desktop UI. Release builds
+also require `REALPET_FFMPEG_PATH` and the matching
+`REALPET_FFMPEG_SHA256`; the build script no longer downloads an unpinned
+"latest" binary.
+
+Python packages are installed from `requirements.txt`, which delegates to the
+hash-locked `requirements.lock`. Regenerate both runtime and CI locks only with
+Python 3.10 and `pip-compile --generate-hashes` after intentionally changing
+`requirements.in` or `requirements-dev.in`.
 
 ## Building the App
 
 ```bash
+./install.sh
+REALPET_SUPABASE_PUBLISHABLE_KEY=<publishable-key> \
+REALPET_AGNES_API_KEY=<agnes-key> \
+REALPET_FFMPEG_PATH=/path/to/verified/ffmpeg \
+REALPET_FFMPEG_SHA256=<sha256> \
+REALPET_BUILD_PYTHON=.venv/bin/python \
 ./build_app.sh
 # Output: dist/RealPet.app (ad-hoc signed)
 ```

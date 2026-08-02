@@ -4,22 +4,10 @@ import Security
 enum OpenAIAPIKeyStore {
     private static let service = "com.realpet.app.openai"
     private static let imageAccount = "gpt-image"
-    private static let legacyMotionAccount = "motion-generation"
-    private static let agnesMotionAccount = "motion-agnes"
     private static let miniMaxMotionAccount = "motion-minimax"
 
     static func load() -> String? {
         load(account: imageAccount)
-    }
-
-    /// Agnes owns a distinct direct credential. The legacy motion account is
-    /// only a migration fallback for the previously single-key workflow.
-    static func loadAgnesMotionService() -> String? {
-        load(account: agnesMotionAccount) ?? load(account: legacyMotionAccount)
-    }
-
-    static func loadMotionService() -> String? {
-        loadAgnesMotionService()
     }
 
     /// MiniMax H3 is a separate provider. Do not fall back to the legacy
@@ -30,14 +18,6 @@ enum OpenAIAPIKeyStore {
 
     static func save(_ key: String) throws {
         try save(key, account: imageAccount)
-    }
-
-    static func saveAgnesMotionService(_ key: String) throws {
-        try save(key, account: agnesMotionAccount)
-    }
-
-    static func saveMotionService(_ key: String) throws {
-        try saveAgnesMotionService(key)
     }
 
     static func saveMiniMaxMotionService(_ key: String) throws {
