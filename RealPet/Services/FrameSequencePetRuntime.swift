@@ -1,6 +1,7 @@
 import AppKit
 import CoreImage
 import Foundation
+import ImageIO
 
 enum FrameSequenceRuntimeError: LocalizedError {
     case noFrames(URL)
@@ -343,9 +344,16 @@ private final class SourceFrameImageCache {
         label: "com.realpet.frame-image-decoder", qos: .userInitiated)
     private let lock = NSLock()
     private var pendingCallbacks: [String: [(NSImage?) -> Void]] = [:]
+    private let maximumPixelDimension: Int
 
-    init(limit: Int = 24) {
+    init(
+        limit: Int = 18,
+        totalCostLimit: Int = 64 * 1024 * 1024,
+        maximumPixelDimension: Int = 1024
+    ) {
         cache.countLimit = max(1, limit)
+        cache.totalCostLimit = max(1, totalCostLimit)
+        self.maximumPixelDimension = max(1, maximumPixelDimension)
     }
 
     func image(for frame: SourceFrameSequence.Frame) -> NSImage? {
@@ -368,9 +376,12 @@ private final class SourceFrameImageCache {
         lock.unlock()
         guard !alreadyDecoding else { return }
         decodeQueue.async { [weak self] in
-            let image = Self.decodedImage(for: frame)
+            guard let self else { return }
+            let image = Self.decodedImage(
+                for: frame, maximumPixelDimension: self.maximumPixelDimension)
+            let cost = Self.cost(of: image)
             DispatchQueue.main.async {
-                self?.completeDecode(key: key, image: image)
+                self.completeDecode(key: key, image: image, cost: cost)
             }
         }
     }
@@ -381,21 +392,44 @@ private final class SourceFrameImageCache {
         }
     }
 
-    private func completeDecode(key: String, image: NSImage?) {
-        if let image { cache.setObject(image, forKey: key as NSString) }
+    private func completeDecode(key: String, image: NSImage?, cost: Int) {
+        if let image { cache.setObject(image, forKey: key as NSString, cost: cost) }
         lock.lock()
         let callbacks = pendingCallbacks.removeValue(forKey: key) ?? []
         lock.unlock()
         callbacks.forEach { $0(image) }
     }
 
-    private static func decodedImage(for frame: SourceFrameSequence.Frame) -> NSImage? {
+    private static func decodedImage(
+        for frame: SourceFrameSequence.Frame,
+        maximumPixelDimension: Int
+    ) -> NSImage? {
         autoreleasepool {
             if let alphaURL = frame.alphaURL {
-                return compositedImage(rgbURL: frame.rgbURL, alphaURL: alphaURL)
+                return resizedImage(
+                    compositedImage(rgbURL: frame.rgbURL, alphaURL: alphaURL),
+                    maximumPixelDimension: maximumPixelDimension)
             }
-            return NSImage(contentsOf: frame.rgbURL)
+            return thumbnailImage(
+                at: frame.rgbURL, maximumPixelDimension: maximumPixelDimension)
         }
+    }
+
+    private static func thumbnailImage(
+        at url: URL,
+        maximumPixelDimension: Int
+    ) -> NSImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceShouldCacheImmediately: false,
+                  kCGImageSourceThumbnailMaxPixelSize: maximumPixelDimension,
+              ] as CFDictionary) else {
+            return nil
+        }
+        return NSImage(cgImage: image, size: NSSize(
+            width: image.width, height: image.height))
     }
 
     private static func compositedImage(rgbURL: URL, alphaURL: URL) -> NSImage? {
@@ -413,6 +447,41 @@ private final class SourceFrameImageCache {
         }
         return NSImage(cgImage: cgImage, size: NSSize(
             width: rgb.extent.width, height: rgb.extent.height))
+    }
+
+    private static func resizedImage(
+        _ image: NSImage?,
+        maximumPixelDimension: Int
+    ) -> NSImage? {
+        guard let image,
+              let cgImage = image.cgImage(
+                  forProposedRect: nil, context: nil, hints: nil) else {
+            return nil
+        }
+        let largestDimension = max(cgImage.width, cgImage.height)
+        guard largestDimension > maximumPixelDimension else { return image }
+        let scale = CGFloat(maximumPixelDimension) / CGFloat(largestDimension)
+        let width = max(1, Int((CGFloat(cgImage.width) * scale).rounded()))
+        let height = max(1, Int((CGFloat(cgImage.height) * scale).rounded()))
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return image }
+        context.interpolationQuality = .high
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let resized = context.makeImage() else { return image }
+        return NSImage(cgImage: resized, size: NSSize(width: width, height: height))
+    }
+
+    private static func cost(of image: NSImage?) -> Int {
+        guard let representation = image?.representations.first else { return 1 }
+        return max(1, representation.pixelsWide * representation.pixelsHigh * 4)
     }
 }
 
@@ -512,7 +581,7 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
     NSWindowDelegate {
 
     let petId: UUID
-    private let rendererKind = PetRendererKind.sourceFrames
+    private let rendererKind = "sourceFrames"
     var onObservation: ((InteractionObservation) -> Void)?
     var onTermination: (() -> Void)?
     private(set) var isRunning = false
@@ -615,7 +684,7 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
             panel.orderOut(nil)
         }
         emitSystem(kind: "runtime.ready", attributes: [
-            "renderer": rendererKind.rawValue,
+            "renderer": rendererKind,
             "featureAnchors": features?.head == nil ? "geometry_fallback" : "vision",
         ])
     }
@@ -906,6 +975,18 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         let next = SourceFrameHold(sequence: sequence, index: index)
         heldFrame = next
         render(next)
+        prefetchNeighbors(of: next)
+    }
+
+    private func prefetchNeighbors(of hold: SourceFrameHold) {
+        let radius = min(4, max(0, hold.sequence.frames.count - 1))
+        let frames = (-radius...radius).map { offset in
+            let index = min(
+                max(0, hold.index + offset),
+                hold.sequence.frames.count - 1)
+            return hold.sequence.frames[index]
+        }
+        cache.prefetch(frames)
     }
 
     private func render(_ heldFrame: SourceFrameHold) {
@@ -1005,7 +1086,7 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         var attributes = [
             "commandId": command.id.uuidString,
             "action": command.action.rawValue,
-            "renderer": rendererKind.rawValue,
+            "renderer": rendererKind,
         ]
         if let reason { attributes["reason"] = reason }
         emitSystem(

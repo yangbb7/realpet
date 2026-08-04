@@ -27,45 +27,25 @@ enum PetImageLibraryPolicy {
 }
 
 enum MotionVideoProvider: String, Codable, CaseIterable, Identifiable, Sendable {
-    case agnes
     case miniMaxH3
+    /// Decodes unfinished pre-cutover tasks. It is never selectable and the
+    /// desktop app will not attempt to resume it through the retired API.
+    case legacyAgnes = "agnes"
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
-        case .agnes: return "Agnes Video V2.0"
         case .miniMaxH3: return "MiniMax H3"
+        case .legacyAgnes: return "旧版视频任务"
         }
     }
 
     var modelName: String {
         switch self {
-        case .agnes: return "agnes-video-v2.0"
         case .miniMaxH3: return "MiniMax-H3"
+        case .legacyAgnes: return "legacy-agnes"
         }
-    }
-}
-
-/// Agnes is a product-owned direct integration. The release pipeline injects
-/// its credential into the app bundle. It intentionally has no Keychain
-/// fallback, so all installations use the same bundled China-site credential.
-enum BundledAgnesVideoService {
-    /// Agnes China official API gateway. The URL is product-owned and never
-    /// comes from the desktop settings UI.
-    static let baseURLString = "https://api.agnes-ai.cn/v1"
-    static let modelName = "agnes-video-v2.0"
-    static let size = "1152x768"
-    private static let apiKeyInfoKey = "RealPetAgnesAPIKey"
-
-    static func apiKey(bundle: Bundle = .main) throws -> String {
-        let bundledValue = bundle.object(forInfoDictionaryKey: apiKeyInfoKey) as? String
-        let bundledKey = bundledValue?.trimmingCharacters(
-            in: .whitespacesAndNewlines) ?? ""
-        guard !bundledKey.isEmpty else {
-            throw AgnesVideoGenerationError.invalidAPIKey
-        }
-        return bundledKey
     }
 }
 
@@ -148,34 +128,34 @@ enum FixedPetAction: String, CaseIterable, Identifiable, Codable, Sendable {
         .sleepSnore, .wave, .jumpCheer, .cuddle,
     ]
 
+    /// The action-pack order intentionally starts with the only action that
+    /// can create a base frame library for a photo-only pet.
+    static func missingActions(
+        installedKinds: Set<PetActionManifest.Action.Kind>
+    ) -> [FixedPetAction] {
+        allCases.filter { !installedKinds.contains($0.kind) }
+    }
+
     static func action(for kind: PetActionManifest.Action.Kind) -> FixedPetAction? {
         allCases.first { $0.kind == kind }
     }
 
     var prompt: String {
-        prompt(referenceImageCount: 1, provider: .miniMaxH3)
+        prompt(referenceImageCount: 1)
     }
 
-    func prompt(
-        referenceImageCount: Int,
-        provider: MotionVideoProvider
-    ) -> String {
+    func prompt(referenceImageCount: Int) -> String {
         let count = PetImageLibraryPolicy.normalizedReferenceCount(referenceImageCount)
         let identityConstraint: String
-        switch provider {
-        case .agnes:
-            identityConstraint = "以第一张上传的宠物照片为唯一主参考图，严格保持同一只宠物的毛色、花纹、脸型、眼睛、耳朵和体型一致。"
-        case .miniMaxH3:
-            switch count {
-            case 1:
-                identityConstraint = "仅使用这 1 张宠物素材图锁定外观，必须始终是同一只宠物。"
-            case 2:
-                identityConstraint = "综合这 2 张宠物素材图交叉校验毛色、花纹、脸型、眼睛、耳朵和体型，必须始终是同一只宠物。"
-            case 3:
-                identityConstraint = "综合这 3 张宠物素材图完整锁定毛色、花纹、脸型、眼睛、耳朵和体型，必须始终是同一只宠物。"
-            default:
-                identityConstraint = "综合全部 4 张宠物素材图严格锁定毛色、花纹、脸型、眼睛、耳朵和体型，必须始终是同一只宠物。"
-            }
+        switch count {
+        case 1:
+            identityConstraint = "仅使用这 1 张宠物素材图锁定外观，必须始终是同一只宠物。"
+        case 2:
+            identityConstraint = "综合这 2 张宠物素材图交叉校验毛色、花纹、脸型、眼睛、耳朵和体型，必须始终是同一只宠物。"
+        case 3:
+            identityConstraint = "综合这 3 张宠物素材图完整锁定毛色、花纹、脸型、眼睛、耳朵和体型，必须始终是同一只宠物。"
+        default:
+            identityConstraint = "综合全部 4 张宠物素材图严格锁定毛色、花纹、脸型、眼睛、耳朵和体型，必须始终是同一只宠物。"
         }
 
         let motion: String
@@ -245,142 +225,45 @@ enum MotionWorkflowState: Equatable {
 }
 
 struct MotionServiceConfiguration: Codable, Equatable, Sendable {
-    static let defaultValue = MotionServiceConfiguration(
-        provider: .agnes,
-        agnesBaseURLString: BundledAgnesVideoService.baseURLString,
-        miniMaxBaseURLString: MiniMaxVideoAPIConfiguration.defaultBaseURLString,
-        videoModel: BundledAgnesVideoService.modelName,
-        seconds: 4,
-        size: "1152x768")
+    static let defaultValue = MotionServiceConfiguration(seconds: 4)
 
-    var provider: MotionVideoProvider
-    var agnesBaseURLString: String? = nil
-    var miniMaxBaseURLString: String? = nil
-    var videoModel: String
+    let provider: MotionVideoProvider = .miniMaxH3
+    let videoModel = MotionVideoProvider.miniMaxH3.modelName
     var seconds: Int
-    var size: String
 
-    init(
-        provider: MotionVideoProvider = .agnes,
-        agnesBaseURLString: String? = nil,
-        miniMaxBaseURLString: String? = nil,
-        videoModel: String,
-        seconds: Int,
-        size: String
-    ) {
-        self.provider = provider
-        self.agnesBaseURLString = agnesBaseURLString
-        self.miniMaxBaseURLString = miniMaxBaseURLString
-        self.videoModel = videoModel
+    init(seconds: Int) {
         self.seconds = seconds
-        self.size = size
-    }
-
-    var resolvedAgnesBaseURLString: String {
-        BundledAgnesVideoService.baseURLString
-    }
-
-    var resolvedMiniMaxBaseURLString: String {
-        miniMaxBaseURLString ?? MiniMaxVideoAPIConfiguration.defaultBaseURLString
-    }
-
-    func validatedAgnesAPIConfiguration() throws -> OpenAIImageAPIConfiguration {
-        try OpenAIImageAPIConfiguration(baseURLString: resolvedAgnesBaseURLString)
     }
 
     func validated() throws -> MotionServiceConfiguration {
-        switch provider {
-        case .agnes:
-            let agnesConfiguration = try validatedAgnesAPIConfiguration()
-            guard agnesConfiguration.isAgnesAPI else {
-                throw MotionServiceConfigurationError.invalidAgnesAPI
-            }
-            guard (4...18).contains(seconds) else {
-                throw MotionServiceConfigurationError.invalidAgnesDuration
-            }
-            guard videoModel == MotionVideoProvider.agnes.modelName else {
-                throw MotionServiceConfigurationError.invalidVideoModel
-            }
-            guard AgnesVideoGenerationRequestSettings(size: size, seconds: seconds) != nil else {
-                throw MotionServiceConfigurationError.invalidSize
-            }
-        case .miniMaxH3:
-            let miniMaxConfiguration = try MiniMaxVideoAPIConfiguration(
-                baseURLString: resolvedMiniMaxBaseURLString)
-            guard miniMaxConfiguration.isOfficialAPI else {
-                throw MotionServiceConfigurationError.invalidMiniMaxAPI
-            }
-            guard (4...15).contains(seconds) else {
-                throw MotionServiceConfigurationError.invalidMiniMaxDuration
-            }
-            guard videoModel == MotionVideoProvider.miniMaxH3.modelName else {
-                throw MotionServiceConfigurationError.invalidVideoModel
-            }
+        guard (4...15).contains(seconds) else {
+            throw MotionServiceConfigurationError.invalidDuration
         }
         return self
     }
 
-    /// Configurations from older releases lacked an explicit provider. Infer it
-    /// from their saved model rather than silently replacing MiniMax with Agnes.
+    /// Rewrites every older direct-provider preference to the server-owned
+    /// MiniMax path. Only the supported duration is retained.
     func migratedToSupportedProviders() -> MotionServiceConfiguration {
-        var migrated = self
-        if migrated.miniMaxBaseURLString == nil {
-            migrated.miniMaxBaseURLString = MiniMaxVideoAPIConfiguration.defaultBaseURLString
-        }
-        if migrated.provider == .agnes {
-            migrated.agnesBaseURLString = BundledAgnesVideoService.baseURLString
-            migrated.videoModel = BundledAgnesVideoService.modelName
-            migrated.seconds = min(max(migrated.seconds, 4), 18)
-            migrated.size = BundledAgnesVideoService.size
-        } else {
-            migrated.videoModel = MotionVideoProvider.miniMaxH3.modelName
-            migrated.seconds = min(max(migrated.seconds, 4), 15)
-        }
-        return migrated
+        MotionServiceConfiguration(seconds: min(max(seconds, 4), 15))
     }
 
     private enum CodingKeys: String, CodingKey {
-        case provider
-        case agnesBaseURLString
-        case miniMaxBaseURLString
-        case videoModel
         case seconds
-        case size
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let savedModel = try container.decodeIfPresent(String.self, forKey: .videoModel)
-        let savedProvider = try container.decodeIfPresent(
-            MotionVideoProvider.self, forKey: .provider)
-        provider = savedProvider ?? (savedModel == MotionVideoProvider.miniMaxH3.modelName
-            ? .miniMaxH3 : .agnes)
-        agnesBaseURLString = try container.decodeIfPresent(
-            String.self, forKey: .agnesBaseURLString)
-        miniMaxBaseURLString = try container.decodeIfPresent(
-            String.self, forKey: .miniMaxBaseURLString)
-        videoModel = savedModel ?? provider.modelName
         seconds = try container.decodeIfPresent(Int.self, forKey: .seconds) ?? 4
-        size = try container.decodeIfPresent(String.self, forKey: .size) ?? "1152x768"
     }
 }
 
 enum MotionServiceConfigurationError: LocalizedError, Equatable {
-    case invalidAgnesDuration
-    case invalidMiniMaxDuration
-    case invalidAgnesAPI
-    case invalidMiniMaxAPI
-    case invalidVideoModel
-    case invalidSize
+    case invalidDuration
 
     var errorDescription: String? {
         switch self {
-        case .invalidAgnesDuration: return "Agnes Video V2.0 视频时长仅支持 4 到 18 秒"
-        case .invalidMiniMaxDuration: return "MiniMax H3 视频时长仅支持 4 到 15 秒"
-        case .invalidAgnesAPI: return "视频模型必须使用 Agnes 官方 API"
-        case .invalidMiniMaxAPI: return "视频模型必须使用 MiniMax 官方 API"
-        case .invalidVideoModel: return "视频模型与当前提供商不匹配"
-        case .invalidSize: return "视频尺寸必须为合法的宽x高，例如 1152x768"
+        case .invalidDuration: return "MiniMax H3 视频时长仅支持 4 到 15 秒"
         }
     }
 }

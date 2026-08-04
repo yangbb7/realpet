@@ -166,7 +166,7 @@ struct SupabaseReferenceStorageCredentials: Sendable {
 
 /// Stores original user-provided reference bytes in a private, per-user
 /// gallery. The persisted `PetCloudReference` contains no URL capability;
-/// signed URLs are generated only in memory when Agnes needs a first frame.
+/// signed URLs are generated only in memory for authorized server-side work.
 struct SupabasePetReferenceStorageClient {
     private let session: URLSession
 

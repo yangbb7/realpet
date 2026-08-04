@@ -102,22 +102,7 @@ struct PetBehaviorMemory: Equatable, Sendable {
             engagementDelta = 0.38
             arousalDelta = 0.08
             stressDelta = -0.16
-        case InteractionKind.userWaves, InteractionKind.userCallsPet,
-             InteractionKind.userLooksAtPet, InteractionKind.userAppears:
-            valenceDelta = 0.12
-            engagementDelta = 0.25 + personality.curiosity * 0.12
-            arousalDelta = 0.08
-        case InteractionKind.userPraisesPet:
-            valenceDelta = 0.34 + personality.affection * 0.20
-            engagementDelta = 0.34
-            arousalDelta = 0.10
-            stressDelta = -0.12
-        case InteractionKind.userInvitesPlay, InteractionKind.userOffersObject:
-            valenceDelta = 0.24 + personality.playfulness * 0.16
-            engagementDelta = 0.42
-            arousalDelta = 0.30 + personality.energy * 0.10
-        case InteractionKind.pointerApproachingFast,
-             InteractionKind.userApproachesPet:
+        case InteractionKind.pointerApproachingFast:
             arousalDelta = 0.30
             engagementDelta = 0.18
             stressDelta = 0.20 + (1 - personality.boldness) * 0.42
@@ -128,12 +113,6 @@ struct PetBehaviorMemory: Equatable, Sendable {
         case InteractionKind.dragEnded:
             valenceDelta = 0.08
             stressDelta = -0.10
-        case InteractionKind.userRequestsPause:
-            arousalDelta = -0.30
-            stressDelta = -0.08
-        case InteractionKind.userRequestsResume:
-            arousalDelta = 0.12
-            engagementDelta = 0.12
         default:
             break
         }

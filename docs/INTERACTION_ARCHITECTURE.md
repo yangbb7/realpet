@@ -3,8 +3,7 @@
 ## Status
 
 The desktop renderer is a native `NSPanel` that replays the owner’s alpha-matted
-source frames. It is the default for every new import; a legacy Live2D/Cubism
-package is optional and is never required to show a pet. The pipeline retains
+source frames. It is the only supported desktop renderer. The pipeline retains
 the source clip and its extracted RGB/alpha pairs, then writes two local,
 versioned manifests beside the frames:
 
@@ -109,13 +108,4 @@ Capabilities describe what a pet has real assets for: locomotion, reactions, and
 orientation. Commands are schema-checked, pet-ID scoped, expiry-checked, and
 capability-gated before the runtime receives them. Unknown action names and
 out-of-bounds coordinates are rejected. Dragging temporarily pauses only the
-current direct interaction. Camera, speech, and local VLM adapters emit
-allow-listed semantics, apply backpressure, and discard late or expired results.
-
-## Legacy Cubism
-
-`CubismWebPetRuntime` remains available solely to open existing compiled
-packages. It is isolated from new imports and included in a bundle only when a
-release maintainer explicitly sets `REALPET_INCLUDE_LEGACY_CUBISM=1` with the
-licensed runtime files present. See `CUBISM_SETUP.md` for that migration-only
-path.
+current direct interaction.

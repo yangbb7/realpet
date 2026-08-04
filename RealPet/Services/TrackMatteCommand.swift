@@ -10,7 +10,8 @@ enum TrackMatteCommand {
         bbox: [Double]? = nil,
         startTime: Double = -1,
         duration: Double = -1,
-        skipsQualityCheck: Bool = false
+        skipsQualityCheck: Bool = false,
+        assetProfile: PetAssetProfile = .standard
     ) -> [String] {
         var arguments = [
             scriptPath,
@@ -18,6 +19,8 @@ enum TrackMatteCommand {
             "--output-dir", outputDir,
             "--preview-seconds", "5",
             "--max-seconds", "15",
+            "--fps", "\(assetProfile.frameRate)",
+            "--max-output-dimension", "\(assetProfile.maximumOutputDimension)",
             "--click", "\(clickX),\(clickY)",
         ]
         if skipsQualityCheck {

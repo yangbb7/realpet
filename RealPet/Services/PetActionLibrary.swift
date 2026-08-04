@@ -161,6 +161,81 @@ enum PetActionLibrary {
         try sourceFrames(in: directory).count
     }
 
+    /// Returns the stable visual identity source for later action validation.
+    /// Generated photo-only pets keep their canonical frames in `gaze_orbit`;
+    /// their root directory may be reclaimed after the install completes.
+    static func identityReferenceDirectory(rootFramesDirectory: URL) -> URL {
+        let root = rootFramesDirectory.standardizedFileURL
+            .resolvingSymlinksInPath()
+        guard let manifest = PetActionManifest.load(framesDirectory: root.path),
+              let orbit = manifest.actions.first(where: {
+                  $0.kind == .gazeOrbit && $0.effectiveOrigin == .generated
+              }),
+              let orbitDirectory = safeActionDirectory(
+                  orbit.framesDirectory, beneath: root),
+              let frames = try? sourceFrames(in: orbitDirectory),
+              !frames.isEmpty else {
+            return root
+        }
+        return orbitDirectory
+    }
+
+    /// Removes the obsolete root-level copy created by the original generated
+    /// head-follow install. Files are reclaimed only when every color and alpha
+    /// frame has an exact byte-for-byte counterpart in the canonical action.
+    @discardableResult
+    static func deduplicateGeneratedOrbitFrames(
+        rootFramesDirectory: URL
+    ) throws -> Bool {
+        let root = rootFramesDirectory.standardizedFileURL
+            .resolvingSymlinksInPath()
+        guard let manifest = PetActionManifest.load(framesDirectory: root.path),
+              let idle = manifest.actions.first(where: { $0.id == manifest.defaultAction }),
+              idle.framesDirectory != ".",
+              let orbit = manifest.actions.first(where: {
+                  $0.kind == .gazeOrbit && $0.effectiveOrigin == .generated
+              }),
+              let orbitDirectory = safeActionDirectory(
+                  orbit.framesDirectory, beneath: root) else {
+            return false
+        }
+
+        let rootFrames = try sourceFrames(in: root)
+        let orbitFrames = try sourceFrames(in: orbitDirectory)
+        guard !rootFrames.isEmpty, rootFrames.count == orbitFrames.count else {
+            return false
+        }
+
+        let fm = FileManager.default
+        for (rootFrame, orbitFrame) in zip(rootFrames, orbitFrames) {
+            guard rootFrame.lastPathComponent == orbitFrame.lastPathComponent,
+                  fm.contentsEqual(atPath: rootFrame.path, andPath: orbitFrame.path)
+            else {
+                return false
+            }
+
+            let rootAlpha = alphaCompanion(for: rootFrame)
+            let orbitAlpha = alphaCompanion(for: orbitFrame)
+            let rootHasAlpha = fm.fileExists(atPath: rootAlpha.path)
+            let orbitHasAlpha = fm.fileExists(atPath: orbitAlpha.path)
+            guard rootHasAlpha == orbitHasAlpha,
+                  !rootHasAlpha || fm.contentsEqual(
+                      atPath: rootAlpha.path, andPath: orbitAlpha.path)
+            else {
+                return false
+            }
+        }
+
+        for frame in rootFrames {
+            try fm.removeItem(at: frame)
+            let alpha = alphaCompanion(for: frame)
+            if fm.fileExists(atPath: alpha.path) {
+                try fm.removeItem(at: alpha)
+            }
+        }
+        return true
+    }
+
     static func removeCustomAction(
         id: String,
         rootFramesDirectory: URL
@@ -215,6 +290,24 @@ enum PetActionLibrary {
                     && !$0.lastPathComponent.hasSuffix("_a.jpg")
             }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private static func alphaCompanion(for frame: URL) -> URL {
+        let stem = frame.deletingPathExtension()
+        return stem.deletingLastPathComponent().appendingPathComponent(
+            "\(stem.lastPathComponent)_a.jpg")
+    }
+
+    private static func safeActionDirectory(
+        _ relative: String,
+        beneath root: URL
+    ) -> URL? {
+        let resolvedRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        let candidate = resolvedRoot.appendingPathComponent(relative)
+            .standardizedFileURL.resolvingSymlinksInPath()
+        let prefix = resolvedRoot.path.hasSuffix("/")
+            ? resolvedRoot.path : resolvedRoot.path + "/"
+        return candidate.path.hasPrefix(prefix) ? candidate : nil
     }
 
     private static func isSafeActionID(_ id: String) -> Bool {

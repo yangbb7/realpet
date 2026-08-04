@@ -1,8 +1,7 @@
 import SwiftUI
 
-/// The app is account-scoped. No local console is mounted until a valid
-/// Supabase session exists, which prevents a second user's local catalog from
-/// being shown before the cloud gallery boundary has been established.
+/// The console is account-scoped. Its local catalog stays hidden until the
+/// cloud owner boundary is resolved, while account controls remain available.
 struct RealPetRootView: View {
     @EnvironmentObject private var vm: PetListViewModel
     @ObservedObject private var googleLogin = SupabaseGoogleLoginCoordinator.shared
@@ -13,23 +12,14 @@ struct RealPetRootView: View {
         Group {
             switch googleLogin.state {
             case .signedIn:
-                if vm.cloudAccountIsReady {
-                    MainPanelView(bridge: bridge)
-                } else if let error = vm.cloudGalleryError {
-                    GoogleLoginGateView(
-                        title: "无法打开云端图库",
-                        detail: error,
-                        isLoading: false,
-                        actionTitle: "重试",
-                        action: vm.activateCloudGallery)
-                } else {
-                    GoogleLoginGateView(
-                        title: "正在打开云端图库…",
-                        detail: nil,
-                        isLoading: true,
-                        actionTitle: nil,
-                        action: {})
-                }
+                MainPanelView(bridge: bridge)
+                    .safeAreaInset(edge: .top, spacing: 0) {
+                        if !vm.cloudAccountIsReady {
+                            CloudGalleryStatusBar(
+                                error: vm.cloudGalleryError,
+                                retry: vm.activateCloudGallery)
+                        }
+                    }
             case .checking:
                 GoogleLoginGateView(
                     title: "正在检查登录状态…",
@@ -73,6 +63,38 @@ struct RealPetRootView: View {
             }
             vm.clearCloudAccountSession()
         }
+    }
+}
+
+private struct CloudGalleryStatusBar: View {
+    let error: String?
+    let retry: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if let error {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(error)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Button(action: retry) {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("重试同步云端图库")
+            } else {
+                ProgressView().controlSize(.small)
+                Text("正在同步云端图库")
+                Spacer(minLength: 0)
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity)
+        .background(.bar)
     }
 }
 

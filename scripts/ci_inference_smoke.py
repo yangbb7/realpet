@@ -12,6 +12,7 @@ It exits 0 on success and 1 on failure.
 """
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -93,8 +94,9 @@ def main():
     print(f"Selected device: {device}")
     print(f"HF_ENDPOINT={os.environ.get('HF_ENDPOINT', 'default')}")
 
-    # Optional: let HF cache go to a temp dir for isolation
-    os.environ.setdefault("HF_HOME", os.path.join(os.getcwd(), ".ci_cache", "hf"))
+    # Keep the CI-only Hugging Face cache outside the checkout as well.
+    os.environ.setdefault(
+        "HF_HOME", os.path.join(tempfile.gettempdir(), "realpet-ci-hf"))
 
     t0 = time.time()
     smoke_birefnet(device)

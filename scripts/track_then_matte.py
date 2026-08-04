@@ -580,7 +580,8 @@ def _verify_output_frame_sequence(directory, expected_count):
     return paths
 
 
-def _extract_frames_core(video_path, output_dir, fps=None, ss=None, dur=None):
+def _extract_frames_core(video_path, output_dir, fps=None, ss=None, dur=None,
+                         max_output_dimension=0):
     """Shared extraction. SDR → fast JPEG path; HDR → 16-bit + numpy tone-map.
 
     Returns sorted list of frame_*.jpg paths.
@@ -603,6 +604,10 @@ def _extract_frames_core(video_path, output_dir, fps=None, ss=None, dur=None):
     filters = ["yadif=mode=send_frame"] if _is_interlaced_video(video_path) else []
     if fps is not None and fps > 0:
         filters.append(f"fps={fps}")
+    if max_output_dimension and max_output_dimension > 0:
+        filters.append(
+            f"scale={max_output_dimension}:{max_output_dimension}:"
+            "force_original_aspect_ratio=decrease:flags=lanczos")
     output_options = ["-map", "0:v:0", "-vsync", "0"]
     if filters:
         output_options += ["-vf", ",".join(filters)]
@@ -619,6 +624,14 @@ def _extract_frames_core(video_path, output_dir, fps=None, ss=None, dur=None):
                 rgb16 = cv2.cvtColor(cv2.imread(p, cv2.IMREAD_UNCHANGED),
                                      cv2.COLOR_BGR2RGB)
                 bgr8 = _tonemap_bt2020_to_srgb(rgb16, transfer)
+                if max_output_dimension and max(bgr8.shape[:2]) > max_output_dimension:
+                    height, width = bgr8.shape[:2]
+                    scale = max_output_dimension / max(height, width)
+                    bgr8 = cv2.resize(
+                        bgr8,
+                        (max(1, int(round(width * scale))),
+                         max(1, int(round(height * scale)))),
+                        interpolation=cv2.INTER_AREA)
                 cv2.imwrite(os.path.join(output_dir, f"frame_{i:04d}.jpg"),
                             bgr8, [cv2.IMWRITE_JPEG_QUALITY, 95])
         finally:
@@ -631,15 +644,19 @@ def _extract_frames_core(video_path, output_dir, fps=None, ss=None, dur=None):
     return sorted(glob.glob(os.path.join(output_dir, "frame_*.jpg")))
 
 
-def extract_frames_range(video_path, output_dir, start_time, duration, fps=None):
+def extract_frames_range(video_path, output_dir, start_time, duration, fps=None,
+                         max_output_dimension=0):
     """Extract frames from a specific time range (HDR-aware)."""
-    return _extract_frames_core(video_path, output_dir, fps,
-                                ss=start_time, dur=duration)
+    return _extract_frames_core(
+        video_path, output_dir, fps, ss=start_time, dur=duration,
+        max_output_dimension=max_output_dimension)
 
 
-def extract_frames(video_path, output_dir, fps=None):
+def extract_frames(video_path, output_dir, fps=None, max_output_dimension=0):
     """Extract frames from the whole video (HDR-aware)."""
-    return _extract_frames_core(video_path, output_dir, fps)
+    return _extract_frames_core(
+        video_path, output_dir, fps,
+        max_output_dimension=max_output_dimension)
 
 
 # === Video stabilization (Part A — tech/PET_STABILIZATION_SPIKE.md) ===
@@ -2005,6 +2022,9 @@ def main():
     parser.add_argument(
         "--fps", type=int, default=0,
         help="Optional extraction FPS. Omit or pass 0 to preserve every source frame.")
+    parser.add_argument(
+        "--max-output-dimension", type=int, default=0,
+        help="Maximum extracted frame dimension. Omit or pass 0 to preserve source size.")
     parser.add_argument("--click", type=str, default=None,
                         help="Pet click point as 'x,y' (auto-detect if not set)")
     parser.add_argument("--bbox", type=str, default=None,
@@ -2058,7 +2078,9 @@ def main():
         emit({"type": "phase", "name": "extract",
               "detail": f"extracting {dur:.1f}s from {start:.1f}s (user-selected)"})
         trim_dir = os.path.join(extract_dir, "trim")
-        frames = extract_frames_range(args.video, trim_dir, start, dur, args.fps)
+        frames = extract_frames_range(
+            args.video, trim_dir, start, dur, args.fps,
+            args.max_output_dimension)
         emit({"type": "progress", "phase": "extract",
               "current": len(frames), "total": len(frames), "detail": "done"})
     elif video_duration <= args.max_seconds:
@@ -2066,7 +2088,9 @@ def main():
         if not args.skip_extract:
             emit({"type": "phase", "name": "extract",
                   "detail": f"extracting {video_duration:.1f}s video"})
-            frames = extract_frames(args.video, extract_dir, fps=args.fps)
+            frames = extract_frames(
+                args.video, extract_dir, fps=args.fps,
+                max_output_dimension=args.max_output_dimension)
             emit({"type": "progress", "phase": "extract",
                   "current": len(frames), "total": len(frames), "detail": "done"})
         else:
@@ -2081,8 +2105,9 @@ def main():
             clip = result.recommended_clip
             trim_dir = os.path.join(extract_dir, "trim")
             os.makedirs(trim_dir, exist_ok=True)
-            frames = extract_frames_range(args.video, trim_dir,
-                                          clip.start_time, clip.duration, args.fps)
+            frames = extract_frames_range(
+                args.video, trim_dir, clip.start_time, clip.duration, args.fps,
+                args.max_output_dimension)
             emit({"type": "progress", "phase": "analyze",
                   "detail": f"selected {clip.start_time:.1f}-{clip.end_time:.1f}s "
                            f"({len(frames)} frames, score={clip.avg_score:.2f})"})
@@ -2090,7 +2115,8 @@ def main():
             emit({"type": "progress", "phase": "analyze",
                   "detail": f"auto-select failed: {e}, keeping first {args.max_seconds}s"})
             frames = extract_frames_range(
-                args.video, extract_dir, 0, args.max_seconds, args.fps)
+                args.video, extract_dir, 0, args.max_seconds, args.fps,
+                args.max_output_dimension)
 
     if not frames:
         emit({"type": "error", "message": "No frames extracted"})
@@ -2185,8 +2211,8 @@ def main():
     pass2_birefnet(frames, all_logits, final_dir, birefnet_progress)
     _verify_output_frame_sequence(final_dir, len(frames))
 
-    # Swift can now restart its eager detector daemon without overlapping the
-    # SAM2/BiRefNet model allocations. This keeps the next import warm.
+    # The Swift app keeps the detector released after the heavy pipeline. The
+    # next import warms it on demand instead of retaining another model in RAM.
     emit({"type": "models_released"})
 
     # Step 6: Quality feedback loop

@@ -20,8 +20,6 @@ final class PetBehaviorDirector {
     private var states: [UUID: RuntimeState] = [:]
     private var observerToken: UUID?
     private var timer: Timer?
-    private var planningCoordinator: BehaviorPlanningCoordinator?
-    private var planningPetId: UUID?
 
     init(
         hub: InteractionHub,
@@ -94,23 +92,8 @@ final class PetBehaviorDirector {
     }
 
     func unregister(petId: UUID) {
-        if planningPetId == petId {
-            planningCoordinator?.cancelCurrent()
-            planningPetId = nil
-        }
         states.removeValue(forKey: petId)
         hub.removePet(petId)
-    }
-
-    func setPlanningCoordinator(_ coordinator: BehaviorPlanningCoordinator?) {
-        planningCoordinator?.cancelCurrent()
-        planningPetId = nil
-        planningCoordinator = coordinator
-    }
-
-    func cancelPlanning() {
-        planningCoordinator?.cancelCurrent()
-        planningPetId = nil
     }
 
     private func handle(_ observation: InteractionObservation, world: PetWorldState) {
@@ -176,18 +159,6 @@ final class PetBehaviorDirector {
                 x: 0.12 + min(1, max(0, randomUnit())) * 0.76,
                 y: 0.10 + min(1, max(0, randomUnit())) * 0.72)
             let reactionRoll = min(1, max(0, randomUnit()))
-            if requestModelPlan(
-                petId: petId,
-                state: state,
-                context: context,
-                target: target,
-                reactionRoll: reactionRoll,
-                now: now) {
-                state.nextAutonomousActionAt = now + autonomousDelay(
-                    for: state.personality, context: context)
-                store(state, for: petId)
-                continue
-            }
             if let intent = PetBehaviorPolicy.autonomousIntent(
                 petId: petId,
                 personality: state.personality,
@@ -202,77 +173,6 @@ final class PetBehaviorDirector {
                 for: state.personality, context: context)
             store(state, for: petId)
         }
-    }
-
-    private func requestModelPlan(
-        petId: UUID,
-        state: RuntimeState,
-        context: PetBehaviorContext,
-        target: SpatialContext,
-        reactionRoll: Double,
-        now: TimeInterval
-    ) -> Bool {
-        guard let planningCoordinator else { return false }
-        let request = BehaviorPlanningRequest(
-            petId: petId,
-            issuedAt: now,
-            expiresAt: now + 8,
-            personality: state.personality,
-            context: context,
-            capabilities: state.capabilities,
-            recentInteractionKinds: state.memory.recentInteractions.map(\.kind))
-        let accepted = planningCoordinator.submit(request) {
-            [weak self] result in
-            self?.finishModelPlan(
-                request: request,
-                result: result,
-                target: target,
-                reactionRoll: reactionRoll)
-        }
-        if accepted { planningPetId = petId }
-        return accepted
-    }
-
-    private func finishModelPlan(
-        request: BehaviorPlanningRequest,
-        result: Result<BehaviorPlanningResult, Error>,
-        target: SpatialContext,
-        reactionRoll: Double
-    ) {
-        guard planningPetId == request.petId else { return }
-        planningPetId = nil
-        guard var state = states[request.petId],
-              !state.world.isPaused,
-              !state.world.isDragging else { return }
-        let currentTime = now()
-        let context = state.memory.context(
-            at: currentTime,
-            personality: state.personality,
-            isPaused: false)
-        let intent: PetIntent?
-        switch result {
-        case .success(let suggestion):
-            intent = PetBehaviorPolicy.modelSuggestedIntent(
-                petId: request.petId,
-                result: suggestion,
-                personality: state.personality,
-                context: context,
-                capabilities: state.capabilities,
-                wanderTarget: target)
-        case .failure:
-            intent = PetBehaviorPolicy.autonomousIntent(
-                petId: request.petId,
-                personality: state.personality,
-                capabilities: state.capabilities,
-                target: target,
-                reactionRoll: reactionRoll,
-                context: context)
-        }
-        if let intent { execute(intent) }
-        state = states[request.petId] ?? state
-        state.nextAutonomousActionAt = currentTime + autonomousDelay(
-            for: state.personality, context: context)
-        store(state, for: request.petId)
     }
 
     private func autonomousDelay(

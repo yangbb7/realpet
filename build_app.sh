@@ -2,11 +2,10 @@
 set -euo pipefail
 
 # --stub-weights: skip the ~1.1 GB weight download and bundle empty
-# placeholder weights/{sam2,hf,torch} dirs instead. For CI structural
+# placeholder weights/{sam2,birefnet-fp16,torch} dirs instead. For CI structural
 # verification of the .app bundle only — never ship a stubbed build.
 STUB_WEIGHTS=0
 REUSE_SWIFT_BUILD=0
-INCLUDE_LEGACY_CUBISM="${REALPET_INCLUDE_LEGACY_CUBISM:-0}"
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --stub-weights) STUB_WEIGHTS=1 ;;
@@ -25,7 +24,6 @@ BUILD_DIR="$SCRIPT_DIR/RealPet/.build/release"
 DIST_DIR="${REALPET_DIST_DIR:-$SCRIPT_DIR/dist}"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 SUPABASE_PUBLISHABLE_KEY="${REALPET_SUPABASE_PUBLISHABLE_KEY:-}"
-AGNES_API_KEY="${REALPET_AGNES_API_KEY:-}"
 
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -104,12 +102,6 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
-    <key>NSCameraUsageDescription</key>
-    <string>RealPet uses the camera only when you enable visual interaction, and processes frames on this Mac.</string>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>RealPet uses the microphone only when you enable voice interaction, and does not save audio.</string>
-    <key>NSSpeechRecognitionUsageDescription</key>
-    <string>RealPet recognizes allow-listed pet commands only when you enable voice interaction.</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.entertainment</string>
     <key>CFBundleIconFile</key>
@@ -135,14 +127,6 @@ else
     echo "Error: REALPET_SUPABASE_PUBLISHABLE_KEY is required to bundle Supabase Storage" >&2
     exit 1
 fi
-if [ -n "$AGNES_API_KEY" ]; then
-    plutil -replace RealPetAgnesAPIKey -string "$AGNES_API_KEY" \
-        "$APP_BUNDLE/Contents/Info.plist"
-else
-    echo "Error: REALPET_AGNES_API_KEY is required to bundle Agnes Video" >&2
-    exit 1
-fi
-
 # --- App icon ---
 cp "$SCRIPT_DIR/assets/icon/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 ok "Bundled app icon"
@@ -161,26 +145,6 @@ cp "$SCRIPT_DIR/requirements.txt" "$RES_DIR/requirements.txt"
 cp "$SCRIPT_DIR/requirements.lock" "$RES_DIR/requirements.lock"
 ok "Bundled Python source and hash-locked requirements"
 
-if [ "$INCLUDE_LEGACY_CUBISM" = "1" ]; then
-    # Legacy-only: existing Cubism pets require a locally licensed Web runtime.
-    CUBISM_WEB_DIR="${REALPET_CUBISM_WEB_RUNTIME:-$SCRIPT_DIR/web/cubism-runtime/dist}"
-    if [ -f "$CUBISM_WEB_DIR/live2dcubismcore.min.js" ] \
-       && [ -f "$CUBISM_WEB_DIR/realpet-cubism.bundle.js" ] \
-       && [ -f "$CUBISM_WEB_DIR/CUBISM_SDK_LICENSE.md" ] \
-       && [ -f "$CUBISM_WEB_DIR/LIVE2D_OPEN_SOFTWARE_LICENSE.md" ] \
-       && [ -d "$CUBISM_WEB_DIR/shaders" ] \
-       && [ -n "$(find "$CUBISM_WEB_DIR/shaders" -type f -print -quit)" ]; then
-        rsync -a --exclude '*.map' --exclude '.DS_Store' \
-            "$CUBISM_WEB_DIR/" "$RES_DIR/cubism-web/"
-        ok "Bundled legacy Cubism Web runtime"
-    else
-        echo "Error: REALPET_INCLUDE_LEGACY_CUBISM=1 requires a complete licensed runtime" >&2
-        exit 1
-    fi
-else
-    echo "Skipping optional legacy Cubism assets"
-fi
-
 # --- Bundle all model weights (NEW v0.2.0) ---
 WEIGHTS_DIR="${REALPET_WEIGHTS_DIR:-$SCRIPT_DIR/weights}"
 if [ "$STUB_WEIGHTS" = "1" ]; then
@@ -196,7 +160,7 @@ if [ "$STUB_WEIGHTS" = "1" ]; then
         touch "$WEIGHTS_DIR/birefnet-fp16/$f"
     done
     ok "Stub weights created (structural check only, app will NOT run)"
-elif [ ! -d "$WEIGHTS_DIR/sam2" ] || [ ! -d "$WEIGHTS_DIR/hf" ] \
+elif [ ! -d "$WEIGHTS_DIR/sam2" ] || [ ! -d "$WEIGHTS_DIR/birefnet-fp16" ] \
    || [ ! -d "$WEIGHTS_DIR/torch" ]; then
     echo "Error: verified model weights are required at $WEIGHTS_DIR; run the locked release-preparation workflow before packaging" >&2
     exit 1
@@ -205,7 +169,7 @@ else
 fi
 
 if [ "$STUB_WEIGHTS" != "1" ]; then
-    echo "--- Verifying MPS-equivalent BiRefNet FP16 weights ---"
+    echo "--- Verifying release model weights ---"
     MODEL_PYTHON=""
     for candidate in "${REALPET_BUILD_PYTHON:-}" \
                      "$SCRIPT_DIR/.venv/bin/python" \
@@ -222,11 +186,9 @@ if [ "$STUB_WEIGHTS" != "1" ]; then
         echo "Error: REALPET_BUILD_PYTHON must point to the hash-locked release environment" >&2
         exit 1
     fi
-    "$MODEL_PYTHON" "$SCRIPT_DIR/scripts/prepare_birefnet_fp16.py" \
-        --weights-dir "$WEIGHTS_DIR"
     "$MODEL_PYTHON" "$SCRIPT_DIR/scripts/verify_release_assets.py" \
         --weights-dir "$WEIGHTS_DIR"
-    ok "BiRefNet FP16 weights are current"
+    ok "Release model weights verified"
 fi
 
 rsync -a --exclude '.DS_Store' --exclude '__pycache__' --exclude '*.pyc' \
@@ -238,9 +200,12 @@ ok "Bundled release weights ($(du -sh "$APP_BUNDLE/Contents/Resources/weights" |
 FFMPEG_DIR="$APP_BUNDLE/Contents/Resources/bin"
 mkdir -p "$FFMPEG_DIR"
 FFMPEG_SOURCE="${REALPET_FFMPEG_PATH:-$SCRIPT_DIR/assets/bin/ffmpeg}"
+FFPROBE_SOURCE="${REALPET_FFPROBE_PATH:-$(dirname "$FFMPEG_SOURCE")/ffprobe}"
 FFMPEG_SHA256="${REALPET_FFMPEG_SHA256:-}"
-if [ ! -x "$FFMPEG_SOURCE" ] || [ -z "$FFMPEG_SHA256" ]; then
-    echo "Error: set REALPET_FFMPEG_PATH and REALPET_FFMPEG_SHA256 for the verified release binary" >&2
+FFPROBE_SHA256="${REALPET_FFPROBE_SHA256:-}"
+if [ ! -x "$FFMPEG_SOURCE" ] || [ ! -x "$FFPROBE_SOURCE" ] \
+   || [ -z "$FFMPEG_SHA256" ] || [ -z "$FFPROBE_SHA256" ]; then
+    echo "Error: set REALPET_FFMPEG_PATH, REALPET_FFPROBE_PATH, and their SHA-256 values for verified release tools" >&2
     exit 1
 fi
 ACTUAL_FFMPEG_SHA256="$(shasum -a 256 "$FFMPEG_SOURCE" | awk '{print $1}')"
@@ -248,10 +213,18 @@ if [ "$ACTUAL_FFMPEG_SHA256" != "$FFMPEG_SHA256" ]; then
     echo "Error: ffmpeg SHA-256 does not match REALPET_FFMPEG_SHA256" >&2
     exit 1
 fi
+ACTUAL_FFPROBE_SHA256="$(shasum -a 256 "$FFPROBE_SOURCE" | awk '{print $1}')"
+if [ "$ACTUAL_FFPROBE_SHA256" != "$FFPROBE_SHA256" ]; then
+    echo "Error: ffprobe SHA-256 does not match REALPET_FFPROBE_SHA256" >&2
+    exit 1
+fi
 cp "$FFMPEG_SOURCE" "$FFMPEG_DIR/ffmpeg"
 chmod +x "$FFMPEG_DIR/ffmpeg"
+cp "$FFPROBE_SOURCE" "$FFMPEG_DIR/ffprobe"
+chmod +x "$FFMPEG_DIR/ffprobe"
 "$FFMPEG_DIR/ffmpeg" -version | head -1
-ok "Bundled static ffmpeg"
+"$FFMPEG_DIR/ffprobe" -version | head -1
+ok "Bundled static ffmpeg and ffprobe"
 
 ok "App bundle assembled"
 
@@ -267,7 +240,7 @@ echo "Output: $APP_BUNDLE"
 echo ""
 echo "To run: open $APP_BUNDLE"
 echo ""
-echo "First launch sets up Python (~2 min, one-time)."
+echo "First media-processing operation sets up Python (~2 min, one-time)."
 echo "All model weights and ffmpeg are bundled. No downloads."
 echo ""
 echo "Ad-hoc-signed .app: right-click → Open the first time (Gatekeeper)."

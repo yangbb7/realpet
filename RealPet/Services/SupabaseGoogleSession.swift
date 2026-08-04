@@ -10,7 +10,7 @@ enum SupabaseGoogleSessionError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .signInRequired:
-            return "请先使用 Google 登录，再生成 Agnes 动作视频"
+            return "请先使用 Google 登录，再生成动作视频"
         case .invalidCallback:
             return "Google 登录回调无效，请重新登录"
         case .missingOAuthToken:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resident worker: load detector once, serve QC/detect over stdin/stdout NDJSON.
+"""On-demand worker: load detector once, serve QC/detect over stdin/stdout NDJSON.
 
 Phase 1: Only handles qc / detect / ping.  Process (SAM2+BiRefNet) still
 runs as a separate subprocess — too risky to share MPS state.

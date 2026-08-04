@@ -11,7 +11,7 @@ private final class MotionMockURLProtocol: URLProtocol {
     override func startLoading() {
         do {
             guard let handler = Self.handler else {
-                throw AgnesVideoGenerationError.invalidResponse
+                throw SupabaseMiniMaxVideoGatewayError.invalidResponse
             }
             let (response, data) = try handler(request)
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -38,51 +38,15 @@ struct MotionGenerationContractCheck {
     }
 
     private static func testConfigurationAndGeneratedActionCapability() throws {
-        let configuration = try OpenAIImageAPIConfiguration(
-            baseURLString: "https://relay.example.com/openai/v1/videos")
-        precondition(configuration.normalizedBaseURLString
-                     == "https://relay.example.com/openai/v1")
-        precondition(configuration.responsesURL.absoluteString
-                     == "https://relay.example.com/openai/v1/responses")
-        precondition(configuration.videosURL.absoluteString
-                     == "https://relay.example.com/openai/v1/videos")
-
         let motionConfiguration = MotionServiceConfiguration.defaultValue
-        precondition(motionConfiguration.provider == .agnes)
-        precondition(motionConfiguration.resolvedAgnesBaseURLString
-                     == "https://api.agnes-ai.cn/v1")
-        precondition(motionConfiguration.videoModel == "agnes-video-v2.0")
+        precondition(motionConfiguration.provider == .miniMaxH3)
+        precondition(motionConfiguration.videoModel == "MiniMax-H3")
         precondition(motionConfiguration.seconds == 4)
-        let ignoredAgnesEndpoint = MotionServiceConfiguration(
-            provider: .agnes,
-            agnesBaseURLString: "https://not-agnes.example.com/v1",
-            videoModel: "agnes-video-v2.0",
-            seconds: 4,
-            size: "1152x768").migratedToSupportedProviders()
-        precondition(ignoredAgnesEndpoint.resolvedAgnesBaseURLString
-                     == "https://api.agnes-ai.cn/v1")
-        let validatedMotionConfiguration = try motionConfiguration.validated()
-        let agnesConfiguration = try validatedMotionConfiguration
-            .validatedAgnesAPIConfiguration()
-        precondition(validatedMotionConfiguration.size == "1152x768")
-        precondition(agnesConfiguration.isAgnesAPI)
-        let requestSettings = AgnesVideoGenerationRequestSettings(
-            size: validatedMotionConfiguration.size,
-            seconds: validatedMotionConfiguration.seconds)
-        precondition(requestSettings?.numFrames == 97)
-        precondition(requestSettings?.frameRate == 24)
-
-        let savedMiniMaxConfiguration = MotionServiceConfiguration(
-            provider: .miniMaxH3,
-            agnesBaseURLString: "https://api.agnes-ai.cn/v1",
-            miniMaxBaseURLString: "https://api.minimaxi.com",
-            videoModel: "MiniMax-H3",
-            seconds: 4,
-            size: "1152x768")
-        let migratedMiniMax = savedMiniMaxConfiguration.migratedToSupportedProviders()
-        precondition(migratedMiniMax.provider == .miniMaxH3)
-        precondition(migratedMiniMax.videoModel == "MiniMax-H3")
-        _ = try migratedMiniMax.validated()
+        _ = try motionConfiguration.validated()
+        let migrated = MotionServiceConfiguration(seconds: 99)
+            .migratedToSupportedProviders()
+        precondition(migrated.provider == .miniMaxH3)
+        precondition(migrated.seconds == 15)
 
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent(
@@ -141,6 +105,79 @@ struct MotionGenerationContractCheck {
         precondition(generatedOrbit?.effectiveOrigin == .generated)
         precondition(generatedOrbit?.loop == false)
         precondition(orbitManifest.capabilities.orientation)
+
+        let deduplicationRoot = root.appendingPathComponent("deduplication")
+        let deduplicationSource = deduplicationRoot.appendingPathComponent("source")
+        try fm.createDirectory(at: deduplicationSource, withIntermediateDirectories: true)
+        let copiedFrame = Data("identical-generated-frame".utf8)
+        try copiedFrame.write(to: deduplicationRoot.appendingPathComponent("frame_0000.png"))
+        try copiedFrame.write(to: deduplicationSource.appendingPathComponent("frame_0000.png"))
+        let dedupManifest = try PetActionLibrary.install(
+            kind: .gazeOrbit,
+            processedFramesDirectory: deduplicationSource,
+            rootFramesDirectory: deduplicationRoot,
+            fps: 10,
+            origin: .generated)
+        let idleDirectory = deduplicationRoot.appendingPathComponent("actions/idle")
+        try fm.createDirectory(at: idleDirectory, withIntermediateDirectories: true)
+        try copiedFrame.write(to: idleDirectory.appendingPathComponent("frame_0000.png"))
+        try PetActionManifest(
+            version: dedupManifest.version,
+            defaultAction: dedupManifest.defaultAction,
+            actions: dedupManifest.actions.map { action in
+                guard action.kind == .idle else { return action }
+                return .init(
+                    id: action.id,
+                    kind: action.kind,
+                    displayNameOverride: action.displayNameOverride,
+                    framesDirectory: "actions/idle",
+                    fps: action.fps,
+                    loop: action.loop,
+                    translatesWindow: action.translatesWindow,
+                    origin: .generated)
+            }).save(framesDirectory: deduplicationRoot.path)
+        precondition(PetActionLibrary.identityReferenceDirectory(
+            rootFramesDirectory: deduplicationRoot).lastPathComponent == "gaze_orbit")
+        let deduplicated = try PetActionLibrary.deduplicateGeneratedOrbitFrames(
+            rootFramesDirectory: deduplicationRoot)
+        precondition(deduplicated)
+        precondition(!fm.fileExists(atPath: deduplicationRoot
+            .appendingPathComponent("frame_0000.png").path))
+
+        let mismatchRoot = root.appendingPathComponent("deduplication-mismatch")
+        let mismatchSource = mismatchRoot.appendingPathComponent("source")
+        try fm.createDirectory(at: mismatchSource, withIntermediateDirectories: true)
+        try Data("original".utf8).write(to: mismatchRoot.appendingPathComponent("frame_0000.png"))
+        try Data("different".utf8).write(to: mismatchSource.appendingPathComponent("frame_0000.png"))
+        let mismatchManifest = try PetActionLibrary.install(
+            kind: .gazeOrbit,
+            processedFramesDirectory: mismatchSource,
+            rootFramesDirectory: mismatchRoot,
+            fps: 10,
+            origin: .generated)
+        try fm.createDirectory(
+            at: mismatchRoot.appendingPathComponent("actions/idle"),
+            withIntermediateDirectories: true)
+        try PetActionManifest(
+            version: mismatchManifest.version,
+            defaultAction: mismatchManifest.defaultAction,
+            actions: mismatchManifest.actions.map { action in
+                guard action.kind == .idle else { return action }
+                return .init(
+                    id: action.id,
+                    kind: action.kind,
+                    displayNameOverride: action.displayNameOverride,
+                    framesDirectory: "actions/idle",
+                    fps: action.fps,
+                    loop: action.loop,
+                    translatesWindow: action.translatesWindow,
+                    origin: .generated)
+            }).save(framesDirectory: mismatchRoot.path)
+        let mismatchDeduplicated = try PetActionLibrary.deduplicateGeneratedOrbitFrames(
+            rootFramesDirectory: mismatchRoot)
+        precondition(!mismatchDeduplicated)
+        precondition(fm.fileExists(atPath: mismatchRoot
+            .appendingPathComponent("frame_0000.png").path))
 
         let pawSource = root.appendingPathComponent("source-paw")
         try fm.createDirectory(at: pawSource, withIntermediateDirectories: true)
@@ -227,25 +264,22 @@ struct MotionGenerationContractCheck {
         precondition(!FixedPetAction.headFollow.requiresExistingBaseFrames)
         precondition(FixedPetAction.tapActions.count == 11)
         precondition(FixedPetAction.tapActions.allSatisfy { $0.requiresExistingBaseFrames })
+        precondition(FixedPetAction.missingActions(installedKinds: []).first == .headFollow)
+        precondition(FixedPetAction.missingActions(installedKinds: [.gazeOrbit]).first
+                     == .lieDown)
+        precondition(FixedPetAction.missingActions(
+            installedKinds: Set(PetActionManifest.Action.Kind.fixedActionKinds)).isEmpty)
         precondition(FixedPetAction.allCases.allSatisfy { $0.minimumVideoSeconds == 4 })
-        precondition(FixedPetAction.headFollow.prompt(
-            referenceImageCount: 1, provider: .miniMaxH3)
+        precondition(FixedPetAction.headFollow.prompt(referenceImageCount: 1)
                      .contains("这 1 张宠物素材图"))
-        precondition(FixedPetAction.headFollow.prompt(
-            referenceImageCount: 2, provider: .miniMaxH3)
+        precondition(FixedPetAction.headFollow.prompt(referenceImageCount: 2)
                      .contains("这 2 张宠物素材图"))
-        precondition(FixedPetAction.headFollow.prompt(
-            referenceImageCount: 3, provider: .miniMaxH3)
+        precondition(FixedPetAction.headFollow.prompt(referenceImageCount: 3)
                      .contains("这 3 张宠物素材图"))
-        precondition(FixedPetAction.headFollow.prompt(
-            referenceImageCount: 4, provider: .miniMaxH3)
+        precondition(FixedPetAction.headFollow.prompt(referenceImageCount: 4)
                      .contains("全部 4 张宠物素材图"))
-        precondition(FixedPetAction.headFollow.prompt(
-            referenceImageCount: 8, provider: .miniMaxH3)
+        precondition(FixedPetAction.headFollow.prompt(referenceImageCount: 8)
                      .contains("全部 4 张宠物素材图"))
-        precondition(FixedPetAction.headFollow.prompt(
-            referenceImageCount: 4, provider: .agnes)
-                     .contains("第一张上传的宠物照片"))
         precondition(PetActionManifest.Action.Kind.fixedActionKinds
             == [.gazeOrbit] + PetActionManifest.Action.Kind.fixedTapActions)
     }
@@ -267,6 +301,8 @@ struct MotionGenerationContractCheck {
             "--output-dir", "/pet",
             "--preview-seconds", "5",
             "--max-seconds", "15",
+            "--fps", "16",
+            "--max-output-dimension", "960",
             "--click", "100,200",
             "--skip-qa",
             "--bbox", "1.0,2.0,3.0,4.0",
@@ -281,7 +317,17 @@ struct MotionGenerationContractCheck {
             clickX: 100,
             clickY: 200)
         precondition(!capturedArguments.contains("--skip-qa"))
-        precondition(!capturedArguments.contains("--fps"))
+        precondition(capturedArguments.contains("--fps"))
+        precondition(capturedArguments.contains("--max-output-dimension"))
+        let spaceSavingArguments = TrackMatteCommand.arguments(
+            scriptPath: "/app/scripts/track_then_matte.py",
+            videoPath: "/pet/captured.mp4",
+            outputDir: "/pet",
+            clickX: 100,
+            clickY: 200,
+            assetProfile: .spaceSaver)
+        precondition(spaceSavingArguments.contains("640"))
+        precondition(spaceSavingArguments.contains("12"))
     }
 
     private static func testSupabaseOriginalReferenceAndVideoRequests() throws {
@@ -291,59 +337,6 @@ struct MotionGenerationContractCheck {
             preconditionFailure("a Supabase secret key must be rejected")
         } catch SupabaseReferenceStorageError.forbiddenServiceRoleKey {}
 
-        let reference = FileManager.default.temporaryDirectory
-            .appendingPathComponent("realpet-original-reference.png")
-        defer { try? FileManager.default.removeItem(at: reference) }
-        try Data([0x89, 0x50, 0x4e, 0x47]).write(to: reference)
-        let configuration = try OpenAIImageAPIConfiguration(
-            baseURLString: "https://api.agnes-ai.cn/v1")
-        precondition(configuration.isAgnesAPI)
-        precondition(configuration.chatCompletionsURL.absoluteString
-                     == "https://api.agnes-ai.cn/v1/chat/completions")
-
-        let settings = AgnesVideoGenerationRequestSettings(
-            size: "1152x768", seconds: 4)!
-        let videoRequest = try AgnesVideoGenerationClient.makeCreateRequest(
-            prompt: "纯白色背景，固定镜头，小狗在原地转一圈。",
-            firstFrameURL: URL(string:
-                "https://project.supabase.co/storage/v1/object/sign/pet-reference-images/pet.png?token=temporary")!,
-            apiKey: "agnes-key",
-            configuration: configuration,
-            settings: settings)
-        let videoBody = try JSONSerialization.jsonObject(
-            with: videoRequest.httpBody ?? Data()) as? [String: Any]
-        precondition(videoRequest.value(forHTTPHeaderField: "Authorization")
-                     == "Bearer agnes-key")
-        precondition(videoRequest.url?.absoluteString
-                     == "https://api.agnes-ai.cn/v1/videos")
-        precondition(videoBody?["model"] as? String == "agnes-video-v2.0")
-        precondition((videoBody?["image"] as? String)?.hasPrefix(
-            "https://project.supabase.co/storage/v1/object/sign/pet-reference-images/") == true)
-        precondition(videoBody?["width"] as? Int == 1152)
-        precondition(videoBody?["height"] as? Int == 768)
-        precondition(videoBody?["num_frames"] as? Int == 97)
-        precondition(videoBody?["frame_rate"] as? Int == 24)
-
-        let miniMaxConfiguration = try MiniMaxVideoAPIConfiguration(
-            baseURLString: "https://api.minimaxi.com")
-        let originalImage = try PetReferenceImageData.load(from: reference)
-        let miniMaxRequest = try MiniMaxH3VideoGenerationClient.makeReferenceCreateRequest(
-            prompt: FixedPetAction.headFollow.prompt(
-                referenceImageCount: 4, provider: .miniMaxH3),
-            referenceImages: Array(repeating: originalImage, count: 4),
-            apiKey: "minimax-key",
-            configuration: miniMaxConfiguration,
-            seconds: 4)
-        let miniMaxBody = try JSONSerialization.jsonObject(
-            with: miniMaxRequest.httpBody ?? Data()) as? [String: Any]
-        let content = miniMaxBody?["content"] as? [[String: Any]]
-        let imageEntries = content?.dropFirst() ?? []
-        precondition(imageEntries.count == 4)
-        precondition(imageEntries.allSatisfy {
-            ($0["role"] as? String) == "reference_image"
-                && (($0["image_url"] as? [String: String])?["url"]?.hasPrefix(
-                    "data:image/png;base64,") == true)
-        })
     }
 
     private static func testProviderPipelinesCreatePollAndDownload() async throws {
@@ -351,19 +344,10 @@ struct MotionGenerationContractCheck {
             .appendingPathComponent("realpet-original-pipeline-reference.png")
         defer { try? FileManager.default.removeItem(at: temporary) }
         try Data([0x89, 0x50, 0x4e, 0x47]).write(to: temporary)
-        let agnesAPIConfiguration = try OpenAIImageAPIConfiguration(
-            baseURLString: "https://api.agnes-ai.cn/v1")
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.protocolClasses = [MotionMockURLProtocol.self]
+        var miniMaxGatewayRequestCount = 0
         MotionMockURLProtocol.handler = { request in
-            if request.url?.host == "api.agnes-ai.cn" {
-                precondition(request.value(forHTTPHeaderField: "Authorization")
-                             == "Bearer agnes-key")
-            }
-            if request.url?.host == "api.minimaxi.com" {
-                precondition(request.value(forHTTPHeaderField: "Authorization")
-                             == "Bearer minimax-key")
-            }
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 200,
                 httpVersion: nil, headerFields: nil)!
@@ -386,46 +370,33 @@ struct MotionGenerationContractCheck {
                 precondition(request.value(forHTTPHeaderField: "Authorization")
                              == "Bearer anonymous-session")
                 return (response, Data("{}".utf8))
-            case ("POST", "project.supabase.co", let path)
-                where path?.hasPrefix("/storage/v1/object/sign/pet-reference-images/") == true:
-                return (response, try JSONSerialization.data(withJSONObject: [
-                    "signedURL": "/object/sign/pet-reference-images/pet/action.png?token=temporary",
-                ]))
-            case ("POST", "api.agnes-ai.cn", "/v1/videos"):
-                return (response, try JSONSerialization.data(withJSONObject: [
-                    "code": 0,
-                    "data": [
-                        "taskId": "task_1",
-                        "videoId": "video_1",
-                        "state": "submitted",
-                    ],
-                ]))
-            case ("GET", "api.agnes-ai.cn", "/agnesapi"):
-                precondition(URLComponents(
-                    url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?
-                    .contains(URLQueryItem(name: "video_id", value: "video_1")) == true)
-                return (response, try JSONSerialization.data(withJSONObject: [
-                    "data": [
-                        "videoId": "video_1",
-                        "state": "succeeded",
-                        "percentage": "100",
-                        "output": ["videoUrl": "https://cdn.example.com/generated.mp4"],
-                    ],
-                ]))
-            case ("GET", "cdn.example.com", "/generated.mp4"):
-                return (response, Data([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]))
-            case ("POST", "api.minimaxi.com", "/v2/video_generation"):
-                return (response, try JSONSerialization.data(withJSONObject: [
-                    "task_id": "minimax_task_1",
-                ]))
-            case ("GET", "api.minimaxi.com", "/v2/query/video_generation/minimax_task_1"):
-                return (response, try JSONSerialization.data(withJSONObject: [
-                    "task": [
-                        "id": "minimax_task_1",
+            case ("POST", "project.supabase.co", "/functions/v1/minimax-video"):
+                precondition(request.value(forHTTPHeaderField: "apikey") == "publishable-key")
+                precondition(request.value(forHTTPHeaderField: "Authorization")
+                             == "Bearer anonymous-session")
+                miniMaxGatewayRequestCount += 1
+                switch miniMaxGatewayRequestCount {
+                case 1:
+                    return (response, try JSONSerialization.data(withJSONObject: [
+                        "jobId": "11111111-1111-4111-8111-111111111111",
+                        "status": "queued",
+                        "durationSeconds": 4,
+                        "providerCostCents": NSNull(),
+                        "resultUrl": NSNull(),
+                        "error": NSNull(),
+                    ]))
+                case 2:
+                    return (response, try JSONSerialization.data(withJSONObject: [
+                        "jobId": "11111111-1111-4111-8111-111111111111",
                         "status": "succeeded",
-                        "content": ["url": "https://cdn.example.com/minimax.mp4"],
-                    ],
-                ]))
+                        "durationSeconds": 4,
+                        "providerCostCents": 24,
+                        "resultUrl": "https://cdn.example.com/minimax.mp4",
+                        "error": NSNull(),
+                    ]))
+                default:
+                    preconditionFailure("Unexpected MiniMax gateway request count")
+                }
             case ("GET", "cdn.example.com", "/minimax.mp4"):
                 return (response, Data([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]))
             default:
@@ -453,50 +424,26 @@ struct MotionGenerationContractCheck {
             uploadedReference, configuration: storageConfiguration,
             credentials: storageCredentials)
         precondition(downloadedReference.mimeType == "image/png")
-        let signedReferenceURL = try await storage.signedURL(
-            for: uploadedReference, configuration: storageConfiguration,
-            credentials: storageCredentials)
-        precondition(signedReferenceURL.absoluteString.hasPrefix(
-            "https://project.supabase.co/storage/v1/object/sign/"))
-
-        // Agnes receives a signed URL from a pre-existing gallery item. The
-        // action request itself never has access to a local image file.
-        let client = AgnesVideoGenerationClient(session: session)
-        let queued = try await client.create(
-            prompt: FixedPetAction.cry.prompt,
-            firstFrameURL: signedReferenceURL,
-            apiKey: "agnes-key",
-            configuration: agnesAPIConfiguration,
-            settings: AgnesVideoGenerationRequestSettings(size: "1152x768", seconds: 4)!)
-        precondition(queued.status == .queued)
-        let completed = try await client.retrieve(
-            id: queued.id, apiKey: "agnes-key", configuration: agnesAPIConfiguration)
-        precondition(completed.status == .completed)
-        let video = try await client.downloadContent(job: completed)
-        precondition(video.count == 8)
-        try await storage.delete(
-            uploadedReference, configuration: storageConfiguration,
-            credentials: storageCredentials)
-
-        let miniMaxConfiguration = try MiniMaxVideoAPIConfiguration(
-            baseURLString: "https://api.minimaxi.com")
-        let originalReference = try PetReferenceImageData.load(from: temporary)
-        let miniMax = MiniMaxH3VideoGenerationClient(session: session)
+        let miniMax = SupabaseMiniMaxVideoGatewayClient(session: session)
         let miniMaxQueued = try await miniMax.create(
-            prompt: FixedPetAction.headFollow.prompt(
-                referenceImageCount: 2, provider: .miniMaxH3),
-            referenceImages: [originalReference, originalReference],
-            apiKey: "minimax-key",
-            configuration: miniMaxConfiguration,
-            seconds: 4)
+            petID: UUID(),
+            action: .headFollow,
+            seconds: 4,
+            configuration: storageConfiguration,
+            credentials: storageCredentials)
         precondition(miniMaxQueued.status == .queued)
         let miniMaxCompleted = try await miniMax.retrieve(
             id: miniMaxQueued.id,
-            apiKey: "minimax-key",
-            configuration: miniMaxConfiguration)
+            configuration: storageConfiguration,
+            credentials: storageCredentials)
         precondition(miniMaxCompleted.status == .completed)
+        precondition(miniMaxCompleted.providerCostCents == 24)
         let miniMaxVideo = try await miniMax.downloadContent(job: miniMaxCompleted)
         precondition(miniMaxVideo.count == 8)
+        precondition(miniMaxGatewayRequestCount == 2)
+        try await storage.delete(
+            uploadedReference, configuration: storageConfiguration,
+            credentials: storageCredentials)
     }
 
     private static func testSupabaseGoogleSessionAuthorization() async throws {

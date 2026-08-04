@@ -9,14 +9,14 @@ End users only need `README.md`.
 
 - **All model weights bundled** in the .app: SAM2 (~156 MB) + BiRefNet-matting (~900 MB) + Faster R-CNN (~175 MB).
 - **Static ffmpeg bundled** — no `brew install ffmpeg` required.
-- **First-launch SetupWizard** auto-creates the Python venv. Users need Python 3.10–3.12 installed (one `brew install python@3.12`, no sudo on Apple Silicon).
+- **First-media SetupWizard** auto-creates the Python venv. Users need Python 3.10–3.12 installed (one `brew install python@3.12`, no sudo on Apple Silicon).
 - DMG compression switched to ULFO (LZFSE) on Apple Silicon; Intel fallback remains UDZO.
 
 ### End-user install
 
 1. Download `RealPet.dmg`.
 2. Double-click and drag `RealPet.app` to `/Applications`.
-3. Launch. First run sets up Python (~2 minutes, one-time).
+3. Launch and sign in. The console opens immediately; the first import or generated action sets up Python (~2 minutes, one-time).
 
 ### Maintainer build
 
@@ -25,9 +25,10 @@ End users only need `README.md`.
 # Set the product credentials and the SHA-256 of the independently reviewed
 # ffmpeg binary before running this command.
 REALPET_SUPABASE_PUBLISHABLE_KEY=<publishable-key> \
-REALPET_AGNES_API_KEY=<agnes-key> \
 REALPET_FFMPEG_PATH=/path/to/verified/ffmpeg \
 REALPET_FFMPEG_SHA256=<sha256> \
+REALPET_FFPROBE_PATH=/path/to/verified/ffprobe \
+REALPET_FFPROBE_SHA256=<sha256> \
 REALPET_BUILD_PYTHON=.venv/bin/python ./build_app.sh
 ./build_dmg.sh   # produces dist/RealPet.dmg
 ```
@@ -69,9 +70,10 @@ people who don't mind right-click → Open the first time.
 ./install.sh              # one-time setup
 cd RealPet && swift build -c release && cd ..   # build binary
 REALPET_SUPABASE_PUBLISHABLE_KEY=<publishable-key> \
-REALPET_AGNES_API_KEY=<agnes-key> \
 REALPET_FFMPEG_PATH=/path/to/verified/ffmpeg \
 REALPET_FFMPEG_SHA256=<sha256> \
+REALPET_FFPROBE_PATH=/path/to/verified/ffprobe \
+REALPET_FFPROBE_SHA256=<sha256> \
 REALPET_BUILD_PYTHON=.venv/bin/python ./build_app.sh
 ./build_dmg.sh            # produces dist/RealPet.dmg (drag-to-install)
 ```
@@ -84,7 +86,7 @@ End-user experience (ad-hoc):
 4. Launch from `/Applications` (or Spotlight).
 5. **First-launch Gatekeeper prompt**: right-click the .app → Open → Open
    (only needed once; macOS records the exception).
-6. **First-launch SetupWizard**: if Python 3.10–3.12 is not found, copy the
+6. **First-media SetupWizard**: when an owner first imports media or installs a generated action and Python 3.10–3.12 is not found, copy the
    `brew install python@3.12` command into Terminal (no sudo on Apple Silicon),
    then click **重新检测 / Retry**. The wizard creates a venv and installs
    dependencies (~2 minutes, one-time).
@@ -188,17 +190,18 @@ xcrun stapler staple dist/RealPet.dmg
    ```
 3. Mark it "Set as the latest release".
 
-## 3. Network considerations on first launch
+## 3. Network considerations for first media processing
 
 **RESOLVED in v0.2.0.** All model weights are now bundled in the `.app`:
 
 - **SAM2** (~156 MB) — bundled at `Resources/weights/sam2/`
-- **BiRefNet-matting** (~900 MB) — bundled at `Resources/weights/hf/`
+- **BiRefNet FP16** (~450 MB) — bundled at `Resources/weights/birefnet-fp16/`
 - **Faster R-CNN** (~175 MB) — bundled at `Resources/weights/torch/`
 
-No internet connection is required for first launch. The only first-launch
-setup is creating the Python venv and installing pip dependencies, which uses
-PyPI. If PyPI is slow or blocked in your region, set a mirror before launching:
+No internet connection is required just to open the app or sign in. The first
+media-processing setup creates the Python venv and installs pip dependencies,
+which uses PyPI. If PyPI is slow or blocked in your region, set a mirror before
+starting the first import:
 
 ```bash
 export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
@@ -207,8 +210,9 @@ open /Applications/RealPet.app
 
 (The default PyPI endpoint is `https://pypi.org/simple`.)
 
-`HF_ENDPOINT` is still honored for any code path that does hit HuggingFace,
-but it is no longer required for normal use.
+The Hugging Face source cache belongs outside the repository and bundle, at
+`~/Library/Application Support/RealPet/huggingface` by default. Set
+`REALPET_HF_CACHE_DIR` to place that development cache on another disk.
 
 ## 4. Reproducibility — what was actually tested
 

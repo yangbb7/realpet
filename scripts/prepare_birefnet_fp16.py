@@ -32,9 +32,15 @@ MANIFEST_NAME = "realpet-fp16-manifest.json"
 MANIFEST_FORMAT = 2
 
 
-def find_snapshot(weights_dir):
-    """Locate the active BiRefNet snapshot in RealPet's Hugging Face cache."""
-    repo_dir = Path(weights_dir) / "hf" / REPO_CACHE_NAME
+def default_source_cache():
+    return Path(os.environ.get(
+        "REALPET_HF_CACHE_DIR",
+        Path.home() / "Library" / "Application Support" / "RealPet" / "huggingface"))
+
+
+def find_snapshot(source_cache):
+    """Locate the active BiRefNet snapshot in the external HF cache."""
+    repo_dir = Path(source_cache) / REPO_CACHE_NAME
     snapshots_dir = repo_dir / "snapshots"
     ref_path = repo_dir / "refs" / "main"
     candidates = []
@@ -132,13 +138,15 @@ def main():
     parser = argparse.ArgumentParser(
         description="Prepare RealPet's MPS-equivalent FP16 BiRefNet checkpoint")
     parser.add_argument("--weights-dir", required=True,
-                        help="Weight root containing hf/<BiRefNet cache>")
+                        help="Release weight root receiving birefnet-fp16")
+    parser.add_argument("--source-cache", default=str(default_source_cache()),
+                        help="External Hugging Face cache containing BiRefNet")
     parser.add_argument("--output", default=None,
                         help="Output model directory (default: <weights>/birefnet-fp16)")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    source = find_snapshot(args.weights_dir)
+    source = find_snapshot(args.source_cache)
     output = (Path(args.output) if args.output else
               Path(args.weights_dir) / OUTPUT_DIRNAME)
     convert_snapshot(source, output, force=args.force)

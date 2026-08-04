@@ -8,6 +8,7 @@ from scripts.prepare_birefnet_fp16 import (
     MANIFEST_NAME,
     RUNTIME_FILES,
     convert_snapshot,
+    find_snapshot,
 )
 from scripts import verify_release_assets
 
@@ -40,6 +41,15 @@ def test_fp16_checkpoint_matches_runtime_conversion(tmp_path):
     assert json.loads((output / MANIFEST_NAME).read_text())["tensor_count"] == 2
     for filename in RUNTIME_FILES:
         assert (output / filename).is_file()
+
+
+def test_external_hf_cache_is_not_part_of_release_weights(tmp_path):
+    cache = tmp_path / "huggingface"
+    snapshot = cache / "models--ZhengPeng7--BiRefNet-matting" / "snapshots" / "pinned"
+    snapshot.parent.mkdir(parents=True)
+    _write_snapshot(snapshot)
+
+    assert find_snapshot(cache) == snapshot
 
 
 def test_birefnet_checkpoint_prefers_complete_local_model(tmp_path, monkeypatch):

@@ -17,10 +17,6 @@ struct PetWorldState: Equatable, Sendable {
             isDragging = true
         case InteractionKind.dragEnded:
             isDragging = false
-        case InteractionKind.userRequestsPause:
-            isPaused = true
-        case InteractionKind.userRequestsResume:
-            isPaused = false
         default:
             break
         }

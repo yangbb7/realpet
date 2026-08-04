@@ -11,6 +11,9 @@ from pathlib import Path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_OUT = os.environ.get(
     "REALPET_WEIGHTS_DIR", os.path.join(PROJECT_ROOT, "weights"))
+DEFAULT_HF_CACHE = os.environ.get(
+    "REALPET_HF_CACHE_DIR",
+    os.path.expanduser("~/Library/Application Support/RealPet/huggingface"))
 
 BIREFNET_REPO = "ZhengPeng7/BiRefNet-matting"
 BIREFNET_REVISION = "57f9f68b43ba337c75762b14cf3075d659007268"
@@ -28,20 +31,20 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def _birefnet_source_path(out_dir: str | Path) -> Path:
-    return (Path(out_dir) / "hf" / "models--ZhengPeng7--BiRefNet-matting"
+def _birefnet_source_path(cache_dir: str | Path) -> Path:
+    return (Path(cache_dir) / "models--ZhengPeng7--BiRefNet-matting"
             / "snapshots" / BIREFNET_REVISION / "model.safetensors")
 
 
-def download_birefnet(out_dir: str, force: bool = False) -> None:
+def download_birefnet(cache_dir: str, force: bool = False) -> None:
     from huggingface_hub import snapshot_download
 
-    source = _birefnet_source_path(out_dir)
+    source = _birefnet_source_path(cache_dir)
     if not force and source.is_file() and sha256_file(source) == BIREFNET_SOURCE_SHA256:
         print("BiRefNet source checkpoint verified")
         return
 
-    dest = os.path.join(out_dir, "hf")
+    dest = cache_dir
     print(f"Downloading BiRefNet-matting revision {BIREFNET_REVISION} to {dest} ...")
     snapshot_download(
         repo_id=BIREFNET_REPO,
@@ -55,11 +58,12 @@ def download_birefnet(out_dir: str, force: bool = False) -> None:
         raise RuntimeError("BiRefNet source checkpoint does not match the pinned SHA-256")
 
 
-def prepare_birefnet_fp16(out_dir: str, force: bool = False) -> None:
+def prepare_birefnet_fp16(
+        out_dir: str, source_cache: str, force: bool = False) -> None:
     """Materialize the exact half-precision checkpoint used on MPS."""
     from prepare_birefnet_fp16 import convert_snapshot, find_snapshot
 
-    source = find_snapshot(out_dir)
+    source = find_snapshot(source_cache)
     output = os.path.join(out_dir, "birefnet-fp16")
     convert_snapshot(source, output, force=force)
 
@@ -109,6 +113,8 @@ def main() -> int:
         description="Bundle pinned model weights for the RealPet release app.")
     parser.add_argument("--out", default=DEFAULT_OUT,
                         help="Output directory (default: weights/ or REALPET_WEIGHTS_DIR).")
+    parser.add_argument("--hf-cache", default=DEFAULT_HF_CACHE,
+                        help="External Hugging Face cache; never bundled into the app.")
     parser.add_argument("--force", action="store_true",
                         help="Re-fetch the pinned source artifacts.")
     parser.add_argument("--verify-only", action="store_true",
@@ -127,8 +133,8 @@ def main() -> int:
     if not download_sam2(force=args.force):
         return 1
     print("Preparing BiRefNet...")
-    download_birefnet(args.out, force=args.force)
-    prepare_birefnet_fp16(args.out, force=args.force)
+    download_birefnet(args.hf_cache, force=args.force)
+    prepare_birefnet_fp16(args.out, args.hf_cache, force=args.force)
     print("Preparing Faster R-CNN...")
     download_faster_rcnn(args.out, force=args.force)
     return 0 if verify(args.out) else 1

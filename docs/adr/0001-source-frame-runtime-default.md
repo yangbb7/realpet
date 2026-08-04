@@ -15,16 +15,15 @@ motion, and it requires proprietary runtime resources plus authored rigs.
 ## Decision
 
 Use normalized RGB/alpha frames produced from the imported video as the
-default runtime asset. Present them in an AppKit transparent panel with a
-bounded decoded-frame cache. Keep Cubism as a legacy compatibility renderer
-only when no prepared source frames are present.
+runtime asset. Present them in an AppKit transparent panel with a bounded
+decoded-frame cache. Cubism is not part of the application target.
 
 ## Consequences
 
 ### Positive
 
 - The default visible pet is made from the owner's pixels.
-- New imports do not depend on an API key, cloud image service, or Cubism SDK.
+- New imports do not depend on an API key, cloud image service, or rig SDK.
 - The rendering, pointer, and drop paths remain fully local.
 
 ### Negative

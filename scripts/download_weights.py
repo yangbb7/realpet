@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Unified weight downloader for realpet.
 
-Downloads the SAM2 checkpoint to the project's weights/ directory.
-BiRefNet and Faster R-CNN are auto-downloaded by their respective libraries
-(HuggingFace from_pretrained and torchvision), so only SAM2 needs manual fetch.
+Downloads the SAM2 checkpoint to the project's weights/ directory. Release
+bundles also contain a preconverted BiRefNet FP16 asset and Faster R-CNN
+weights, prepared by bundle_weights.py; neither is downloaded at app runtime.
 
 Usage:
     python scripts/download_weights.py           # download all
@@ -118,13 +118,8 @@ def check_all():
         else:
             missing.append(f"SAM2 checkpoint digest: {sam2}")
 
-    # BiRefNet (auto-downloaded by HuggingFace)
-    print("✓ BiRefNet-matting: auto-downloaded by HuggingFace from_pretrained()")
-    print("  (first run requires internet; cached at ~/.cache/huggingface/)")
-
-    # Faster R-CNN (auto-downloaded by torchvision)
-    print("✓ Faster R-CNN: auto-downloaded by torchvision on first use")
-    print("  (cached at ~/.cache/torch/hub/)")
+    print("ℹ BiRefNet FP16 and Faster R-CNN are prepared by bundle_weights.py")
+    print("  and verified in the release weights directory.")
 
     return missing
 

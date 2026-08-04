@@ -10,11 +10,10 @@ struct MotionComposerView: View {
     let onClose: () -> Void
 
     @State private var showServiceConfiguration = false
-    @State private var videoProvider: MotionVideoProvider = .agnes
-    @State private var miniMaxBaseURL = ""
     @State private var seconds = 4
-    @State private var miniMaxAPIKey = ""
+    @State private var assetProfile = PetAssetProfile.standard
     @State private var configurationMessage: String?
+    @State private var showActionPackConfirmation = false
 
     private var references: [URL] {
         vm.motionReferenceImages(for: pet)
@@ -42,15 +41,16 @@ struct MotionComposerView: View {
         selectedAction == .headFollow || headFollowInstalled
     }
 
+    private var missingActionCount: Int {
+        vm.missingFixedActions(for: pet).count
+    }
+
     private var recoverableJob: MotionGenerationJob? {
         vm.recoverableMotionJob(for: pet)
     }
 
     private var credentialStatus: String {
-        switch vm.motionServiceConfiguration.provider {
-        case .agnes: return "Agnes 使用云端图库的第一张原图"
-        case .miniMaxH3: return "MiniMax H3 使用云端图库中的全部原图"
-        }
+        "MiniMax H3 由 RealPet 云端安全服务处理全部原图"
     }
 
     var body: some View {
@@ -105,9 +105,7 @@ struct MotionComposerView: View {
                 Text("动作提示词")
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(.secondary)
-                Text(selectedAction.prompt(
-                    referenceImageCount: referenceCount,
-                    provider: vm.motionServiceConfiguration.provider))
+                Text(selectedAction.prompt(referenceImageCount: referenceCount))
                     .font(.footnote)
                     .foregroundStyle(.primary)
                     .lineLimit(4)
@@ -118,6 +116,15 @@ struct MotionComposerView: View {
             }
 
             HStack {
+                if missingActionCount > 1 {
+                    Button {
+                        showActionPackConfirmation = true
+                    } label: {
+                        Label("生成剩余 \(missingActionCount) 个动作", systemImage: "rectangle.stack.badge.play")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isBusy || referenceCount == 0)
+                }
                 Spacer()
 
                 Button {
@@ -147,6 +154,12 @@ struct MotionComposerView: View {
                         .help("服务方未提供远程取消接口；任务 ID 会保留，可稍后恢复结果")
                     }
                 }
+            }
+
+            if vm.queuedActionPackRemainingCount > 0 {
+                Text("动作套装还剩 \(vm.queuedActionPackRemainingCount) 个待生成")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
 
             if let recoverableJob, !isBusy {
@@ -182,6 +195,18 @@ struct MotionComposerView: View {
                 .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
         }
         .onAppear(perform: loadConfiguration)
+        .confirmationDialog(
+            "生成剩余 \(missingActionCount) 个固定动作？",
+            isPresented: $showActionPackConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("开始按顺序生成") {
+                vm.generateMissingActionPack(for: pet)
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("每次只生成一个动作。身份校验通过后仍需确认安装；放弃任一预览会结束本次动作套装。")
+        }
     }
 
     private var statusColor: Color {
@@ -194,37 +219,12 @@ struct MotionComposerView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("视频生成服务")
                 .font(.subheadline.weight(.semibold))
-            Picker("视频模型", selection: $videoProvider) {
-                ForEach(MotionVideoProvider.allCases) { provider in
-                    Text(provider.displayName).tag(provider)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            if videoProvider == .agnes {
-                Text("Agnes Video V2.0")
-                    .font(.footnote.weight(.semibold))
-                Text("由 RealPet 统一管理官方直连与凭据。生成时自动上传第一张原始宠物图片到原图桶，作为主参考图；不会调用 Agnes Image。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("原图存储与 Agnes 凭据均由 RealPet 管理，临时参考图地址在 24 小时后失效。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("MiniMax H3 官方直连")
-                    .font(.footnote.weight(.semibold))
-                TextField("MiniMax API Base URL", text: $miniMaxBaseURL)
-                    .textFieldStyle(.roundedBorder)
-                Text("生成时直接发送全部 \(references.count) 张上传原图作为多参考，不经过 Supabase 或 Agnes Image。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                SecureField(
-                    "新的 MiniMax API Key（留空则不修改）",
-                    text: $miniMaxAPIKey)
-                    .textFieldStyle(.roundedBorder)
-            }
-
-            Text("视频模型：\(videoProvider.modelName)  |  1152x768  |  24 fps")
+            Text("MiniMax H3 云端安全服务")
+                .font(.footnote.weight(.semibold))
+            Text("仅提交当前 Google 账户、宠物和动作信息。RealPet 云端服务在私有图册中读取最多 \(references.count) 张原图，并使用服务端 MiniMax 凭据生成视频。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("视频模型：MiniMax H3  |  2K")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Picker("时长", selection: $seconds) {
@@ -232,10 +232,13 @@ struct MotionComposerView: View {
                 Text("8 秒").tag(8)
                 Text("12 秒").tag(12)
                 Text("15 秒").tag(15)
-                if videoProvider == .agnes {
-                    Text("18 秒").tag(18)
+            }
+            Picker("素材质量", selection: $assetProfile) {
+                ForEach(PetAssetProfile.allCases) { profile in
+                    Text("\(profile.displayName)（\(profile.detail)）").tag(profile)
                 }
             }
+            .pickerStyle(.segmented)
             HStack {
                 if let configurationMessage {
                     Text(configurationMessage)
@@ -246,11 +249,8 @@ struct MotionComposerView: View {
                 Button("保存") {
                     do {
                         try vm.saveMotionServiceConfiguration(
-                            provider: videoProvider,
-                            miniMaxBaseURLString: miniMaxBaseURL,
-                            seconds: seconds,
-                            miniMaxAPIKey: miniMaxAPIKey)
-                        miniMaxAPIKey = ""
+                            seconds: seconds)
+                        vm.saveAssetProfile(assetProfile)
                         configurationMessage = "已保存"
                     } catch {
                         configurationMessage = error.localizedDescription
@@ -263,9 +263,8 @@ struct MotionComposerView: View {
 
     private func loadConfiguration() {
         let configuration = vm.motionServiceConfiguration
-        videoProvider = configuration.provider
-        miniMaxBaseURL = configuration.resolvedMiniMaxBaseURLString
         seconds = configuration.seconds
+        assetProfile = vm.assetProfile
     }
 
     private func recoverableJobStatus(_ job: MotionGenerationJob) -> String {

@@ -21,16 +21,13 @@ media directories are retained and never deleted as part of replacement.
 The action catalog is closed to twelve slots:
 
 1. `gaze_orbit` for head following.
-2. Eleven tap-played actions: `cry`, `angry_stomp`, `roll`, `stretch`,
-   `sleep_snore`, `wave`, `jump_cheer`, `puzzled_tilt`, `cuddle`,
-   `startled_retreat`, and `patrol_run`.
+2. Eleven tap-played actions: `lie_down`, `paw`, `eat`, `cry`, `angry_stomp`,
+   `roll`, `stretch`, `sleep_snore`, `wave`, `jump_cheer`, and `cuddle`.
 
-Each request selects one slot and submits exactly one selected-provider task.
-Agnes Video V2.0 receives the first original owner photo through a temporary
-signed URL from a private Supabase Storage bucket; it does not receive an
-Agnes Image-generated intermediate. MiniMax H3 receives all one to four
-original owner photos directly as `reference_image` inputs. The result is
-processed, validated, and atomically installed at
+Each request selects one slot and submits exactly one MiniMax task through the
+authenticated Supabase Edge Function. The Function resolves all one to four
+original owner photos as `reference_image` inputs. The result is processed,
+validated, and atomically installed at
 `actions/<slot>/`; no scenario fan-out or install queue exists. The source and
 installed frame counts must match, and neither processing nor installation may
 sample or discard a frame.
@@ -48,7 +45,7 @@ current pointer and resumes head following.
 
 ## Consequences
 
-- Billing maps one-to-one from a selected action to a provider task.
+- Billing maps one-to-one from a selected action to a MiniMax task.
 - Action files are independently replaceable and have an auditable origin.
 - The desktop has one active interaction target and one transparent pet panel.
 - Existing multi-pet records migrate to the newest record. Existing asset

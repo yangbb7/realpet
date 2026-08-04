@@ -1,7 +1,8 @@
 import Foundation
 
-/// Manages a resident Python daemon process that keeps the Faster R-CNN
-/// detector loaded across QC / detect calls, eliminating cold-start overhead.
+/// Manages an on-demand Python daemon that keeps the Faster R-CNN detector
+/// warm across closely spaced QC / detect calls without retaining it for the
+/// entire desktop session.
 ///
 /// Phase 1: Only `qc` and `detect` go through the daemon.  `process`
 /// (SAM2 + BiRefNet) still runs as a separate subprocess.
@@ -17,9 +18,20 @@ final class PythonDaemon: ObservableObject {
 
     /// Registered per-request callbacks, keyed by request ID.
     private var pending: [Int: ([String: Any]) -> Void] = [:]
+    private struct QueuedRequest {
+        let command: String
+        let arguments: [String: Any]
+        let callback: ([String: Any]) -> Void
+    }
+    private var queued: [Int: QueuedRequest] = [:]
     private var nextId: Int = 1
     private var stdoutBuffer = ""
     private var intentionallyStoppedPIDs: Set<Int32> = []
+    private var idleTermination: DispatchWorkItem?
+
+    // Keep the interpreter warm across a short editing session, then release
+    // its model memory instead of holding it for the whole app lifetime.
+    private static let idleTimeout: TimeInterval = 120
 
     /// Callback invoked when the daemon dies unexpectedly.
     var onCrash: (() -> Void)?
@@ -29,9 +41,11 @@ final class PythonDaemon: ObservableObject {
     /// Start the daemon process.  No-op if already running.
     func start() {
         guard process == nil else { return }
+        cancelIdleTermination()
 
         guard let python = PythonBridge.findTrackMattePython() else {
             PythonBridge.log("PythonDaemon: no Python found")
+            failQueuedRequests(message: "detector Python is unavailable")
             return
         }
 
@@ -85,6 +99,7 @@ final class PythonDaemon: ObservableObject {
                         cb(["type": "error", "message": "daemon exited unexpectedly"])
                     }
                     self.pending.removeAll()
+                    self.failQueuedRequests(message: "daemon exited unexpectedly")
                 }
                 if !intentional {
                     self.onCrash?()
@@ -96,6 +111,7 @@ final class PythonDaemon: ObservableObject {
             try proc.run()
         } catch {
             PythonBridge.log("PythonDaemon failed to start: \(error)")
+            failQueuedRequests(message: "detector daemon failed to start")
             return
         }
 
@@ -110,6 +126,7 @@ final class PythonDaemon: ObservableObject {
     /// Terminate the daemon cleanly.
     func terminate() {
         guard let proc = process else { return }
+        cancelIdleTermination()
         intentionallyStoppedPIDs.insert(proc.processIdentifier)
         // Close stdin → daemon's for-loop exits → clean sys.exit(0)
         stdinPipe?.fileHandleForWriting.closeFile()
@@ -123,65 +140,80 @@ final class PythonDaemon: ObservableObject {
         isRunning = false
         isReady = false
         pending.removeAll()
+        queued.removeAll()
         PythonBridge.log("PythonDaemon terminated")
     }
 
     // MARK: - Send
 
-    /// Send a request and stream response lines to `onLine`.
-    /// The `done` line (containing `"done":true`) is also delivered via `onLine`.
-    /// Returns the request ID (useful for future cancel support).
+    /// Sends a request once the detector is ready. Requests issued while the
+    /// daemon is starting are queued so the caller never starts a duplicate
+    /// subprocess just because model warm-up is still in progress.
     @discardableResult
     func send(cmd: String, args: [String: Any],
               onLine: @escaping ([String: Any]) -> Void) -> Int {
-        // Guard against a dead/zombie daemon: writing to a closed pipe would
-        // silently swallow the request and the callback would never fire,
-        // freezing the UI on "detecting". Verify the process is actually alive
-        // before trusting the pipe; if not, mark not-ready and fail fast so the
-        // caller falls back to the subprocess path.
-        guard let proc = process, proc.isRunning, isReady,
-              let handle = stdinPipe?.fileHandleForWriting else {
-            isReady = false
-            onLine(["type": "error", "message": "daemon not running"])
-            return -1
-        }
-
         let id = nextId
         nextId += 1
+        cancelIdleTermination()
+        let request = QueuedRequest(
+            command: cmd, arguments: args, callback: onLine)
+        guard let proc = process, proc.isRunning, isReady else {
+            queued[id] = request
+            start()
+            return id
+        }
+        sendReadyRequest(id: id, request: request)
+        return id
+    }
 
-        var payload = args
+    /// Starts detector warm-up without requiring a request. It is used at the
+    /// beginning of an import so video analysis can overlap model loading.
+    func warm() {
+        cancelIdleTermination()
+        start()
+    }
+
+    private func sendReadyRequest(id: Int, request: QueuedRequest) {
+        guard let proc = process, proc.isRunning,
+              let handle = stdinPipe?.fileHandleForWriting else {
+            isReady = false
+            request.callback(["type": "error", "message": "daemon not running"])
+            return
+        }
+
+        var payload = request.arguments
         payload["id"] = id
-        payload["cmd"] = cmd
+        payload["cmd"] = request.command
 
         let line: String
         if let data = try? JSONSerialization.data(withJSONObject: payload),
            let s = String(data: data, encoding: .utf8) {
             line = s + "\n"
         } else {
-            onLine(["type": "error", "message": "failed to encode request"])
-            return -1
+            request.callback(["type": "error", "message": "failed to encode request"])
+            return
         }
 
         // Writing to a broken pipe raises SIGPIPE/throws — catch it, mark the
         // daemon dead, and fail this request so the caller can retry via
         // subprocess instead of hanging.
-        pending[id] = onLine
+        pending[id] = request.callback
         do {
             try handle.write(contentsOf: line.data(using: .utf8)!)
         } catch {
             pending.removeValue(forKey: id)
             isReady = false
             PythonBridge.log("PythonDaemon: write failed (\(error)), marking dead")
-            onLine(["type": "error", "message": "daemon write failed"])
-            return -1
+            request.callback(["type": "error", "message": "daemon write failed"])
         }
-        return id
     }
 
     /// Cancel a pending request by ID (best-effort — daemon may already be
     /// processing it; Phase 1 does not support mid-request cancellation).
     func cancel(id: Int) {
         pending.removeValue(forKey: id)
+        queued.removeValue(forKey: id)
+        scheduleIdleTerminationIfNeeded()
     }
 
     // MARK: - stdout parsing
@@ -206,6 +238,8 @@ final class PythonDaemon: ObservableObject {
         if msg["type"] as? String == "ready" {
             isReady = true
             PythonBridge.log("PythonDaemon: ready")
+            drainQueuedRequests()
+            scheduleIdleTerminationIfNeeded()
             return
         }
 
@@ -217,7 +251,46 @@ final class PythonDaemon: ObservableObject {
             // Remove callback when the terminal "done" line arrives.
             if msg["done"] as? Bool == true {
                 pending.removeValue(forKey: id)
+                scheduleIdleTerminationIfNeeded()
             }
         }
+    }
+
+    private func drainQueuedRequests() {
+        let requests = queued
+        queued.removeAll()
+        for (id, request) in requests.sorted(by: { $0.key < $1.key }) {
+            sendReadyRequest(id: id, request: request)
+        }
+    }
+
+    private func failQueuedRequests(message: String) {
+        let requests = queued
+        queued.removeAll()
+        for (_, request) in requests {
+            request.callback(["type": "error", "message": message])
+        }
+    }
+
+    private func scheduleIdleTerminationIfNeeded() {
+        guard pending.isEmpty, queued.isEmpty, process != nil else { return }
+        cancelIdleTermination()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.pending.isEmpty,
+                      self.queued.isEmpty else { return }
+                self.terminate()
+            }
+        }
+        idleTermination = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.idleTimeout,
+            execute: work)
+    }
+
+    private func cancelIdleTermination() {
+        idleTermination?.cancel()
+        idleTermination = nil
     }
 }

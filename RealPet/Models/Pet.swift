@@ -30,12 +30,7 @@ struct Pet: Codable, Identifiable {
     /// Legacy-only persisted field. New runtime behavior uses one fixed,
     /// deterministic interaction policy and does not expose personality.
     var personality: PetPersonality? = nil
-    var rigManifestPath: String? = nil
     var detectedAnimalClass: String? = nil
-    var templateProfile: PetTemplateProfile? = nil
-    /// `nil` is a pre-0.3.0 record. It is deliberately interpreted as source
-    /// frames when available so persisted pets migrate without reprocessing.
-    var rendererKind: PetRendererKind? = nil
     /// Per-pet desktop presentation scale. Optional keeps existing pet records
     /// decodable and gives them the conservative default below.
     var displayScale: Double? = nil
@@ -87,10 +82,6 @@ struct Pet: Codable, Identifiable {
             }
         }
         return (recovered, changed)
-    }
-
-    var preferredRenderer: PetRendererKind {
-        rendererKind ?? .sourceFrames
     }
 
     var referenceImages: [String] {

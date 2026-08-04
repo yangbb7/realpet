@@ -62,7 +62,6 @@ jobs:
           REALPET_WEIGHTS_DIR: ${{ runner.temp }}/realpet-release-weights
           REALPET_DIST_DIR: ${{ runner.temp }}/realpet-package
           REALPET_SUPABASE_PUBLISHABLE_KEY: publishable-ci-key
-          REALPET_AGNES_API_KEY: agnes-ci-key
           REALPET_FFMPEG_PATH: /usr/local/bin/ffmpeg
         run: |
           if [ ! -x "$REALPET_FFMPEG_PATH" ]; then
@@ -71,6 +70,9 @@ jobs:
           test -x "$REALPET_FFMPEG_PATH"
           export REALPET_FFMPEG_PATH
           export REALPET_FFMPEG_SHA256="$(shasum -a 256 "$REALPET_FFMPEG_PATH" | awk '{print $1}')"
+          export REALPET_FFPROBE_PATH="$(command -v ffprobe)"
+          test -x "$REALPET_FFPROBE_PATH"
+          export REALPET_FFPROBE_SHA256="$(shasum -a 256 "$REALPET_FFPROBE_PATH" | awk '{print $1}')"
           export REALPET_BUILD_PYTHON="$REALPET_VENV/bin/python"
           ./build_app.sh
           APP="$REALPET_DIST_DIR/RealPet.app"

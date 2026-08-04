@@ -5,12 +5,6 @@ import SwiftUI
 @main
 struct RealPetMain {
     static func main() {
-        if provisionImageServiceCredentialFromStandardInput() { return }
-        if rejectDeprecatedAgnesCredentialCommands() { return }
-        if provisionMiniMaxServiceCredentialFromStandardInput() { return }
-        if configureMiniMaxMotionServiceFromCommandLine() { return }
-        if exportOriginalRigAtlasFromCommandLine() { return }
-        if exportOriginalRigTorsoFromCommandLine() { return }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
@@ -19,154 +13,6 @@ struct RealPetMain {
         app.run()
     }
 
-    private static func provisionImageServiceCredentialFromStandardInput() -> Bool {
-        guard CommandLine.arguments.contains(
-            "--provision-image-service-credential") else { return false }
-        guard let input = readLine(strippingNewline: true) else {
-            fputs("RealPet: missing image service credential on stdin\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        let key = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else {
-            fputs("RealPet: image service credential is empty\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        do {
-            try OpenAIAPIKeyStore.save(key)
-        } catch {
-            fputs("RealPet: failed to provision image service credential\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        return true
-    }
-
-    private static func rejectDeprecatedAgnesCredentialCommands() -> Bool {
-        let deprecatedFlags: Set<String> = [
-            "--provision-motion-service-credential",
-            "--provision-agnes-service-credential",
-            "--configure-agnes-motion-service",
-        ]
-        guard CommandLine.arguments.contains(where: deprecatedFlags.contains) else {
-            return false
-        }
-        fputs("RealPet: Agnes credential and endpoint are bundled at build time\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-
-    private static func provisionMiniMaxServiceCredentialFromStandardInput() -> Bool {
-        guard CommandLine.arguments.contains(
-            "--provision-minimax-service-credential") else { return false }
-        guard let input = readLine(strippingNewline: true) else {
-            fputs("RealPet: missing MiniMax service credential on stdin\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        let key = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else {
-            fputs("RealPet: MiniMax service credential is empty\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        do {
-            try OpenAIAPIKeyStore.saveMiniMaxMotionService(key)
-        } catch {
-            fputs("RealPet: failed to provision MiniMax service credential\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        return true
-    }
-
-    private static func configureMiniMaxMotionServiceFromCommandLine() -> Bool {
-        guard let flagIndex = CommandLine.arguments.firstIndex(
-            of: "--configure-minimax-motion-service") else { return false }
-        let values = Array(CommandLine.arguments.dropFirst(flagIndex + 1))
-        let miniMaxBaseURL: String
-        let seconds: Int
-        switch values.count {
-        case 2:
-            miniMaxBaseURL = values[0]
-            guard let parsedSeconds = Int(values[1]) else {
-                fputs("RealPet: invalid MiniMax motion duration\n", stderr)
-                exit(EXIT_FAILURE)
-            }
-            seconds = parsedSeconds
-        case 3:
-            // Compatibility with the former Base URL, model, seconds syntax.
-            miniMaxBaseURL = values[0]
-            guard values[1] == MotionVideoProvider.miniMaxH3.modelName,
-                  let parsedSeconds = Int(values[2]) else {
-                fputs("RealPet: invalid MiniMax motion configuration\n", stderr)
-                exit(EXIT_FAILURE)
-            }
-            seconds = parsedSeconds
-        default:
-            fputs(
-                "RealPet: expected MiniMax Base URL and seconds\n",
-                stderr)
-            exit(EXIT_FAILURE)
-        }
-        do {
-            let current = MotionServiceConfigurationStore.load()
-            let configuration = try MotionServiceConfiguration(
-                provider: .miniMaxH3,
-                agnesBaseURLString: current.resolvedAgnesBaseURLString,
-                miniMaxBaseURLString: miniMaxBaseURL,
-                videoModel: MotionVideoProvider.miniMaxH3.modelName,
-                seconds: seconds,
-                size: current.size).validated()
-            MotionServiceConfigurationStore.save(configuration)
-        } catch {
-            fputs("RealPet: invalid MiniMax motion service configuration\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-        return true
-    }
-
-    private static func exportOriginalRigAtlasFromCommandLine() -> Bool {
-        let request: OriginalRigAtlasExportRequest
-        do {
-            guard let parsed = try OriginalRigAtlasExportRequest.parse(
-                arguments: CommandLine.arguments) else { return false }
-            request = parsed
-        } catch {
-            fputs("RealPet: \(error.localizedDescription)\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-
-        Task {
-            do {
-                try await OriginalRigAtlasExporter.export(request)
-                fputs("RealPet: original rig atlas exported\n", stdout)
-                exit(EXIT_SUCCESS)
-            } catch {
-                fputs("RealPet: original rig atlas export failed: \(error.localizedDescription)\n", stderr)
-                exit(EXIT_FAILURE)
-            }
-        }
-        dispatchMain()
-    }
-
-    private static func exportOriginalRigTorsoFromCommandLine() -> Bool {
-        let request: OriginalRigTorsoExportRequest
-        do {
-            guard let parsed = try OriginalRigTorsoExportRequest.parse(
-                arguments: CommandLine.arguments) else { return false }
-            request = parsed
-        } catch {
-            fputs("RealPet: \(error.localizedDescription)\n", stderr)
-            exit(EXIT_FAILURE)
-        }
-
-        Task {
-            do {
-                try await OriginalRigTorsoExporter.export(request)
-                fputs("RealPet: original rig torso exported\n", stdout)
-                exit(EXIT_SUCCESS)
-            } catch {
-                fputs("RealPet: original rig torso export failed: \(error.localizedDescription)\n", stderr)
-                exit(EXIT_FAILURE)
-            }
-        }
-        dispatchMain()
-    }
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
@@ -178,32 +24,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // v0.2.0: first launch may need Python+venv setup. Run the wizard
-        // before starting the pipeline; otherwise jump straight to the UI.
-        SetupWizard.runIfNeeded { [weak self] outcome in
-            guard let self else { return }
-            switch outcome {
-            case .ready:
-                self.startServicesAndUI()
-            case .aborted(let message):
-                self.showSetupFailure(message)
-            }
-        }
+        // A missing venv must not keep the account console from opening.
+        // SetupWizard is requested by the first media-processing operation.
+        startServicesAndUI()
     }
 
     @MainActor
     private func startServicesAndUI() {
         vm = PetListViewModel()
+        RuntimeMetrics.recordStartup()
 
-        // Start resident Python daemon (Phase 1: detector for QC + detect).
+        // The detector daemon starts only when an import needs it.
         daemon = PythonDaemon()
         vm.pythonBridge.daemon = daemon
-        daemon.onCrash = { [weak self] in
-            // Auto-restart on crash (best-effort; next call will use
-            // subprocess fallback if restart fails).
-            self?.daemon.start()
+        vm.requestPipelineSetup = { completion in
+            SetupWizard.runIfNeeded { outcome in
+                switch outcome {
+                case .ready:
+                    completion(nil)
+                case .aborted(let message):
+                    completion(message)
+                }
+            }
         }
-        daemon.start()
+        daemon.onCrash = {
+            // Do not retain a large detector process after a crash; a later
+            // import will create it again on demand.
+            PythonBridge.log("PythonDaemon crashed; waiting for next import")
+        }
 
         // 创建主窗口
         let contentView = NSHostingController(
@@ -266,11 +114,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         resizeActionConsole()
 
         #if DEBUG
-        if ProcessInfo.processInfo.environment["REALPET_UI_TEST_VLM_SETUP"] == "1" {
-            DispatchQueue.main.async { [weak self] in
-                self?.vm.showVisionModelSetup = true
-            }
-        }
         if ProcessInfo.processInfo.environment["REALPET_UI_TEST_SHOW_FIRST_PET"] == "1",
            let pet = vm.pets.first {
             DispatchQueue.main.async { [weak self] in
@@ -337,16 +180,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let height = min(desiredHeight, max(360, visibleHeight - 80))
         window.setContentSize(NSSize(width: 560, height: height))
         window.setFrameOrigin(origin)
-    }
-
-    @MainActor
-    private func showSetupFailure(_ message: String) {
-        let alert = NSAlert()
-        alert.messageText = "RealPet Setup Required"
-        alert.informativeText = message
-        alert.alertStyle = .critical
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
     }
 
     // MARK: - Window delegate

@@ -2,9 +2,6 @@ import Foundation
 
 enum InteractionSource {
     static let pointer = "pointer"
-    static let cameraVision = "camera.vision"
-    static let cameraVLM = "camera.vlm"
-    static let speech = "speech"
     static let system = "system"
 }
 
@@ -20,48 +17,6 @@ enum InteractionKind {
     static let dragEnded = "user.pet.drag_end"
     static let fileDroppedOnBody = "user.pet.file_drop.body"
     static let fileDroppedOnHead = "user.pet.file_drop.head"
-    static let userWaves = "user.waves"
-    static let userOffersObject = "user.offers_object"
-    static let userLooksAtPet = "user.looks_at_pet"
-    static let userApproachesPet = "user.approaches_pet"
-    static let userAppears = "user.appears"
-    static let userCallsPet = "user.calls_pet"
-    static let userPraisesPet = "user.praises_pet"
-    static let userInvitesPlay = "user.invites_play"
-    static let userRequestsPause = "user.requests_pause"
-    static let userRequestsResume = "user.requests_resume"
-
-    static let multimodalAllowed: Set<String> = [
-        userWaves,
-        userOffersObject,
-        userLooksAtPet,
-        userApproachesPet,
-        userAppears,
-    ]
-
-    static let speechAllowed: Set<String> = [
-        userCallsPet,
-        userPraisesPet,
-        userInvitesPlay,
-        userRequestsPause,
-        userRequestsResume,
-    ]
-
-    static let behaviorPlanningAllowed: Set<String> = multimodalAllowed
-        .union(speechAllowed)
-        .union([
-            pointerEntered,
-            pointerExited,
-            pointerNear,
-            pointerApproachingFast,
-            petTapped,
-            petDoubleTapped,
-            petPetted,
-            dragStarted,
-            dragEnded,
-            fileDroppedOnBody,
-            fileDroppedOnHead,
-        ])
 }
 
 /// Recognizes a short horizontal back-and-forth stroke over a pet surface.

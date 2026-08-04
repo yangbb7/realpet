@@ -39,7 +39,7 @@ deliverable promise is therefore:
 | P0 | A source-frame runtime used global scale/rotation/translation fallbacks for gaze and missing actions. | It visibly changes the pet instead of replaying owner footage. | Remove visual fallbacks and select captured gaze/action sequences only. |
 | P0 | Action capability was broad: any reaction asset could authorise a click/drop whose exact asset was missing. | The UI could imply a supported interaction before its actual footage existed. | Introduce explicit captured response slots and runtime rejection of an unavailable cue. |
 | P1 | `actions.json` has no gaze coverage model. | The product cannot test or communicate whether mouse following is genuine. | Add five gaze action kinds and a fidelity-readiness query. |
-| P1 | Existing Live2D/Cubism and image-to-rig paths are costly legacy compatibility code. | Template fitting and generated rig parts cannot preserve a specific animal. | Keep only for opening legacy records; new source-frame imports never depend on them. |
+| P1 | Live2D/Cubism and image-to-rig paths were costly legacy compatibility code. | Template fitting and generated rig parts cannot preserve a specific animal. | Removed from the application target; source frames are the only renderer. |
 | P1 | Automated tests cover contracts but not a complete response-pack path. | Regressions can restore a synthetic fallback unnoticed. | Add manifest and action-capability tests, then add macOS runtime interaction checks. |
 | P2 | One 10-fps clip is insufficient for all behavioural coverage. | Smoothness and motion variety are capture-limited. | Add a guided multi-clip capture flow and quality gates in phase 2. |
 

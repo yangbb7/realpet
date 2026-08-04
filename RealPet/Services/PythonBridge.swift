@@ -13,10 +13,14 @@ class PythonBridge: ObservableObject {
     private var isShuttingDown = false
     private var isCancelling = false
 
-    /// Resident daemon for QC / detect.  Set by AppDelegate after
-    /// creating both objects.  When nil or not ready, callers fall back to
-    /// subprocess.
+    /// On-demand detector daemon for QC / detect. Set by AppDelegate after
+    /// creating both objects; requests queue while it warms up.
     weak var daemon: PythonDaemon?
+
+    @MainActor
+    func warmDetector() {
+        daemon?.warm()
+    }
 
     static let projectRoot: URL = {
         let bundleURL = Bundle.main.bundleURL
@@ -141,20 +145,21 @@ class PythonBridge: ObservableObject {
         for p in toolPaths + existing where !merged.contains(p) { merged.append(p) }
         env["PATH"] = merged.joined(separator: ":")
 
-        // (b) HF_HUB_CACHE / HF_HOME / TORCH_HOME default to available weights.
-        //
-        // huggingface_hub stores the actual repo cache under HF_HUB_CACHE.
-        // Release builds use Resources/weights/birefnet-fp16 directly. The HF
-        // cache variables remain useful for development trees with full weights.
-        let bundledHF = Bundle.main.resourceURL?
-            .appendingPathComponent("weights/hf").path
-        if let bundledHF, env["HF_HUB_CACHE"] == nil,
-           FileManager.default.fileExists(atPath: bundledHF) {
-            env["HF_HUB_CACHE"] = bundledHF
-        }
-        if let bundledHF, env["HF_HOME"] == nil,
-           FileManager.default.fileExists(atPath: bundledHF) {
-            env["HF_HOME"] = bundledHF
+        // (b) The release reads its BiRefNet checkpoint directly from
+        // Resources/weights/birefnet-fp16. Keep any Hugging Face dynamic-module
+        // cache outside the signed bundle so it can never inflate the app.
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask).first?.appendingPathComponent(
+                "RealPet/huggingface", isDirectory: true)
+        if let applicationSupport {
+            try? FileManager.default.createDirectory(
+                at: applicationSupport, withIntermediateDirectories: true)
+            if env["HF_HOME"] == nil { env["HF_HOME"] = applicationSupport.path }
+            if env["HF_HUB_CACHE"] == nil {
+                env["HF_HUB_CACHE"] = applicationSupport
+                    .appendingPathComponent("hub", isDirectory: true).path
+            }
         }
         let bundledTorch = Bundle.main.resourceURL?
             .appendingPathComponent("weights/torch").path
@@ -302,12 +307,12 @@ class PythonBridge: ObservableObject {
 
     /// Run quality gate (resolution / brightness / blur / pet detection).
     /// Returns `{"type":"qc", "passed": true/false, "reason":..., "message":...}` or nil on error.
-    /// Routes through the resident daemon when available, falls back to subprocess.
+    /// Routes through the on-demand daemon when configured, and falls back to
+    /// a subprocess only when no daemon is available or it reports an error.
     @MainActor
     func qualityCheck(videoPath: String, outputDir: String,
                       completion: @escaping ([String: Any]?) -> Void) {
-        // Try daemon first.
-        if let daemon, daemon.isReady {
+        if let daemon {
             Self.log("qualityCheck via daemon video=\(videoPath)")
             var settled = false
             daemon.send(cmd: "qc",
@@ -333,7 +338,7 @@ class PythonBridge: ObservableObject {
             return
         }
 
-        // Fallback: subprocess (legacy path).
+        // Fallback when no daemon was configured.
         qualityCheckSubprocess(videoPath: videoPath, outputDir: outputDir, completion: completion)
     }
 
@@ -395,12 +400,12 @@ class PythonBridge: ObservableObject {
     }
 
     /// Run quick pet detection and return result via callback.
-    /// Routes through the resident daemon when available, falls back to subprocess.
+    /// Routes through the on-demand daemon when configured, and falls back to
+    /// a subprocess only when no daemon is available or it reports an error.
     @MainActor
     func detectPet(videoPath: String, outputDir: String, startTime: Double = 0,
                    completion: @escaping ([String: Any]?) -> Void) {
-        // Try daemon first.
-        if let daemon, daemon.isReady {
+        if let daemon {
             Self.log("detectPet via daemon video=\(videoPath) start=\(startTime)")
             var args: [String: Any] = ["video": videoPath, "output_dir": outputDir]
             if startTime > 0 { args["start"] = startTime }
@@ -427,7 +432,7 @@ class PythonBridge: ObservableObject {
             return
         }
 
-        // Fallback: subprocess (legacy path).
+        // Fallback when no daemon was configured.
         detectPetSubprocess(videoPath: videoPath, outputDir: outputDir,
                             startTime: startTime, completion: completion)
     }
@@ -482,7 +487,8 @@ class PythonBridge: ObservableObject {
     func startWithClick(videoPath: String, outputDir: String, clickX: Int, clickY: Int,
                         bbox: [Double]? = nil,
                         startTime: Double = -1, duration: Double = -1,
-                        skipQualityCheck: Bool = false) {
+                        skipQualityCheck: Bool = false,
+                        assetProfile: PetAssetProfile = .standard) {
         guard !isProcessing, let python = Self.findTrackMattePython() else { return }
 
         let script = Self.projectRoot.appendingPathComponent("scripts/track_then_matte.py")
@@ -497,7 +503,8 @@ class PythonBridge: ObservableObject {
             bbox: bbox,
             startTime: startTime,
             duration: duration,
-            skipsQualityCheck: skipQualityCheck)
+            skipsQualityCheck: skipQualityCheck,
+            assetProfile: assetProfile)
         proc.environment = Self.subprocessEnvironment()
 
         startProcess(proc)
@@ -516,9 +523,8 @@ class PythonBridge: ObservableObject {
         proc.standardOutput = pipe
         proc.standardError = errPipe
 
-        // The eager Faster R-CNN daemon retains about 1 GB after detection but
-        // is idle during SAM2/BiRefNet. Release it before the heavy model process;
-        // `models_released` starts it again before the user can import another pet.
+        // Detector memory is unnecessary while SAM2/BiRefNet are active. The
+        // next import lazily warms a fresh daemon if it needs detection again.
         daemon?.terminate()
 
         buffer = ""
@@ -563,9 +569,6 @@ class PythonBridge: ObservableObject {
                         userInfo: ["cancelled": wasCancelled]
                     )
                 }
-                if !self.isShuttingDown {
-                    self.daemon?.start()
-                }
             }
         }
 
@@ -581,9 +584,6 @@ class PythonBridge: ObservableObject {
                 object: nil,
                 userInfo: ["cancelled": false]
             )
-            if !isShuttingDown {
-                daemon?.start()
-            }
         }
     }
 
@@ -670,11 +670,9 @@ class PythonBridge: ObservableObject {
                 )
 
             case "models_released":
-                // Heavy model allocations are gone. Re-warm the eager detector
-                // while lightweight quality/encoding work finishes.
-                if !self.isShuttingDown {
-                    self.daemon?.start()
-                }
+                // The detector stays off after a heavy process. It will warm on
+                // demand at the beginning of the next import.
+                break
 
             case "error":
                 if let message = msg["message"] as? String {

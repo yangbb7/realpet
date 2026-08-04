@@ -25,29 +25,23 @@ jobs:
       - name: Test persisted-state recovery
         run: |
           cd RealPet
-          swiftc Models/PetPersonality.swift Models/PetTemplateProfile.swift \
+          swiftc Models/PetPersonality.swift \
             Models/PetCloudReference.swift \
-            Models/PetRendererKind.swift Models/Pet.swift \
+            Models/Pet.swift \
             Tests/PetRecoveryCheck.swift \
             -o /tmp/realpet-pet-recovery-check
           /tmp/realpet-pet-recovery-check
       - name: Test interaction architecture
         run: |
           cd RealPet
-          swiftc Models/PetPersonality.swift Models/PetActionManifest.swift \
-            Models/InteractionModels.swift Models/InteractivePetModel.swift \
-            Models/PetRendererKind.swift \
-            Models/MultimodalInteractionModels.swift \
-            Models/CameraInteractionModels.swift Models/SpeechInteractionModels.swift \
-            Models/PetBehaviorMemory.swift Models/BehaviorPlanningModels.swift \
+          swiftc Models/PetPersonality.swift Models/PetCloudReference.swift \
+            Models/PetActionManifest.swift \
+            Models/InteractionModels.swift \
+            Models/PetBehaviorMemory.swift \
             Models/PetBehaviorPolicy.swift \
             Services/InteractionHub.swift \
             Services/InteractionAdapter.swift Services/PetRuntimeController.swift \
-            Services/EphemeralEvidenceBuffer.swift \
-            Services/VLMInteractionAdapter.swift Services/BehaviorPlanningCoordinator.swift \
-            Services/PetBehaviorDirector.swift Services/OllamaVLMModel.swift \
-            Services/LocalVLMConfiguration.swift \
-            Services/LocalBehaviorPlannerConfiguration.swift \
+            Services/PetBehaviorDirector.swift \
             Services/PetActionLibrary.swift \
             Tests/InteractionArchitectureCheck.swift \
             -o /tmp/realpet-interaction-check
@@ -56,68 +50,38 @@ jobs:
         run: |
           cd RealPet
           swiftc Models/PetActionManifest.swift Models/PetFeatureManifest.swift \
-            Models/InteractionModels.swift Models/PetRendererKind.swift \
+            Models/InteractionModels.swift \
             Services/InteractionHub.swift Services/InteractionAdapter.swift \
             Services/PetRuntimeController.swift Services/FrameSequencePetRuntime.swift \
             Tests/FrameSequenceRuntimeCheck.swift \
             -o /tmp/realpet-frame-runtime-check
           /tmp/realpet-frame-runtime-check
-      - name: Test rig asset generation
-        run: |
-          cd RealPet
-          swiftc Models/PetActionManifest.swift Models/PetFeatureManifest.swift \
-            Models/PetTemplateProfile.swift \
-            Models/InteractivePetModel.swift \
-            Services/OpenAIImageAPIConfiguration.swift \
-            Services/OpenAIAPIKeyStore.swift \
-            Services/GPTImage2RigAssetGenerator.swift \
-            Services/OriginalRigAtlasExporter.swift \
-            Tests/RigAssetGenerationCheck.swift \
-            -o /tmp/realpet-rig-asset-check
-          /tmp/realpet-rig-asset-check
       - name: Test motion generation contracts
         run: |
           cd RealPet
           swiftc Models/PetActionManifest.swift \
             Models/PetCloudReference.swift \
+            Models/PetAssetProfile.swift \
             Models/MotionGenerationModels.swift \
-            Services/OpenAIImageAPIConfiguration.swift \
-            Services/OpenAIAPIKeyStore.swift \
-            Services/MiniMaxVideoAPIConfiguration.swift \
             Services/PetReferenceImageData.swift \
-            Services/AgnesVideoGenerationClient.swift \
-            Services/MiniMaxH3VideoGenerationClient.swift \
             Services/SupabasePetReferenceStorage.swift \
             Services/SupabaseGoogleSession.swift \
+            Services/SupabaseMiniMaxVideoGatewayClient.swift \
             Services/PetActionLibrary.swift \
             Services/TrackMatteCommand.swift \
             Tests/MotionGenerationContractCheck.swift \
             -o /tmp/realpet-motion-generation-check
           /tmp/realpet-motion-generation-check
-      - name: Test Cubism runtime contracts
-        run: |
-          cd RealPet
-          swiftc Models/PetActionManifest.swift Models/PetFeatureManifest.swift \
-            Models/PetTemplateProfile.swift \
-            Models/InteractionModels.swift \
-            Models/InteractivePetModel.swift Models/PetRendererKind.swift \
-            Models/CubismParameterMapper.swift Models/CubismProceduralMotion.swift \
-            Services/CubismWebRuntimeResources.swift \
-            Services/PetRuntimeController.swift Services/InteractionHub.swift \
-            Services/InteractionAdapter.swift \
-            Services/FrameSequencePetRuntime.swift \
-            Services/CubismWebPetRuntime.swift \
-            Tests/CubismRuntimeContractCheck.swift \
-            -o /tmp/realpet-cubism-runtime-check
-          /tmp/realpet-cubism-runtime-check
       - name: Package app structural smoke
         run: |
           printf '#!/bin/sh\nprintf "ffmpeg version realpet-ci\\n"\n' > /tmp/realpet-ci-ffmpeg
           chmod +x /tmp/realpet-ci-ffmpeg
+          cp /tmp/realpet-ci-ffmpeg /tmp/realpet-ci-ffprobe
           REALPET_SUPABASE_PUBLISHABLE_KEY=publishable-ci-key \
-          REALPET_AGNES_API_KEY=agnes-ci-key \
           REALPET_FFMPEG_PATH=/tmp/realpet-ci-ffmpeg \
           REALPET_FFMPEG_SHA256="$(shasum -a 256 /tmp/realpet-ci-ffmpeg | awk '{print $1}')" \
+          REALPET_FFPROBE_PATH=/tmp/realpet-ci-ffprobe \
+          REALPET_FFPROBE_SHA256="$(shasum -a 256 /tmp/realpet-ci-ffprobe | awk '{print $1}')" \
           REALPET_DIST_DIR="${RUNNER_TEMP}/realpet-ci-package" \
           ./build_app.sh --stub-weights --reuse-swift-build
           test -x "${RUNNER_TEMP}/realpet-ci-package/RealPet.app/Contents/MacOS/RealPet"

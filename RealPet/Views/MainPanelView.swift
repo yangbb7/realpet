@@ -52,11 +52,6 @@ struct MainPanelView: View {
             .frame(maxWidth: .infinity)
         }
         .frame(width: 540)
-        .sheet(isPresented: $vm.showVisionModelSetup) {
-            VisualInteractionSetupView(
-                viewModel: vm,
-                onCancel: { vm.showVisionModelSetup = false })
-        }
         .sheet(isPresented: $vm.showPetImageManager) {
             PetImageManagerView(onDismiss: { vm.dismissPetImageManager() })
                 .environmentObject(vm)
@@ -100,46 +95,6 @@ struct MainPanelView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Toggle(
-                isOn: Binding(
-                    get: { vm.speechInteractionEnabled },
-                    set: { vm.setSpeechInteractionEnabled($0) })
-            ) {
-                Image(systemName: speechIconName)
-                    .foregroundStyle(speechColor)
-            }
-            .toggleStyle(.button)
-            .buttonStyle(.borderless)
-            .fixedSize()
-            .disabled(!vm.hasVisiblePet && !vm.speechInteractionEnabled)
-            .help(vm.speechInteractionHelp)
-            .accessibilityLabel("语音互动")
-
-            Toggle(
-                isOn: Binding(
-                    get: { vm.cameraInteractionEnabled },
-                    set: { vm.setCameraInteractionEnabled($0) })
-            ) {
-                Image(systemName: cameraIconName)
-                    .foregroundStyle(cameraColor)
-            }
-            .toggleStyle(.button)
-            .buttonStyle(.borderless)
-            .fixedSize()
-            .disabled(!vm.hasVisiblePet && !vm.cameraInteractionEnabled)
-            .help(vm.cameraInteractionHelp)
-            .accessibilityLabel("视觉互动")
-
-            Button {
-                vm.showVisionModelSetup = true
-            } label: {
-                Image(systemName: "gearshape")
-                    .foregroundStyle(visionModelColor)
-            }
-            .buttonStyle(.borderless)
-            .help(vm.localIntelligenceHelp)
-            .accessibilityLabel("本机智能设置")
-
             Menu {
                 if case .signedIn(let account) = googleLogin.state {
                     Text(account.displayName)
@@ -397,44 +352,4 @@ struct MainPanelView: View {
         }
     }
 
-    private var cameraIconName: String {
-        switch vm.cameraInteractionState {
-        case .denied, .unavailable, .failed: return "video.slash"
-        case .running: return "video.fill"
-        default: return "video"
-        }
-    }
-
-    private var speechIconName: String {
-        switch vm.speechInteractionState {
-        case .denied, .restricted, .unavailable, .failed: return "mic.slash"
-        case .listening: return "mic.fill"
-        default: return "mic"
-        }
-    }
-
-    private var speechColor: Color {
-        switch vm.speechInteractionState {
-        case .listening: return .green
-        case .requestingPermission, .starting: return .orange
-        case .denied, .restricted, .unavailable, .failed: return .red
-        default: return .secondary
-        }
-    }
-
-    private var cameraColor: Color {
-        switch vm.cameraInteractionState {
-        case .running: return .green
-        case .requestingPermission, .starting: return .orange
-        case .denied, .unavailable, .failed: return .red
-        default: return .secondary
-        }
-    }
-
-    private var visionModelColor: Color {
-        if case .failed = vm.localVLMRuntimeState { return .red }
-        if case .inferencing = vm.localVLMRuntimeState { return .orange }
-        if case .ready = vm.localVLMRuntimeState { return .green }
-        return .secondary
-    }
 }

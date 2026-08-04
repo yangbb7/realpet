@@ -21,7 +21,7 @@ and plays a captured response action for click and file drop. It does not apply
 a full-image gaze/action warp when an asset is absent; it reports the missing
 coverage instead.
 
-Generated video, Live2D and other inferred representations remain optional
+Generated source-frame video and other inferred representations remain optional
 experiments or legacy compatibility paths. They cannot satisfy this fidelity
 contract unless independently benchmarked and product-approved later.
 

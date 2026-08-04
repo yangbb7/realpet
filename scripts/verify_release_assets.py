@@ -8,12 +8,9 @@ import sys
 from pathlib import Path
 
 
-BIREFNET_REVISION = "57f9f68b43ba337c75762b14cf3075d659007268"
 ASSETS = (
     ("SAM2", "sam2/sam2.1_hiera_tiny.pt",
      "7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69"),
-    ("BiRefNet source", f"hf/models--ZhengPeng7--BiRefNet-matting/snapshots/{BIREFNET_REVISION}/model.safetensors",
-     "a9875de5b1e6c8eb5fdaa8c727a82927ce442cdc87ba3abee6a77e6fa46c25bb"),
     ("BiRefNet FP16", "birefnet-fp16/model.safetensors",
      "ad4e1bbe79a2f483fe808eaf2ff956183826d42da8d0eeeeacd69f1d80aff1a0"),
     ("Faster R-CNN", "torch/hub/checkpoints/fasterrcnn_resnet50_fpn_v2_coco-dd69338a.pth",

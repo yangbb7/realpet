@@ -19,7 +19,7 @@ class PetLauncher: ObservableObject {
     @discardableResult
     func launch(pet: Pet) -> Bool {
         lastRuntimeError = nil
-        // A desktop session exposes one global pet. Stop any stale renderer
+        // A desktop session exposes one global pet. Stop any stale runtime
         // before creating the next one so two independent windows cannot run.
         let otherPetIDs = runningPets.keys.filter { $0 != pet.id }
         for petID in otherPetIDs {
@@ -39,28 +39,12 @@ class PetLauncher: ObservableObject {
             if started { lastRuntimeError = nil }
             return started
         }
-        guard let configuration = live2DConfiguration(for: pet) else {
-            return false
-        }
-        let runtime = CubismWebPetRuntime(
-            petId: pet.id,
-            modelURL: configuration.modelURL,
-            resources: configuration.resources,
-            displayScale: pet.resolvedDisplayScale,
-            initialWindowOrigin: initialWindowOrigin(for: pet),
-            startHidden: false)
-        let started = activate(
-            runtime,
-            capabilities: configuration.manifest.runtimeCapabilities)
-        if started {
-            lastRuntimeError = nil
-        }
-        return started
+        lastRuntimeError = "宠物缺少可播放的 source-frame 动作素材"
+        return false
     }
 
     func canLaunch(pet: Pet) -> Bool {
         sourceFrameConfiguration(for: pet) != nil
-            || live2DConfiguration(for: pet, publishError: false) != nil
     }
 
     @discardableResult
@@ -167,12 +151,6 @@ class PetLauncher: ObservableObject {
         return true
     }
 
-    private struct Live2DConfiguration {
-        let manifest: InteractivePetModelManifest
-        let modelURL: URL
-        let resources: CubismWebRuntimeResources
-    }
-
     private struct SourceFrameConfiguration {
         let framesDirectory: URL
         let fps: Int
@@ -185,12 +163,13 @@ class PetLauncher: ObservableObject {
     }
 
     private func sourceFrameConfiguration(for pet: Pet) -> SourceFrameConfiguration? {
-        guard pet.preferredRenderer == .sourceFrames,
-              let framesPath = pet.framesDir else { return nil }
+        guard let framesPath = pet.framesDir else { return nil }
         let framesDirectory = URL(fileURLWithPath: framesPath)
             .standardizedFileURL.resolvingSymlinksInPath()
-        guard (try? SourceFrameSequence.load(
-            at: framesDirectory, fps: pet.fps)) != nil else { return nil }
+        guard SourceFrameActionResolver.defaultSequence(
+            framesDirectory: framesDirectory, fallbackFPS: pet.fps) != nil
+            || (try? SourceFrameSequence.load(
+                at: framesDirectory, fps: pet.fps)) != nil else { return nil }
         return SourceFrameConfiguration(
             framesDirectory: framesDirectory,
             fps: pet.fps,
@@ -198,45 +177,6 @@ class PetLauncher: ObservableObject {
                 framesDirectory: framesDirectory))
     }
 
-    private func live2DConfiguration(
-        for pet: Pet,
-        publishError: Bool = true
-    ) -> Live2DConfiguration? {
-        func fail(_ message: String) -> Live2DConfiguration? {
-            if publishError { lastRuntimeError = message }
-            return nil
-        }
-
-        guard let manifestPath = pet.rigManifestPath else {
-            return fail("尚未生成完整 Live2D 模型，请重试自动制作")
-        }
-        guard let manifest = InteractivePetModelManifest.load(at: manifestPath) else {
-            return fail("Live2D 模型清单损坏或版本不兼容，请重新生成")
-        }
-        guard manifest.isRuntimeReady else {
-            switch manifest.stage {
-            case .partsPrepared:
-                return fail("Live2D 部件已准备，但自动模板安装尚未完成，请重试")
-            case .cubismCompiled:
-                return fail("Live2D 模型能力配置不完整，请重新导入已编译模型")
-            }
-        }
-        guard let modelURL = manifest.resolvedModelURL(
-            manifestPath: manifestPath) else {
-            return fail("找不到 Live2D .model3.json，请重新导入已编译模型")
-        }
-        do {
-            try CubismModelPackageValidator.validate(modelURL: modelURL)
-        } catch {
-            return fail(error.localizedDescription)
-        }
-        guard let resources = CubismWebRuntimeResources.discover(
-            projectRoot: PythonBridge.projectRoot) else {
-            return fail("缺少已授权的 Live2D Cubism Web Core/Runtime/Shaders")
-        }
-        return Live2DConfiguration(
-            manifest: manifest, modelURL: modelURL, resources: resources)
-    }
 }
 
 extension Notification.Name {
