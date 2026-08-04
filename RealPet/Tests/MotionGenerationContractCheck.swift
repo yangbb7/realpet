@@ -13,7 +13,7 @@ private final class MotionMockURLProtocol: URLProtocol {
             guard let handler = Self.handler else {
                 throw SupabaseMiniMaxVideoGatewayError.invalidResponse
             }
-            let (response, data) = try handler(request)
+            let (response, data) = try handler(Self.requestWithMaterializedBody(request))
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: data)
             client?.urlProtocolDidFinishLoading(self)
@@ -23,6 +23,25 @@ private final class MotionMockURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+
+    private static func requestWithMaterializedBody(_ request: URLRequest) -> URLRequest {
+        guard request.httpBody == nil, let stream = request.httpBodyStream else {
+            return request
+        }
+
+        stream.open()
+        defer { stream.close() }
+        var bytes = [UInt8](repeating: 0, count: 4_096)
+        var body = Data()
+        while stream.hasBytesAvailable {
+            let count = stream.read(&bytes, maxLength: bytes.count)
+            guard count > 0 else { break }
+            body.append(contentsOf: bytes[0..<count])
+        }
+        var materialized = request
+        materialized.httpBody = body
+        return materialized
+    }
 }
 
 @main
@@ -42,11 +61,13 @@ struct MotionGenerationContractCheck {
         precondition(motionConfiguration.provider == .miniMaxH3)
         precondition(motionConfiguration.videoModel == "MiniMax-H3")
         precondition(motionConfiguration.seconds == 4)
+        precondition(motionConfiguration.resolution == .native2K)
         _ = try motionConfiguration.validated()
         let migrated = MotionServiceConfiguration(seconds: 99)
             .migratedToSupportedProviders()
         precondition(migrated.provider == .miniMaxH3)
         precondition(migrated.seconds == 15)
+        precondition(migrated.resolution == .native2K)
 
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent(
@@ -294,15 +315,14 @@ struct MotionGenerationContractCheck {
             bbox: [1, 2, 3, 4],
             startTime: 0,
             duration: 12,
-            skipsQualityCheck: true)
+            skipsQualityCheck: true,
+            preservesSourceVideo: true)
         precondition(generatedArguments == [
             "/app/scripts/track_then_matte.py",
             "--video", "/pet/generated.mp4",
             "--output-dir", "/pet",
             "--preview-seconds", "5",
             "--max-seconds", "15",
-            "--fps", "16",
-            "--max-output-dimension", "960",
             "--click", "100,200",
             "--skip-qa",
             "--bbox", "1.0,2.0,3.0,4.0",
@@ -377,10 +397,15 @@ struct MotionGenerationContractCheck {
                 miniMaxGatewayRequestCount += 1
                 switch miniMaxGatewayRequestCount {
                 case 1:
+                    let requestBody = try JSONSerialization.jsonObject(
+                        with: request.httpBody ?? Data()) as? [String: Any]
+                    precondition(requestBody?["operation"] as? String == "create")
+                    precondition(requestBody?["resolution"] as? String == "2K")
                     return (response, try JSONSerialization.data(withJSONObject: [
                         "jobId": "11111111-1111-4111-8111-111111111111",
                         "status": "queued",
                         "durationSeconds": 4,
+                        "providerResolution": "2K",
                         "providerCostCents": NSNull(),
                         "resultUrl": NSNull(),
                         "error": NSNull(),
@@ -390,6 +415,7 @@ struct MotionGenerationContractCheck {
                         "jobId": "11111111-1111-4111-8111-111111111111",
                         "status": "succeeded",
                         "durationSeconds": 4,
+                        "providerResolution": "2K",
                         "providerCostCents": 24,
                         "resultUrl": "https://cdn.example.com/minimax.mp4",
                         "error": NSNull(),
@@ -429,6 +455,7 @@ struct MotionGenerationContractCheck {
             petID: UUID(),
             action: .headFollow,
             seconds: 4,
+            resolution: .native2K,
             configuration: storageConfiguration,
             credentials: storageCredentials)
         precondition(miniMaxQueued.status == .queued)
@@ -438,6 +465,7 @@ struct MotionGenerationContractCheck {
             credentials: storageCredentials)
         precondition(miniMaxCompleted.status == .completed)
         precondition(miniMaxCompleted.providerCostCents == 24)
+        precondition(miniMaxCompleted.providerResolution == .native2K)
         let miniMaxVideo = try await miniMax.downloadContent(job: miniMaxCompleted)
         precondition(miniMaxVideo.count == 8)
         precondition(miniMaxGatewayRequestCount == 2)

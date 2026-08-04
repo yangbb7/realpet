@@ -488,7 +488,8 @@ class PythonBridge: ObservableObject {
                         bbox: [Double]? = nil,
                         startTime: Double = -1, duration: Double = -1,
                         skipQualityCheck: Bool = false,
-                        assetProfile: PetAssetProfile = .standard) {
+                        assetProfile: PetAssetProfile = .standard,
+                        preservesSourceVideo: Bool = false) {
         guard !isProcessing, let python = Self.findTrackMattePython() else { return }
 
         let script = Self.projectRoot.appendingPathComponent("scripts/track_then_matte.py")
@@ -504,7 +505,8 @@ class PythonBridge: ObservableObject {
             startTime: startTime,
             duration: duration,
             skipsQualityCheck: skipQualityCheck,
-            assetProfile: assetProfile)
+            assetProfile: assetProfile,
+            preservesSourceVideo: preservesSourceVideo)
         proc.environment = Self.subprocessEnvironment()
 
         startProcess(proc)

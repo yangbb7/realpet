@@ -42,6 +42,9 @@ type ProviderStatus =
   | "failed"
   | "expired";
 
+type ProviderResolution = "2K";
+const H3_NATIVE_RESOLUTION: ProviderResolution = "2K";
+
 interface MotionVideoJob {
   id: string;
   user_id: string;
@@ -49,6 +52,7 @@ interface MotionVideoJob {
   action_kind: ActionKind;
   duration_seconds: number;
   provider_model: string;
+  provider_resolution: ProviderResolution;
   provider_cost_cents: number | null;
   provider_task_id: string | null;
   provider_status: ProviderStatus;
@@ -63,6 +67,7 @@ interface CreateRequest {
   petId: string;
   actionKind: ActionKind;
   durationSeconds: number;
+  resolution: ProviderResolution;
 }
 
 interface StatusRequest {
@@ -154,6 +159,7 @@ async function createJob(
       action_kind: input.actionKind,
       duration_seconds: input.durationSeconds,
       provider_model: "MiniMax-H3",
+      provider_resolution: input.resolution,
       provider_status: "submitting",
     })
     .select("*")
@@ -178,6 +184,7 @@ async function createJob(
       prompt: promptFor(input.actionKind, referenceURLs.length),
       referenceURLs,
       durationSeconds: input.durationSeconds,
+      resolution: input.resolution,
     });
 
     const updated = await updateJob(admin, job.id, userID, {
@@ -291,6 +298,7 @@ async function submitToMiniMax(input: {
   prompt: string;
   referenceURLs: string[];
   durationSeconds: number;
+  resolution: ProviderResolution;
 }): Promise<{ task_id: string }> {
   const content = [
     { type: "text", text: input.prompt },
@@ -309,7 +317,7 @@ async function submitToMiniMax(input: {
     body: JSON.stringify({
       model: "MiniMax-H3",
       content,
-      resolution: "2K",
+      resolution: input.resolution,
       duration: input.durationSeconds,
       ratio: "adaptive",
       aigc_watermark: false,
@@ -464,11 +472,17 @@ function parseRequest(value: unknown): FunctionRequest {
     if (!isUUID(value.petId) || !isActionKind(value.actionKind) || !isDuration(value.durationSeconds)) {
       throw new FunctionError(400, "Invalid create request");
     }
+    if (value.resolution !== undefined && value.resolution !== H3_NATIVE_RESOLUTION) {
+      throw new FunctionError(400, "Unsupported MiniMax H3 resolution");
+    }
     return {
       operation: "create",
       petId: value.petId,
       actionKind: value.actionKind,
       durationSeconds: value.durationSeconds,
+      // Keep the current desktop app compatible while preserving the server's
+      // explicit provider contract for newer clients.
+      resolution: H3_NATIVE_RESOLUTION,
     };
   }
   if (value.operation === "status") {
@@ -504,7 +518,7 @@ function promptFor(action: ActionKind, referenceCount: number): string {
 
 function actionMotion(action: ActionKind): string {
   const motion: Record<ActionKind, string> = {
-    head_follow: "主体安静端坐正对镜头，身体、四肢和尾巴完全静止；只有头部和双眼极度平滑地顺时针依次注视上方、右侧、下方、左侧并回到正前方。固定机位，无身体转动、移动或镜头运动。",
+    head_follow: "主体安静端坐正对镜头，身体、四肢和尾巴完全静止；只有头部和双眼极度平滑地顺时针依次注视上方、右侧、下方、左侧、上方并回到正前方。固定机位，无身体转动、移动或镜头运动。",
     lie_down: "角色正对镜头自然站立，缓慢躺倒露出放松撒娇姿态，四肢自然收拢，短暂停留后平稳回到初始站姿。固定机位，动作完整可见。",
     paw: "角色正对镜头自然站立，仅抬起一只前爪在身前连续轻轻扒拉两次，头部专注看着爪子，随后回到初始站姿。固定机位。",
     eat: "角色正对镜头自然站立，抬头张嘴做出吞下一小块食物的自然动作，轻微咀嚼后闭嘴并回到初始站姿。固定机位。",
@@ -526,6 +540,7 @@ function jobResponse(job: MotionVideoJob) {
     status: job.provider_status,
     durationSeconds: job.duration_seconds,
     providerModel: job.provider_model,
+    providerResolution: job.provider_resolution,
     providerCostCents: job.provider_status === "succeeded"
       ? job.provider_cost_cents
       : null,

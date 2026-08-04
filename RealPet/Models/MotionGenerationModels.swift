@@ -224,15 +224,29 @@ enum MotionWorkflowState: Equatable {
     }
 }
 
+/// The generation precision accepted by the active MiniMax H3 integration.
+/// Keep this provider contract separate from local asset-processing settings.
+enum MiniMaxH3VideoResolution: String, Codable, CaseIterable, Identifiable, Sendable {
+    case native2K = "2K"
+
+    var id: String { rawValue }
+
+    var displayName: String { "原生 2K" }
+
+    var detail: String { "2560 x 1440 / 24 FPS" }
+}
+
 struct MotionServiceConfiguration: Codable, Equatable, Sendable {
     static let defaultValue = MotionServiceConfiguration(seconds: 4)
 
     let provider: MotionVideoProvider = .miniMaxH3
     let videoModel = MotionVideoProvider.miniMaxH3.modelName
     var seconds: Int
+    var resolution: MiniMaxH3VideoResolution
 
-    init(seconds: Int) {
+    init(seconds: Int, resolution: MiniMaxH3VideoResolution = .native2K) {
         self.seconds = seconds
+        self.resolution = resolution
     }
 
     func validated() throws -> MotionServiceConfiguration {
@@ -243,18 +257,23 @@ struct MotionServiceConfiguration: Codable, Equatable, Sendable {
     }
 
     /// Rewrites every older direct-provider preference to the server-owned
-    /// MiniMax path. Only the supported duration is retained.
+    /// MiniMax path. Only the supported duration and native precision are retained.
     func migratedToSupportedProviders() -> MotionServiceConfiguration {
-        MotionServiceConfiguration(seconds: min(max(seconds, 4), 15))
+        MotionServiceConfiguration(
+            seconds: min(max(seconds, 4), 15),
+            resolution: .native2K)
     }
 
     private enum CodingKeys: String, CodingKey {
         case seconds
+        case resolution
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         seconds = try container.decodeIfPresent(Int.self, forKey: .seconds) ?? 4
+        resolution = try container.decodeIfPresent(
+            MiniMaxH3VideoResolution.self, forKey: .resolution) ?? .native2K
     }
 }
 

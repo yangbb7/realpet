@@ -11,7 +11,7 @@ struct MotionComposerView: View {
 
     @State private var showServiceConfiguration = false
     @State private var seconds = 4
-    @State private var assetProfile = PetAssetProfile.standard
+    @State private var resolution = MiniMaxH3VideoResolution.native2K
     @State private var configurationMessage: String?
     @State private var showActionPackConfirmation = false
 
@@ -224,7 +224,7 @@ struct MotionComposerView: View {
             Text("仅提交当前 Google 账户、宠物和动作信息。RealPet 云端服务在私有图册中读取最多 \(references.count) 张原图，并使用服务端 MiniMax 凭据生成视频。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text("视频模型：MiniMax H3  |  2K")
+            Text("视频模型：MiniMax H3")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Picker("时长", selection: $seconds) {
@@ -233,12 +233,15 @@ struct MotionComposerView: View {
                 Text("12 秒").tag(12)
                 Text("15 秒").tag(15)
             }
-            Picker("素材质量", selection: $assetProfile) {
-                ForEach(PetAssetProfile.allCases) { profile in
-                    Text("\(profile.displayName)（\(profile.detail)）").tag(profile)
+            Picker("模型生成精度", selection: $resolution) {
+                ForEach(MiniMaxH3VideoResolution.allCases) { option in
+                    Text("\(option.displayName)（\(option.detail)）")
+                        .tag(option)
                 }
             }
-            .pickerStyle(.segmented)
+            Text("视频按模型原生分辨率和帧率处理，本地不会缩放或降帧。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             HStack {
                 if let configurationMessage {
                     Text(configurationMessage)
@@ -249,8 +252,7 @@ struct MotionComposerView: View {
                 Button("保存") {
                     do {
                         try vm.saveMotionServiceConfiguration(
-                            seconds: seconds)
-                        vm.saveAssetProfile(assetProfile)
+                            seconds: seconds, resolution: resolution)
                         configurationMessage = "已保存"
                     } catch {
                         configurationMessage = error.localizedDescription
@@ -264,7 +266,7 @@ struct MotionComposerView: View {
     private func loadConfiguration() {
         let configuration = vm.motionServiceConfiguration
         seconds = configuration.seconds
-        assetProfile = vm.assetProfile
+        resolution = configuration.resolution
     }
 
     private func recoverableJobStatus(_ job: MotionGenerationJob) -> String {

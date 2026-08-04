@@ -13,6 +13,7 @@ struct SupabaseMiniMaxVideoGatewayJob: Equatable, Sendable {
     let resultURL: URL?
     /// `nil` means the server has no configured contractual rate, never zero.
     let providerCostCents: Int?
+    let providerResolution: MiniMaxH3VideoResolution
 }
 
 enum SupabaseMiniMaxVideoGatewayError: LocalizedError, Equatable {
@@ -57,6 +58,7 @@ struct SupabaseMiniMaxVideoGatewayClient {
         petID: UUID,
         action: FixedPetAction,
         seconds: Int,
+        resolution: MiniMaxH3VideoResolution,
         configuration: SupabaseReferenceStorageConfiguration,
         credentials: SupabaseReferenceStorageCredentials
     ) async throws -> SupabaseMiniMaxVideoGatewayJob {
@@ -69,6 +71,7 @@ struct SupabaseMiniMaxVideoGatewayClient {
                 "petId": petID.uuidString.lowercased(),
                 "actionKind": action.rawValue,
                 "durationSeconds": seconds,
+                "resolution": resolution.rawValue,
             ],
             configuration: configuration,
             credentials: credentials)
@@ -145,6 +148,8 @@ struct SupabaseMiniMaxVideoGatewayClient {
         }
         let resultURL = (root["resultUrl"] as? String).flatMap(URL.init(string:))
         let message = root["error"] as? String
+        let providerResolution = MiniMaxH3VideoResolution(
+            rawValue: root["providerResolution"] as? String ?? "") ?? .native2K
         let status: SupabaseMiniMaxVideoGatewayJob.Status
         switch rawStatus.lowercased() {
         case "submitting", "queued":
@@ -166,7 +171,8 @@ struct SupabaseMiniMaxVideoGatewayClient {
             id: id,
             status: status,
             resultURL: resultURL,
-            providerCostCents: root["providerCostCents"] as? Int)
+            providerCostCents: root["providerCostCents"] as? Int,
+            providerResolution: providerResolution)
     }
 
     private static func errorMessage(from data: Data) -> String {

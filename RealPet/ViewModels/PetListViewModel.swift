@@ -806,9 +806,11 @@ class PetListViewModel: ObservableObject {
     }
 
     func saveMotionServiceConfiguration(
-        seconds: Int
+        seconds: Int,
+        resolution: MiniMaxH3VideoResolution
     ) throws {
-        let configuration = try MotionServiceConfiguration(seconds: seconds)
+        let configuration = try MotionServiceConfiguration(
+            seconds: seconds, resolution: resolution)
             .migratedToSupportedProviders()
             .validated()
         motionServiceConfiguration = configuration
@@ -985,6 +987,7 @@ class PetListViewModel: ObservableObject {
                 petID: pet.id,
                 action: action,
                 seconds: configuration.seconds,
+                resolution: configuration.resolution,
                 configuration: storageConfiguration,
                 credentials: storageCredentials)
             var persistedJob = durableJob
@@ -1005,6 +1008,7 @@ class PetListViewModel: ObservableObject {
                         attributes: [
                             "action": action.rawValue,
                             "duration_seconds": String(configuration.seconds),
+                            "provider_resolution": pendingJob.providerResolution.rawValue,
                             "provider_cost_cents": pendingJob.providerCostCents
                                 .map(String.init) ?? "unknown",
                         ])
@@ -1227,18 +1231,19 @@ class PetListViewModel: ObservableObject {
             pets[index].detectedAnimalClass = detectedClass
             persistPets()
         }
-        let skipsQualityCheck = GeneratedMotionProcessingPolicy
+        let isGeneratedMotion = GeneratedMotionProcessingPolicy
             .bypassesRecordedFootageQualityGate(
                 actionOrigin: activeActionImport?.petId == petId
                     ? activeActionImport?.origin
-                    : nil,
+                : nil,
                 isInitialGeneratedPet: generatedInitialPetId == petId)
         pythonBridge.startWithClick(
             videoPath: videoPath, outputDir: outputDir,
             clickX: clickX, clickY: clickY, bbox: bbox,
             startTime: startTime, duration: duration,
-            skipQualityCheck: skipsQualityCheck,
-            assetProfile: assetProfile)
+            skipQualityCheck: isGeneratedMotion,
+            assetProfile: assetProfile,
+            preservesSourceVideo: isGeneratedMotion)
     }
 
     private func failPreparation(petId: UUID, message: String) {

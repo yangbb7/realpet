@@ -11,7 +11,8 @@ enum TrackMatteCommand {
         startTime: Double = -1,
         duration: Double = -1,
         skipsQualityCheck: Bool = false,
-        assetProfile: PetAssetProfile = .standard
+        assetProfile: PetAssetProfile = .standard,
+        preservesSourceVideo: Bool = false
     ) -> [String] {
         var arguments = [
             scriptPath,
@@ -19,10 +20,14 @@ enum TrackMatteCommand {
             "--output-dir", outputDir,
             "--preview-seconds", "5",
             "--max-seconds", "15",
-            "--fps", "\(assetProfile.frameRate)",
-            "--max-output-dimension", "\(assetProfile.maximumOutputDimension)",
             "--click", "\(clickX),\(clickY)",
         ]
+        if !preservesSourceVideo {
+            arguments += [
+                "--fps", "\(assetProfile.frameRate)",
+                "--max-output-dimension", "\(assetProfile.maximumOutputDimension)",
+            ]
+        }
         if skipsQualityCheck {
             // White studio backgrounds are valid for model-generated motion.
             arguments.append("--skip-qa")
