@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 private final class MotionMockURLProtocol: URLProtocol {
@@ -76,6 +77,21 @@ struct MotionGenerationContractCheck {
         defer { try? fm.removeItem(at: root) }
         try fm.createDirectory(at: source, withIntermediateDirectories: true)
         try Data("frame".utf8).write(to: source.appendingPathComponent("frame_0000.png"))
+        try JSONEncoder().encode(PetActionFrameTimeline(frames: [
+            .init(pts: 0, duration: 0.25),
+        ])).write(
+            to: source.appendingPathComponent(PetActionFrameTimeline.fileName),
+            options: .atomic)
+        try Data("source-video".utf8).write(to: source.appendingPathComponent("action.mp4"))
+        let verifiedSourceMedia = PetActionSourceMedia(
+            sha256: SHA256.hash(data: Data("source-video".utf8)).map {
+                String(format: "%02x", $0)
+            }.joined(),
+            width: 2560, height: 1440, duration: 4.5,
+            nominalFrameRate: 24, variableFrameRate: false)
+        try JSONEncoder().encode(verifiedSourceMedia).write(
+            to: source.appendingPathComponent(PetActionSourceMedia.fileName),
+            options: .atomic)
         let manifest = try PetActionLibrary.install(
             kind: .cry,
             processedFramesDirectory: source,
@@ -84,6 +100,15 @@ struct MotionGenerationContractCheck {
             origin: .generated)
         precondition(manifest.actions.first(where: { $0.kind == .cry })?.effectiveOrigin
                      == .generated)
+        let generatedAction = manifest.actions.first(where: { $0.kind == .cry })
+        precondition(generatedAction?.sourceMedia == verifiedSourceMedia)
+        precondition(generatedAction?.timelinePath == PetActionFrameTimeline.fileName)
+        precondition(fm.fileExists(atPath: root.appendingPathComponent(
+            "actions/cry/\(PetActionSourceMedia.fileName)").path))
+        precondition(fm.fileExists(atPath: root.appendingPathComponent(
+            "actions/cry/\(PetActionFrameTimeline.fileName)").path))
+        precondition(verifiedSourceMedia.verifiesMedia(at: root.appendingPathComponent(
+            "actions/cry")) == true)
         precondition(manifest.capabilities.reaction)
 
         let customSource = root.appendingPathComponent("source-custom")

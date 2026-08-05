@@ -1,5 +1,6 @@
 """Regression tests for the no-frame-loss import contract."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -7,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from scripts.track_then_matte import extract_frames, _verify_output_frame_sequence
+from scripts.track_then_matte import (
+    _source_frame_timeline,
+    extract_frames,
+    _verify_output_frame_sequence,
+)
 
 
 def test_extraction_keeps_every_decoded_frame(tmp_path):
@@ -36,6 +41,24 @@ def test_output_verification_rejects_a_missing_frame(tmp_path):
 
     with pytest.raises(RuntimeError, match="frame preservation check failed"):
         _verify_output_frame_sequence(str(tmp_path), expected_count=3)
+
+
+def test_variable_frame_rate_timeline_preserves_source_pts(monkeypatch):
+    class ProbeResult:
+        stdout = json.dumps({"frames": [
+            {"best_effort_timestamp_time": "2.0", "pkt_duration_time": "0.05"},
+            {"best_effort_timestamp_time": "2.05", "pkt_duration_time": "0.30"},
+            {"best_effort_timestamp_time": "2.35", "pkt_duration_time": "0.10"},
+        ]})
+
+    monkeypatch.setattr(
+        subprocess, "run", lambda *args, **kwargs: ProbeResult())
+    timeline = _source_frame_timeline(
+        "unused.mp4", start_time=2.0, duration=0.5, expected_count=3,
+        fallback_fps=24, preserve_source_timing=True)
+
+    assert [entry["pts"] for entry in timeline] == pytest.approx([0.0, 0.05, 0.35])
+    assert [entry["duration"] for entry in timeline] == pytest.approx([0.05, 0.30, 0.10])
 
 
 def test_pipeline_never_replaces_a_frame_with_a_neighbor():

@@ -15,6 +15,7 @@ Requires Python 3.10+ venv (set REALPET_VENV or default to .venv in project root
 import argparse
 import gc
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -469,6 +470,116 @@ def _get_video_frame_rate(video_path):
         return rate if rate > 0 else 10.0
     except Exception:
         return 10.0
+
+
+def _parse_frame_rate(value, fallback=10.0):
+    """Parse ffprobe's rational frame-rate values without rounding them."""
+    try:
+        numerator, denominator = str(value).split("/", 1)
+        rate = float(numerator) / float(denominator)
+        return rate if rate > 0 else fallback
+    except Exception:
+        return fallback
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _probe_action_source(video_path):
+    """Read source facts needed to verify the preserved action video."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries",
+             "stream=width,height,avg_frame_rate,r_frame_rate,color_transfer,color_primaries",
+             "-show_entries", "format=duration", "-of", "json", video_path],
+            capture_output=True, text=True, timeout=20, check=True)
+        data = json.loads(result.stdout)
+        stream = (data.get("streams") or [{}])[0]
+        average = _parse_frame_rate(stream.get("avg_frame_rate", "0/1"))
+        real = _parse_frame_rate(stream.get("r_frame_rate", "0/1"), average)
+        return {
+            "version": 1,
+            "sourceFilename": "action.mp4",
+            "sha256": _sha256_file(video_path),
+            "width": int(stream.get("width") or 0),
+            "height": int(stream.get("height") or 0),
+            "duration": max(0.0, float((data.get("format") or {}).get("duration") or 0)),
+            "nominalFrameRate": average,
+            "variableFrameRate": abs(average - real) > 0.01,
+            "colorTransfer": stream.get("color_transfer") or None,
+            "colorPrimaries": stream.get("color_primaries") or None,
+        }
+    except Exception:
+        return None
+
+
+def _source_frame_timeline(video_path, start_time, duration, expected_count,
+                           fallback_fps, preserve_source_timing):
+    """Return source PTS/durations when extraction kept every source frame.
+
+    Resampled extraction deliberately receives a uniform display timeline: there
+    is no one-to-one source PTS mapping after an fps filter has dropped frames.
+    """
+    frame_duration = 1.0 / max(1.0, fallback_fps)
+    fallback = [{"pts": index * frame_duration, "duration": frame_duration}
+                for index in range(expected_count)]
+    if expected_count == 0 or not preserve_source_timing:
+        return fallback
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_frames",
+             "-show_entries", "frame=best_effort_timestamp_time,pkt_duration_time",
+             "-of", "json", video_path],
+            capture_output=True, text=True, timeout=45, check=True)
+        raw_frames = json.loads(result.stdout).get("frames") or []
+        end_time = start_time + duration if duration > 0 else float("inf")
+        # ffmpeg's seek may decode a nearby keyframe, so select by actual PTS.
+        selected = []
+        for frame in raw_frames:
+            pts = float(frame.get("best_effort_timestamp_time"))
+            if pts + 0.000_001 < start_time or pts >= end_time - 0.000_001:
+                continue
+            selected.append((pts, frame.get("pkt_duration_time")))
+        if len(selected) != expected_count:
+            return fallback
+        normalized = [max(0.0, value[0] - selected[0][0]) for value in selected]
+        timeline = []
+        for index, pts in enumerate(normalized):
+            if index + 1 < len(normalized):
+                duration_value = normalized[index + 1] - pts
+            else:
+                duration_value = frame_duration
+                duration_value = float(selected[index][1] or duration_value)
+            if duration_value <= 0 or not np.isfinite(duration_value):
+                return fallback
+            timeline.append({"pts": pts, "duration": duration_value})
+        return timeline
+    except Exception:
+        return fallback
+
+
+def _write_action_metadata(output_dir, video_path, start_time, duration,
+                           frame_count, fallback_fps, preserve_source_timing):
+    """Write immutable source facts and the display PTS sidecar atomically."""
+    timeline = {
+        "version": 1,
+        "frames": _source_frame_timeline(
+            video_path, start_time, duration, frame_count, fallback_fps,
+            preserve_source_timing),
+    }
+    with open(os.path.join(output_dir, "timeline.json"), "w", encoding="utf-8") as output:
+        json.dump(timeline, output, ensure_ascii=True, separators=(",", ":"))
+    source = _probe_action_source(video_path)
+    if source:
+        with open(os.path.join(output_dir, "source-media.json"), "w", encoding="utf-8") as output:
+            json.dump(source, output, ensure_ascii=True, separators=(",", ":"))
 
 
 def _is_interlaced_video(video_path):
@@ -2066,6 +2177,8 @@ def main():
 
     # Step 1: Check duration and decide processing range
     video_duration = _get_video_duration(args.video)
+    selected_start = 0.0
+    selected_duration = video_duration
 
     if args.start is not None and not args.skip_extract:
         # User picked a specific segment — honor it exactly, no auto-select.
@@ -2075,6 +2188,8 @@ def main():
         # (or a future short selection) can't slip a sub-8s or over-budget clip.
         dur = max(8.0, min(dur, args.max_seconds))
         start = max(0.0, min(args.start, max(0.0, video_duration - 1.0)))
+        selected_start = start
+        selected_duration = dur
         emit({"type": "phase", "name": "extract",
               "detail": f"extracting {dur:.1f}s from {start:.1f}s (user-selected)"})
         trim_dir = os.path.join(extract_dir, "trim")
@@ -2103,6 +2218,8 @@ def main():
             from pipeline.smart_clip import analyze_video
             result = analyze_video(args.video, target_duration=args.max_seconds)
             clip = result.recommended_clip
+            selected_start = clip.start_time
+            selected_duration = clip.duration
             trim_dir = os.path.join(extract_dir, "trim")
             os.makedirs(trim_dir, exist_ok=True)
             frames = extract_frames_range(
@@ -2117,6 +2234,7 @@ def main():
             frames = extract_frames_range(
                 args.video, extract_dir, 0, args.max_seconds, args.fps,
                 args.max_output_dimension)
+            selected_duration = args.max_seconds
 
     if not frames:
         emit({"type": "error", "message": "No frames extracted"})
@@ -2198,6 +2316,9 @@ def main():
                        birefnet_progress)
         processed = min(preview_limit, len(frames))
         _verify_output_frame_sequence(final_dir, processed)
+        _write_action_metadata(
+            final_dir, args.video, selected_start, selected_duration,
+            processed, output_fps, args.fps <= 0)
         emit({"type": "complete",
               "frames": processed,
               "frames_dir": os.path.abspath(final_dir),
@@ -2210,6 +2331,9 @@ def main():
 
     pass2_birefnet(frames, all_logits, final_dir, birefnet_progress)
     _verify_output_frame_sequence(final_dir, len(frames))
+    _write_action_metadata(
+        final_dir, args.video, selected_start, selected_duration,
+        len(frames), output_fps, args.fps <= 0)
 
     # The Swift app keeps the detector released after the heavy pipeline. The
     # next import warms it on demand instead of retaining another model in RAM.

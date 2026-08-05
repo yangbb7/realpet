@@ -6,6 +6,8 @@ import Foundation
 struct FrameSequenceRuntimeCheck {
     static func main() throws {
         try testSourceFramesPreferPNGAndPairJPEGAlpha()
+        try testTimelineUsesPerFramePTSAndFallsBackForLegacyAssets()
+        testPresentationPolicyTracksWindowPixelsAndMemoryBudget()
         testWindowDragAnchorUsesGlobalPointerCoordinates()
         testDragRenderGate()
         testWindowPlacementPreservesOrigin()
@@ -34,6 +36,47 @@ struct FrameSequenceRuntimeCheck {
         precondition(jpeg.frames.count == 1)
         precondition(jpeg.frames[0].alphaURL?.lastPathComponent == "frame_0000_a.jpg")
         precondition(jpeg.fps == 1)
+    }
+
+    private static func testTimelineUsesPerFramePTSAndFallsBackForLegacyAssets() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for index in 0..<3 {
+            try Data("frame-\(index)".utf8).write(
+                to: root.appendingPathComponent(String(format: "frame_%04d.png", index)))
+        }
+        let variableTimeline = PetActionFrameTimeline(frames: [
+            .init(pts: 0, duration: 0.05),
+            .init(pts: 0.05, duration: 0.30),
+            .init(pts: 0.35, duration: 0.10),
+        ])
+        try JSONEncoder().encode(variableTimeline).write(
+            to: root.appendingPathComponent(PetActionFrameTimeline.fileName),
+            options: .atomic)
+        let sequence = try SourceFrameSequence.load(at: root, fps: 24)
+        precondition(abs(sequence.duration - 0.45) < 0.000_001)
+        precondition(sequence.frameIndex(at: 0.049) == 0)
+        precondition(sequence.frameIndex(at: 0.20) == 1)
+        precondition(sequence.frameIndex(at: 0.41) == 2)
+        precondition(sequence.frameIndex(at: 0.46) == 0)
+
+        try FileManager.default.removeItem(
+            at: root.appendingPathComponent(PetActionFrameTimeline.fileName))
+        let legacy = try SourceFrameSequence.load(at: root, fps: 20)
+        precondition(abs(legacy.duration - 0.15) < 0.000_001)
+        precondition(legacy.frameIndex(at: 0.101) == 2)
+    }
+
+    private static func testPresentationPolicyTracksWindowPixelsAndMemoryBudget() {
+        let compact = SourceFramePresentationPolicy.make(
+            viewSize: NSSize(width: 210, height: 260), backingScale: 2, nominalFPS: 24)
+        let large = SourceFramePresentationPolicy.make(
+            viewSize: NSSize(width: 820, height: 920), backingScale: 2, nominalFPS: 60)
+        precondition(compact.targetPixelDimension == 702)
+        precondition(large.targetPixelDimension > compact.targetPixelDimension)
+        precondition(compact.prefetchFrameCount >= 8)
+        precondition(large.prefetchFrameCount >= compact.prefetchFrameCount)
+        precondition(large.totalCostLimit <= 256 * 1024 * 1024)
     }
 
     private static func testFrameHoldKeepsItsOwningSequence() throws {

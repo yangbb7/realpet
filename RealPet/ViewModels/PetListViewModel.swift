@@ -1935,6 +1935,15 @@ class PetListViewModel: ObservableObject {
                 try fm.copyItem(at: entry, to: staging.appendingPathComponent(
                     entry.lastPathComponent))
             }
+            for sidecar in [
+                PetActionFrameTimeline.fileName,
+                PetActionSourceMedia.fileName,
+            ] {
+                let source = root.appendingPathComponent(sidecar)
+                if fm.fileExists(atPath: source.path) {
+                    try fm.copyItem(at: source, to: staging.appendingPathComponent(sidecar))
+                }
+            }
             if let sourceVideoURL,
                fm.fileExists(atPath: sourceVideoURL.path) {
                 try fm.copyItem(

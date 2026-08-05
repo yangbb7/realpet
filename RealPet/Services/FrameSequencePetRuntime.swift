@@ -1,5 +1,6 @@
 import AppKit
 import CoreImage
+import CoreVideo
 import Foundation
 import ImageIO
 
@@ -23,9 +24,14 @@ struct SourceFrameSequence: Equatable {
     let root: URL
     let frames: [Frame]
     let fps: Int
+    let timeline: PetActionFrameTimeline
     let loop: Bool
 
-    static func load(at directory: URL, fps: Int) throws -> SourceFrameSequence {
+    static func load(
+        at directory: URL,
+        fps: Int,
+        timelinePath: String? = nil
+    ) throws -> SourceFrameSequence {
         let root = directory.standardizedFileURL.resolvingSymlinksInPath()
         let entries = try FileManager.default.contentsOfDirectory(
             at: root,
@@ -36,11 +42,13 @@ struct SourceFrameSequence: Equatable {
                 && $0.lastPathComponent.hasPrefix("frame_")
         }.sorted { $0.lastPathComponent < $1.lastPathComponent }
         if !pngs.isEmpty {
-            return SourceFrameSequence(
+            let frames = pngs.map { Frame(rgbURL: $0, alphaURL: nil) }
+            return makeSequence(
                 root: root,
-                frames: pngs.map { Frame(rgbURL: $0, alphaURL: nil) },
+                frames: frames,
                 fps: max(1, fps),
-                loop: true)
+                loop: true,
+                timelinePath: timelinePath)
         }
 
         let jpegs = entries.filter {
@@ -58,12 +66,37 @@ struct SourceFrameSequence: Equatable {
                     ? alphaURL : nil)
         }
         guard !frames.isEmpty else { throw FrameSequenceRuntimeError.noFrames(root) }
-        return SourceFrameSequence(
-            root: root, frames: frames, fps: max(1, fps), loop: true)
+        return makeSequence(
+            root: root, frames: frames, fps: max(1, fps), loop: true,
+            timelinePath: timelinePath)
     }
 
     func with(loop: Bool) -> SourceFrameSequence {
-        SourceFrameSequence(root: root, frames: frames, fps: fps, loop: loop)
+        SourceFrameSequence(
+            root: root, frames: frames, fps: fps, timeline: timeline, loop: loop)
+    }
+
+    var duration: TimeInterval { timeline.duration }
+
+    func frameIndex(at time: TimeInterval) -> Int {
+        timeline.index(at: time, looping: loop)
+    }
+
+    private static func makeSequence(
+        root: URL,
+        frames: [Frame],
+        fps: Int,
+        loop: Bool,
+        timelinePath: String?
+    ) -> SourceFrameSequence {
+        SourceFrameSequence(
+            root: root,
+            frames: frames,
+            fps: fps,
+            timeline: PetActionFrameTimeline.load(
+                at: root, relativePath: timelinePath,
+                frameCount: frames.count, fallbackFPS: fps),
+            loop: loop)
     }
 }
 
@@ -134,6 +167,17 @@ enum PetWindowPlacement {
 /// Every generated frame remains reachable; no leading or trailing portion is
 /// discarded at playback time.
 enum GazeSweepFrameSelector {
+    static func phase(
+        horizontalOffset: Double,
+        verticalOffset: Double,
+        deadZone: Double = 0.16
+    ) -> Double? {
+        guard hypot(horizontalOffset, verticalOffset) >= deadZone else { return nil }
+        let fullTurn = 2 * Double.pi
+        let angle = atan2(horizontalOffset, verticalOffset)
+        return angle >= 0 ? angle / fullTurn : (angle + fullTurn) / fullTurn
+    }
+
     static func index(
         frameCount: Int,
         horizontalOffset: Double,
@@ -143,10 +187,10 @@ enum GazeSweepFrameSelector {
         trailingHoldFraction: Double = 0
     ) -> Int? {
         guard frameCount > 0,
-              hypot(horizontalOffset, verticalOffset) >= deadZone else { return nil }
-        let fullTurn = 2 * Double.pi
-        let angle = atan2(horizontalOffset, verticalOffset)
-        let progress = angle >= 0 ? angle / fullTurn : (angle + fullTurn) / fullTurn
+              let progress = phase(
+                  horizontalOffset: horizontalOffset,
+                  verticalOffset: verticalOffset,
+                  deadZone: deadZone) else { return nil }
         let maxIndex = frameCount - 1
         let firstOrbitIndex = min(
             maxIndex,
@@ -304,7 +348,8 @@ enum SourceFrameActionResolver {
         guard let actionRoot = safeActionDirectory(
             action.framesDirectory, beneath: framesDirectory) else { return nil }
         let fps = action.fps > 0 ? action.fps : fallbackFPS
-        return try? SourceFrameSequence.load(at: actionRoot, fps: fps)
+        return try? SourceFrameSequence.load(
+            at: actionRoot, fps: fps, timelinePath: action.timelinePath)
             .with(loop: action.loop)
     }
 
@@ -338,26 +383,77 @@ enum PetFeatureHitTester {
     }
 }
 
+/// Computes a disposable presentation cache from the actual desktop-pet size.
+/// Source images are never resized on disk and a cache eviction only requires a
+/// background re-decode from the installed source frames.
+struct SourceFramePresentationPolicy: Equatable {
+    let targetPixelDimension: Int
+    let prefetchFrameCount: Int
+    let totalCostLimit: Int
+
+    static func make(
+        viewSize: NSSize,
+        backingScale: CGFloat,
+        nominalFPS: Int,
+        qualityOverscan: CGFloat = 1.35
+    ) -> Self {
+        let requestedFrames = min(60, max(8, Int((Double(max(1, nominalFPS)) * 1.25).rounded(.up))))
+        let physicalMemory = ProcessInfo.processInfo.physicalMemory
+        let deviceBudget = Int(min(
+            UInt64(256 * 1024 * 1024),
+            max(UInt64(48 * 1024 * 1024), physicalMemory / 20)))
+        let largestVisiblePixelDimension = max(viewSize.width, viewSize.height)
+            * max(1, backingScale) * max(1, qualityOverscan)
+        // Reserve room for at least two decoded frames even on an unusually
+        // large desktop display. Source thumbnails never upscale past media.
+        let memoryBound = Int(sqrt(
+            Double(deviceBudget) / Double(max(2, requestedFrames) * 4)))
+        let target = max(1, min(
+            Int(largestVisiblePixelDimension.rounded(.up)), memoryBound))
+        let estimatedFrameBytes = max(1, target * target * 4)
+        let count = max(2, min(requestedFrames, deviceBudget / estimatedFrameBytes))
+        return Self(
+            targetPixelDimension: target,
+            prefetchFrameCount: count,
+            totalCostLimit: min(deviceBudget, max(24 * 1024 * 1024, estimatedFrameBytes * count)))
+    }
+}
+
 private final class SourceFrameImageCache {
     private let cache = NSCache<NSString, NSImage>()
-    private let decodeQueue = DispatchQueue(
-        label: "com.realpet.frame-image-decoder", qos: .userInitiated)
+    private let decodeQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.realpet.frame-image-decoder"
+        queue.qualityOfService = .userInitiated
+        queue.maxConcurrentOperationCount = 2
+        return queue
+    }()
     private let lock = NSLock()
     private var pendingCallbacks: [String: [(NSImage?) -> Void]] = [:]
-    private let maximumPixelDimension: Int
+    private var policy: SourceFramePresentationPolicy
 
-    init(
-        limit: Int = 18,
-        totalCostLimit: Int = 64 * 1024 * 1024,
-        maximumPixelDimension: Int = 1024
-    ) {
-        cache.countLimit = max(1, limit)
-        cache.totalCostLimit = max(1, totalCostLimit)
-        self.maximumPixelDimension = max(1, maximumPixelDimension)
+    init(policy: SourceFramePresentationPolicy = .make(
+        viewSize: NSSize(width: 260, height: 260), backingScale: 2, nominalFPS: 24
+    )) {
+        self.policy = policy
+        cache.countLimit = max(1, policy.prefetchFrameCount)
+        cache.totalCostLimit = max(1, policy.totalCostLimit)
     }
 
+    @discardableResult
+    func configure(_ policy: SourceFramePresentationPolicy) -> Bool {
+        guard self.policy != policy else { return false }
+        self.policy = policy
+        cache.removeAllObjects()
+        cache.countLimit = max(1, policy.prefetchFrameCount)
+        cache.totalCostLimit = max(1, policy.totalCostLimit)
+        return true
+    }
+
+    var prefetchFrameCount: Int { policy.prefetchFrameCount }
+
     func image(for frame: SourceFrameSequence.Frame) -> NSImage? {
-        let key = frame.rgbURL.path as NSString
+        let key = cacheKey(for: frame, policy: policy) as NSString
         return cache.object(forKey: key)
     }
 
@@ -365,7 +461,8 @@ private final class SourceFrameImageCache {
         _ frame: SourceFrameSequence.Frame,
         completion: @escaping (NSImage?) -> Void
     ) {
-        let key = frame.rgbURL.path
+        let policy = policy
+        let key = cacheKey(for: frame, policy: policy)
         if let cached = cache.object(forKey: key as NSString) {
             DispatchQueue.main.async { completion(cached) }
             return
@@ -375,13 +472,14 @@ private final class SourceFrameImageCache {
         pendingCallbacks[key, default: []].append(completion)
         lock.unlock()
         guard !alreadyDecoding else { return }
-        decodeQueue.async { [weak self] in
+        decodeQueue.addOperation { [weak self] in
             guard let self else { return }
             let image = Self.decodedImage(
-                for: frame, maximumPixelDimension: self.maximumPixelDimension)
+                for: frame, maximumPixelDimension: policy.targetPixelDimension)
             let cost = Self.cost(of: image)
             DispatchQueue.main.async {
-                self.completeDecode(key: key, image: image, cost: cost)
+                self.completeDecode(
+                    key: key, image: image, cost: cost, policy: policy)
             }
         }
     }
@@ -392,12 +490,26 @@ private final class SourceFrameImageCache {
         }
     }
 
-    private func completeDecode(key: String, image: NSImage?, cost: Int) {
-        if let image { cache.setObject(image, forKey: key as NSString, cost: cost) }
+    private func completeDecode(
+        key: String,
+        image: NSImage?,
+        cost: Int,
+        policy: SourceFramePresentationPolicy
+    ) {
+        if let image, self.policy == policy {
+            cache.setObject(image, forKey: key as NSString, cost: cost)
+        }
         lock.lock()
         let callbacks = pendingCallbacks.removeValue(forKey: key) ?? []
         lock.unlock()
         callbacks.forEach { $0(image) }
+    }
+
+    private func cacheKey(
+        for frame: SourceFrameSequence.Frame,
+        policy: SourceFramePresentationPolicy
+    ) -> String {
+        "\(frame.rgbURL.path)#\(policy.targetPixelDimension)"
     }
 
     private static func decodedImage(
@@ -423,7 +535,9 @@ private final class SourceFrameImageCache {
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                   kCGImageSourceCreateThumbnailFromImageAlways: true,
                   kCGImageSourceCreateThumbnailWithTransform: true,
-                  kCGImageSourceShouldCacheImmediately: false,
+                  // Force PNG/JPEG decompression on the background queue. A
+                  // lazy provider can otherwise inflate during NSImage.draw.
+                  kCGImageSourceShouldCacheImmediately: true,
                   kCGImageSourceThumbnailMaxPixelSize: maximumPixelDimension,
               ] as CFDictionary) else {
             return nil
@@ -576,6 +690,77 @@ private final class SourceFramePetView: NSView {
 
 }
 
+/// Coalesces CoreVideo display refreshes onto the main thread. The CoreVideo
+/// callback never performs AppKit work, image decoding, or disk I/O.
+private final class SourceFrameDisplayLink {
+    private let tick: () -> Void
+    private let lock = NSLock()
+    private var isTickQueued = false
+    private var displayLink: CVDisplayLink?
+
+    init(tick: @escaping () -> Void) {
+        self.tick = tick
+    }
+
+    func start(for screen: NSScreen?) {
+        stop()
+        let displayID: CGDirectDisplayID
+        if let screenNumber = screen?.deviceDescription[
+            NSDeviceDescriptionKey("NSScreenNumber")
+        ] as? NSNumber {
+            displayID = CGDirectDisplayID(screenNumber.uint32Value)
+        } else {
+            displayID = CGMainDisplayID()
+        }
+        var link: CVDisplayLink?
+        guard CVDisplayLinkCreateWithCGDisplay(displayID, &link) == kCVReturnSuccess,
+              let link else { return }
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        guard CVDisplayLinkSetOutputCallback(link, Self.callback, context)
+            == kCVReturnSuccess else { return }
+        displayLink = link
+        CVDisplayLinkStart(link)
+    }
+
+    func stop() {
+        if let displayLink, CVDisplayLinkIsRunning(displayLink) {
+            CVDisplayLinkStop(displayLink)
+        }
+        displayLink = nil
+        lock.lock()
+        isTickQueued = false
+        lock.unlock()
+    }
+
+    private static let callback: CVDisplayLinkOutputCallback = {
+        _, _, _, _, _, context in
+        guard let context else { return kCVReturnSuccess }
+        let driver = Unmanaged<SourceFrameDisplayLink>
+            .fromOpaque(context).takeUnretainedValue()
+        driver.queueTick()
+        return kCVReturnSuccess
+    }
+
+    private func queueTick() {
+        lock.lock()
+        guard !isTickQueued else {
+            lock.unlock()
+            return
+        }
+        isTickQueued = true
+        lock.unlock()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.isTickQueued = false
+            self.lock.unlock()
+            self.tick()
+        }
+    }
+
+    deinit { stop() }
+}
+
 @MainActor
 final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
     NSWindowDelegate {
@@ -592,10 +777,8 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
     private let fallbackFPS: Int
     private var baseSequence: SourceFrameSequence?
     private var activeSequence: SourceFrameSequence?
-    private var frameIndex = 0
-    private var frameTimer: Timer?
-    private var activePlaybackFPS: Int?
-    private var pointerTimer: Timer?
+    private var playbackStartedAt: TimeInterval = 0
+    private var displayLink: SourceFrameDisplayLink?
     private var window: NSPanel?
     private var petView: SourceFramePetView?
     private var cache = SourceFrameImageCache()
@@ -662,6 +845,7 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
 
         let view = SourceFramePetView(frame: NSRect(origin: .zero, size: panel.frame.size))
         view.autoresizingMask = [.width, .height]
+        configurePresentationCache(sequence: sequence, panel: panel, view: view)
         present(sequence.frames[0], in: view)
         view.headRegion = features?.head
         view.onPointer = { [weak self] kind, point in
@@ -675,9 +859,9 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         petView = view
         isRunning = true
         terminated = false
-        frameIndex = 0
+        playbackStartedAt = ProcessInfo.processInfo.systemUptime
         prefetch(sequence: sequence, from: 0)
-        startTimers(fps: sequence.fps)
+        startDisplayLink(for: panel)
         if isPresentationActive {
             panel.orderFrontRegardless()
         } else {
@@ -699,6 +883,11 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
             aspect: aspect,
             visibleFrame: panel.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
                 ?? NSRect(x: 0, y: 0, width: 1440, height: 900)))
+        if let sequence = activeSequence, let view = petView {
+            configurePresentationCache(sequence: sequence, panel: panel, view: view)
+            let elapsed = ProcessInfo.processInfo.systemUptime - playbackStartedAt
+            prefetch(sequence: sequence, from: sequence.frameIndex(at: elapsed))
+        }
     }
 
     func send(_ command: PetCommand) {
@@ -744,10 +933,8 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         guard !terminated else { return }
         terminated = true
         isRunning = false
-        frameTimer?.invalidate()
-        pointerTimer?.invalidate()
-        frameTimer = nil
-        pointerTimer = nil
+        displayLink?.stop()
+        displayLink = nil
         window?.orderOut(nil)
         window?.close()
         window = nil
@@ -764,6 +951,16 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
     func stop() { terminate() }
 
     func windowWillClose(_ notification: Notification) { terminate() }
+
+    func windowDidChangeScreen(_ notification: Notification) {
+        guard let panel = window,
+              let view = petView,
+              let sequence = activeSequence else { return }
+        configurePresentationCache(sequence: sequence, panel: panel, view: view)
+        startDisplayLink(for: panel)
+        let elapsed = ProcessInfo.processInfo.systemUptime - playbackStartedAt
+        prefetch(sequence: sequence, from: sequence.frameIndex(at: elapsed))
+    }
 
     private static func clampedDisplayScale(_ scale: Double) -> Double {
         min(1.75, max(0.55, scale))
@@ -789,27 +986,28 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         panel.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
     }
 
-    private func startTimers(fps: Int) {
-        startFrameTimer(fps: fps)
-        let pointerTimer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.observePointer() }
+    private func configurePresentationCache(
+        sequence: SourceFrameSequence,
+        panel: NSPanel,
+        view: SourceFramePetView
+    ) {
+        let policy = SourceFramePresentationPolicy.make(
+            viewSize: view.bounds.size,
+            backingScale: panel.backingScaleFactor,
+            nominalFPS: sequence.fps)
+        if cache.configure(policy) {
+            pendingDisplayFrame = nil
+            imageRequestGeneration &+= 1
         }
-        RunLoop.main.add(pointerTimer, forMode: .common)
-        self.pointerTimer = pointerTimer
     }
 
-    private func startFrameTimer(fps: Int) {
-        let playbackFPS = max(1, fps)
-        guard activePlaybackFPS != playbackFPS || frameTimer == nil else { return }
-        frameTimer?.invalidate()
-        let frameTimer = Timer(
-            timeInterval: 1.0 / Double(playbackFPS), repeats: true
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.advanceFrame() }
+    private func startDisplayLink(for panel: NSPanel) {
+        let driver = SourceFrameDisplayLink { [weak self] in
+            self?.displayTick()
         }
-        RunLoop.main.add(frameTimer, forMode: .common)
-        self.frameTimer = frameTimer
-        activePlaybackFPS = playbackFPS
+        displayLink?.stop()
+        displayLink = driver
+        driver.start(for: panel.screen)
     }
 
     private func activate(sequence: SourceFrameSequence) {
@@ -817,19 +1015,21 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
         heldFrame = nil
         pendingDisplayFrame = nil
         imageRequestGeneration &+= 1
-        frameIndex = 0
+        playbackStartedAt = ProcessInfo.processInfo.systemUptime
+        if let panel = window, let view = petView {
+            configurePresentationCache(sequence: sequence, panel: panel, view: view)
+        }
         prefetch(sequence: sequence, from: 0)
-        startFrameTimer(fps: sequence.fps)
     }
 
-    private func advanceFrame() {
+    private func displayTick() {
         guard isRunning,
-              FrameSequencePresentationGate.allowsFrameOrPointerUpdate(
-                paused: paused, isDragging: isDragging,
-                awaitingImageDecode: pendingDisplayFrame != nil),
               let sequence = activeSequence,
               let view = petView else { return }
-        let now = Date().timeIntervalSince1970
+        observePointer()
+        guard FrameSequencePresentationGate.allowsFrameOrPointerUpdate(
+            paused: paused, isDragging: isDragging) else { return }
+        let now = ProcessInfo.processInfo.systemUptime
         if let endsAt = actionEndsAt, now >= endsAt {
             actionEndsAt = nil
             activeGazeAction = nil
@@ -838,22 +1038,16 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
             } else {
                 restoreCenteredGaze()
             }
-            advanceFrame()
             return
         }
         if let heldFrame {
             render(heldFrame)
             return
         }
-        let displayIndex = sequence.loop
-            ? frameIndex % sequence.frames.count
-            : min(frameIndex, sequence.frames.count - 1)
+        let displayIndex = sequence.frameIndex(at: now - playbackStartedAt)
         let frame = sequence.frames[displayIndex]
-        guard present(frame, in: view) else { return }
-        frameIndex = sequence.loop
-            ? (frameIndex + 1) % sequence.frames.count
-            : min(frameIndex + 1, sequence.frames.count - 1)
-        prefetch(sequence: sequence, from: frameIndex)
+        _ = present(frame, in: view)
+        prefetch(sequence: sequence, from: displayIndex)
     }
 
     private func observePointer() {
@@ -934,10 +1128,11 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
             // The idle action is often a separately extracted still, so
             // switching to it while the pointer crosses the center produces
             // a visible flash between its first frame and the held gaze frame.
-            let selectedFrameIndex = GazeSweepFrameSelector.index(
-                frameCount: orbitSequence.frames.count,
+            let phase = GazeSweepFrameSelector.phase(
                 horizontalOffset: Double(horizontalOffset),
                 verticalOffset: Double(verticalOffset)) ?? 0
+            let selectedFrameIndex = orbitSequence.timeline.index(
+                forNormalizedPhase: phase)
             activeGazeAction = .gazeOrbit
             hold(frameAt: selectedFrameIndex, in: orbitSequence)
             return
@@ -1020,7 +1215,7 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
 
     private func prefetch(sequence: SourceFrameSequence, from index: Int) {
         guard !sequence.frames.isEmpty else { return }
-        let count = min(18, sequence.frames.count)
+        let count = min(cache.prefetchFrameCount, sequence.frames.count)
         let frames = (0..<count).map { offset -> SourceFrameSequence.Frame in
             let next = sequence.loop
                 ? (index + offset) % sequence.frames.count
@@ -1031,11 +1226,11 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
     }
 
     private func play(cue: PetAnimationCue) -> Bool {
-        let now = Date().timeIntervalSince1970
+        let now = ProcessInfo.processInfo.systemUptime
         if let sequence = SourceFrameActionResolver.sequence(
             for: cue, framesDirectory: framesDirectory, fallbackFPS: fallbackFPS) {
             activate(sequence: sequence)
-            actionEndsAt = now + Double(sequence.frames.count) / Double(sequence.fps)
+            actionEndsAt = now + sequence.duration
             return true
         }
         return false
@@ -1049,8 +1244,7 @@ final class FrameSequencePetRuntime: NSObject, PetRuntimeController,
                 framesDirectory: framesDirectory,
                 fallbackFPS: fallbackFPS) else { return false }
         activate(sequence: sequence)
-        actionEndsAt = Date().timeIntervalSince1970
-            + Double(sequence.frames.count) / Double(sequence.fps)
+        actionEndsAt = ProcessInfo.processInfo.systemUptime + sequence.duration
         return true
     }
 

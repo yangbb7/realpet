@@ -210,6 +210,12 @@ struct PetActionManifest: Codable, Equatable, Sendable {
         let translatesWindow: Bool
         /// Nil is treated as `captured` so previously saved manifests remain valid.
         let origin: Origin?
+        /// Present only for v2 action assets. The original media is preserved
+        /// separately from runtime presentation caches.
+        let sourceMedia: PetActionSourceMedia?
+        /// Present only for v2 action assets. Older assets use integer FPS.
+        let timelinePath: String?
+        let presentationVariantVersion: Int?
 
         var effectiveOrigin: Origin { origin ?? .captured }
 
@@ -221,7 +227,10 @@ struct PetActionManifest: Codable, Equatable, Sendable {
             fps: Int,
             loop: Bool,
             translatesWindow: Bool,
-            origin: Origin? = nil
+            origin: Origin? = nil,
+            sourceMedia: PetActionSourceMedia? = nil,
+            timelinePath: String? = nil,
+            presentationVariantVersion: Int? = nil
         ) {
             self.id = id
             self.kind = kind
@@ -231,6 +240,9 @@ struct PetActionManifest: Codable, Equatable, Sendable {
             self.loop = loop
             self.translatesWindow = translatesWindow
             self.origin = origin
+            self.sourceMedia = sourceMedia
+            self.timelinePath = timelinePath
+            self.presentationVariantVersion = presentationVariantVersion
         }
 
         var displayName: String {
@@ -242,7 +254,8 @@ struct PetActionManifest: Codable, Equatable, Sendable {
         var isCustom: Bool { kind == .custom }
     }
 
-    static let currentVersion = 1
+    static let currentVersion = 2
+    private static let supportedVersions: Set<Int> = [1, currentVersion]
 
     let version: Int
     let defaultAction: String
@@ -289,7 +302,7 @@ struct PetActionManifest: Codable, Equatable, Sendable {
             .appendingPathComponent("actions.json")
         guard let data = try? Data(contentsOf: url),
               let manifest = try? JSONDecoder().decode(Self.self, from: data),
-              manifest.version == currentVersion,
+              supportedVersions.contains(manifest.version),
               manifest.actions.contains(where: { $0.id == manifest.defaultAction }) else {
             return nil
         }
@@ -303,6 +316,8 @@ struct PetActionManifest: Codable, Equatable, Sendable {
         origin: Action.Origin = .captured,
         actionID: String? = nil,
         displayNameOverride: String? = nil,
+        sourceMedia: PetActionSourceMedia? = nil,
+        timelinePath: String? = nil,
         in existing: PetActionManifest?
     ) -> PetActionManifest {
         let idle = Action(
@@ -320,7 +335,10 @@ struct PetActionManifest: Codable, Equatable, Sendable {
             fps: fps,
             loop: kind == .idle,
             translatesWindow: kind.translatesWindow,
-            origin: origin)
+            origin: origin,
+            sourceMedia: sourceMedia,
+            timelinePath: timelinePath,
+            presentationVariantVersion: sourceMedia == nil && timelinePath == nil ? nil : 1)
         if let index = actions.firstIndex(where: { $0.id == action.id }) {
             actions[index] = action
         } else {

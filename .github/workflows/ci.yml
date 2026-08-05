@@ -35,7 +35,7 @@ jobs:
         run: |
           cd RealPet
           swiftc Models/PetPersonality.swift Models/PetCloudReference.swift \
-            Models/PetActionManifest.swift \
+            Models/PetActionMediaMetadata.swift Models/PetActionManifest.swift \
             Models/InteractionModels.swift \
             Models/PetBehaviorMemory.swift \
             Models/PetBehaviorPolicy.swift \
@@ -49,7 +49,7 @@ jobs:
       - name: Test source-frame runtime contracts
         run: |
           cd RealPet
-          swiftc Models/PetActionManifest.swift Models/PetFeatureManifest.swift \
+          swiftc Models/PetActionMediaMetadata.swift Models/PetActionManifest.swift Models/PetFeatureManifest.swift \
             Models/InteractionModels.swift \
             Services/InteractionHub.swift Services/InteractionAdapter.swift \
             Services/PetRuntimeController.swift Services/FrameSequencePetRuntime.swift \
@@ -59,7 +59,7 @@ jobs:
       - name: Test motion generation contracts
         run: |
           cd RealPet
-          swiftc Models/PetActionManifest.swift \
+          swiftc Models/PetActionMediaMetadata.swift Models/PetActionManifest.swift \
             Models/PetCloudReference.swift \
             Models/PetAssetProfile.swift \
             Models/MotionGenerationModels.swift \

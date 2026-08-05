@@ -4,6 +4,7 @@ enum PetActionLibrary {
     enum InstallError: LocalizedError {
         case noFrames
         case frameCountMismatch(expected: Int, actual: Int)
+        case sourceHashMismatch
         case unsupportedAction(PetActionManifest.Action.Kind)
 
         var errorDescription: String? {
@@ -11,6 +12,8 @@ enum PetActionLibrary {
             case .noFrames: return "动作目录中没有有效帧"
             case .frameCountMismatch(let expected, let actual):
                 return "动作帧不完整（应为 \(expected) 帧，实际为 \(actual) 帧）"
+            case .sourceHashMismatch:
+                return "原始动作视频校验失败，文件可能已损坏"
             case .unsupportedAction(let kind):
                 return "不支持安装动作：\(kind.displayName)"
             }
@@ -51,6 +54,10 @@ enum PetActionLibrary {
         let fm = FileManager.default
         let frames = try sourceFrames(in: processedFramesDirectory)
         guard !frames.isEmpty else { throw InstallError.noFrames }
+        let sourceMedia = PetActionSourceMedia.load(at: processedFramesDirectory)
+        let timelinePath = fm.fileExists(atPath: processedFramesDirectory
+            .appendingPathComponent(PetActionFrameTimeline.fileName).path)
+            ? PetActionFrameTimeline.fileName : nil
 
         let root = rootFramesDirectory.standardizedFileURL
         let actionsDirectory = root.appendingPathComponent("actions")
@@ -82,6 +89,10 @@ enum PetActionLibrary {
                 throw InstallError.frameCountMismatch(
                     expected: frames.count, actual: installedFrameCount)
             }
+            if let sourceMedia,
+               sourceMedia.verifiesMedia(at: destination) == false {
+                throw InstallError.sourceHashMismatch
+            }
 
             let existing = PetActionManifest.load(
                 framesDirectory: root.path)
@@ -92,6 +103,8 @@ enum PetActionLibrary {
                 origin: origin,
                 actionID: resolvedActionID,
                 displayNameOverride: displayNameOverride,
+                sourceMedia: sourceMedia,
+                timelinePath: timelinePath,
                 in: existing)
             try manifest.save(framesDirectory: root.path)
             manifestSaved = true
